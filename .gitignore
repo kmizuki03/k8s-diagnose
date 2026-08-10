@@ -27,6 +27,19 @@ go.work.sum
 # env file
 .env
 
+# macOS metadata
+.DS_Store
+
+# k8s-diagnose local artifacts
+/k8s-diagnose
+/dist/
+/*.db
+/*.db-shm
+/*.db-wal
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
 # Editor/IDE
 # .idea/
 # .vscode/
