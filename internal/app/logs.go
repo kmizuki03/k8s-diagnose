@@ -29,13 +29,15 @@ func (runner *Runner) collectLogs(ctx context.Context, snapshot *kube.Snapshot, 
 		for _, previous := range []bool{false, true} {
 			logs, failures := runner.podLogs(ctx, pod, previous)
 			source := "current"
+			sourceLabel := "現在"
 			if previous {
 				source = "previous"
+				sourceLabel = "前回終了時"
 			}
 			checkID := "logs/" + pod.Namespace + "/" + pod.Name + "/" + source
-			state.AddCheck(model.Check{ID: checkID, Section: "ログ", Description: fmt.Sprintf("Pod %s/%sの%sログ", pod.Namespace, pod.Name, source), Available: len(failures) == 0, Reason: strings.Join(failures, "; ")})
+			state.AddCheck(model.Check{ID: checkID, Section: "ログ", Description: fmt.Sprintf("Pod %s/%s のログ（%s）", pod.Namespace, pod.Name, sourceLabel), Available: len(failures) == 0, Reason: strings.Join(failures, "; ")})
 			if len(failures) > 0 {
-				finding := model.NewFinding(model.Unavailable, "K8S.LOG.FETCH_UNAVAILABLE", "ログ", "Pod/"+pod.Namespace+"/"+pod.Name, "LogFetchFailed", source, fmt.Sprintf("Pod %s/%sの%sログを一部またはすべて取得できませんでした", pod.Namespace, pod.Name, source), 100, model.Evidence{Kind: "api", Key: "errors", Value: strings.Join(failures, "; ")})
+				finding := model.NewFinding(model.Unavailable, "K8S.LOG.FETCH_UNAVAILABLE", "ログ", "Pod/"+pod.Namespace+"/"+pod.Name, "LogFetchFailed", source, fmt.Sprintf("Pod %s/%s のログ（%s）を、一部またはすべて取得できませんでした", pod.Namespace, pod.Name, sourceLabel), 100, model.Evidence{Kind: "api", Key: "errors", Value: strings.Join(failures, "; ")})
 				finding.RuleID = "logs"
 				state.Add(finding)
 			}
@@ -50,7 +52,7 @@ func (runner *Runner) collectLogs(ctx context.Context, snapshot *kube.Snapshot, 
 					lines[index] = console.MaskSecrets(lines[index], runner.Config.Mask)
 				}
 				runner.logBlocks = append(runner.logBlocks, logBlock{
-					Title:   fmt.Sprintf("ログ %s/%s [%s] (%s)", pod.Namespace, pod.Name, log.Container, source),
+					Title:   fmt.Sprintf("ログ %s/%s [%s]（%s）", pod.Namespace, pod.Name, log.Container, sourceLabel),
 					Lines:   lines,
 					Command: log.Command,
 				})

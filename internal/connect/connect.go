@@ -81,7 +81,7 @@ func targetsAt(pod *corev1.Pod, services []corev1.Service, pathOverride string, 
 						Container: container.Name, ProbeType: value.name, Group: "pod", Label: value.name,
 						Protocol: "http", PortName: get.Port.StrVal, Path: get.Path, Scheme: strings.ToLower(string(get.Scheme)),
 						Headers: append([]corev1.HTTPHeader{}, get.HTTPHeaders...), Probe: value.probe, Source: "probe",
-						Strict: true, Invalid: true, Inactive: fmt.Sprintf("container %q のports[].nameにポート名 %q がありません", container.Name, get.Port.StrVal),
+						Strict: true, Invalid: true, Inactive: fmt.Sprintf("コンテナ %q の ports[].name には、ポート名 %q が定義されていません", container.Name, get.Port.StrVal),
 					})
 					continue
 				}
@@ -102,7 +102,7 @@ func targetsAt(pod *corev1.Pod, services []corev1.Service, pathOverride string, 
 				if active && get.Host != "" {
 					active = false
 					unavailable = true
-					inactive = fmt.Sprintf("httpGet.host=%q の接続先はport-forwardでは再現できません", get.Host)
+					inactive = fmt.Sprintf("httpGet.host で指定された接続先 %q は、port-forwardでは再現できません", get.Host)
 				}
 				result = append(result, Target{
 					Container: container.Name, ProbeType: value.name, Group: "pod",
@@ -115,14 +115,14 @@ func targetsAt(pod *corev1.Pod, services []corev1.Service, pathOverride string, 
 			if tcp := value.probe.TCPSocket; tcp != nil {
 				port, ok := resolvePort(tcp.Port, container)
 				if !ok {
-					result = append(result, Target{Container: container.Name, ProbeType: value.name, Group: "pod", Label: value.name, Protocol: "tcp", PortName: tcp.Port.StrVal, Probe: value.probe, Source: "probe", Strict: true, Invalid: true, Inactive: fmt.Sprintf("container %q のports[].nameにポート名 %q がありません", container.Name, tcp.Port.StrVal)})
+					result = append(result, Target{Container: container.Name, ProbeType: value.name, Group: "pod", Label: value.name, Protocol: "tcp", PortName: tcp.Port.StrVal, Probe: value.probe, Source: "probe", Strict: true, Invalid: true, Inactive: fmt.Sprintf("コンテナ %q の ports[].name には、ポート名 %q が定義されていません", container.Name, tcp.Port.StrVal)})
 				} else {
 					active, inactive := probeActive(pod, container.Name, value.name, value.probe, now)
 					unavailable := false
 					if active && tcp.Host != "" {
 						active = false
 						unavailable = true
-						inactive = fmt.Sprintf("tcpSocket.host=%q の接続先はport-forwardでは再現できません", tcp.Host)
+						inactive = fmt.Sprintf("tcpSocket.host で指定された接続先 %q は、port-forwardでは再現できません", tcp.Host)
 					}
 					result = append(result, Target{Container: container.Name, ProbeType: value.name, Group: "pod", Label: value.name, Protocol: "tcp", RemotePort: port, PortName: tcp.Port.StrVal, Probe: value.probe, Source: "probe", Strict: true, Active: active, Unavailable: unavailable, Inactive: inactive})
 				}
@@ -272,10 +272,10 @@ func probeActive(pod *corev1.Pod, container, probeType string, probe *corev1.Pro
 		}
 	}
 	if status == nil || status.State.Running == nil {
-		return false, "コンテナがRunningではありません"
+		return false, "コンテナがRunning状態ではありません"
 	}
 	if probeType == "startupProbe" && status.Started != nil && *status.Started {
-		return false, "startupProbe成功済み"
+		return false, "startupProbeはすでに成功しています"
 	}
 	if probeType != "startupProbe" {
 		var hasStartup bool
@@ -286,11 +286,11 @@ func probeActive(pod *corev1.Pod, container, probeType string, probe *corev1.Pro
 			}
 		}
 		if hasStartup && (status.Started == nil || !*status.Started) {
-			return false, "startupProbe完了待ち"
+			return false, "startupProbeの完了を待っています"
 		}
 	}
 	if probe.InitialDelaySeconds > 0 && now.Sub(status.State.Running.StartedAt.Time) < time.Duration(probe.InitialDelaySeconds)*time.Second {
-		return false, "initialDelaySeconds内"
+		return false, "initialDelaySecondsで指定された待機時間内です"
 	}
 	return true, ""
 }
@@ -334,9 +334,9 @@ func namedContainerPortSummary(pod *corev1.Pod, containerName string) string {
 		}
 	}
 	if len(names) == 0 {
-		return fmt.Sprintf("container %q の定義済みports[].name: なし", containerName)
+		return fmt.Sprintf("コンテナ %q の ports[].name に定義された名前: なし", containerName)
 	}
-	return fmt.Sprintf("container %q の定義済みports[].name: %s", containerName, strings.Join(names, ", "))
+	return fmt.Sprintf("コンテナ %q の ports[].name に定義された名前: %s", containerName, strings.Join(names, ", "))
 }
 
 func selectorMatches(selector, labels map[string]string) bool {
@@ -372,13 +372,13 @@ func (checker *Checker) Check(ctx context.Context, pod *corev1.Pod, services []c
 		if !target.Active {
 			results = append(results, Result{Target: target, Detail: "未実施: " + target.Inactive})
 			if target.Invalid {
-				findings = append(findings, model.NewFinding(model.Issue, "K8S.PROBE.PORT_UNRESOLVED", "Probe", targetResource(target, pod), "NamedPortUnresolved", probePortStableKey(target), fmt.Sprintf("Pod %s/%s のcontainer %q に設定された%sでは、ポート名 %q が指定されています。しかし、同じcontainerのports[].nameに %q は定義されていません", pod.Namespace, pod.Name, target.Container, targetName(target), target.PortName, target.PortName), 100,
+				findings = append(findings, model.NewFinding(model.Issue, "K8S.PROBE.PORT_UNRESOLVED", "Probe", targetResource(target, pod), "NamedPortUnresolved", probePortStableKey(target), fmt.Sprintf("Pod %s/%s のコンテナ %q に設定された %s のポート %q を解決できません。同じコンテナの ports[].name には、%q が定義されていません", pod.Namespace, pod.Name, target.Container, targetName(target), target.PortName, target.PortName), 100,
 					model.Evidence{Kind: "probe", Key: "portName", Value: fmt.Sprintf("%s.port: %q", targetName(target), target.PortName)},
 					model.Evidence{Kind: "container", Key: "ports[].name", Value: namedContainerPortSummary(pod, target.Container)},
-					model.Evidence{Kind: "decision", Key: "unresolved", Value: fmt.Sprintf("ポート名 %q に対応するcontainerPort: 0件", target.PortName)},
+					model.Evidence{Kind: "decision", Key: "unresolved", Value: fmt.Sprintf("ポート名 %q に対応する containerPort は見つかりませんでした（0件）", target.PortName)},
 				))
 			} else if target.Unavailable {
-				findings = append(findings, model.NewFinding(model.Unavailable, "K8S.CONNECT.PROBE_HOST_UNSUPPORTED", "Probe確認", targetResource(target, pod), "ProbeHostNotReproduced", target.Group+"/"+targetName(target)+"/host", fmt.Sprintf("%s %s/%s: %s は接続先host指定をport-forwardで再現できないため未実施です (%s)", groupLabel(target.Group), pod.Namespace, pod.Name, targetName(target), target.Inactive), 100,
+				findings = append(findings, model.NewFinding(model.Unavailable, "K8S.CONNECT.PROBE_HOST_UNSUPPORTED", "Probe確認", targetResource(target, pod), "ProbeHostNotReproduced", target.Group+"/"+targetName(target)+"/host", fmt.Sprintf("%sを実施できません。理由: %s", connectionTargetDescription(target, pod), target.Inactive), 100,
 					model.Evidence{Kind: "probe", Key: "host", Value: probeHost(target)},
 				))
 			}
@@ -388,14 +388,14 @@ func (checker *Checker) Check(ctx context.Context, pod *corev1.Pod, services []c
 		offset++
 		if local > 65535 {
 			results = append(results, Result{Target: target, LocalPort: local, Detail: "ローカルポート範囲外"})
-			findings = append(findings, model.NewFinding(model.Unavailable, "K8S.CONNECT.LOCAL_PORT_UNAVAILABLE", "接続確認", "Pod/"+pod.Namespace+"/"+pod.Name, "LocalPortRange", target.Group+"/local-port-range", fmt.Sprintf("ローカルポート %d は65535を超えるため確認できません", local), 100))
+			findings = append(findings, model.NewFinding(model.Unavailable, "K8S.CONNECT.LOCAL_PORT_UNAVAILABLE", "接続確認", "Pod/"+pod.Namespace+"/"+pod.Name, "LocalPortRange", target.Group+"/local-port-range", fmt.Sprintf("接続確認に使用するローカルポート %d が上限の65535を超えるため、この対象は確認できません", local), 100))
 			continue
 		}
 		result, err := checker.checkOne(ctx, pod, target, local)
 		results = append(results, result)
 		if err != nil {
 			results[len(results)-1].Tested = false
-			findings = append(findings, model.NewFinding(model.Unavailable, "K8S.CONNECT.PORT_FORWARD_UNAVAILABLE", "接続確認", targetResource(target, pod), "PortForwardFailed", target.Group+"/"+targetName(target)+"/"+strconv.Itoa(target.RemotePort), fmt.Sprintf("%s %s/%s: %s :%dの接続確認を実施できません (%v)", groupLabel(target.Group), pod.Namespace, pod.Name, targetName(target), target.RemotePort, err), 100))
+			findings = append(findings, model.NewFinding(model.Unavailable, "K8S.CONNECT.PORT_FORWARD_UNAVAILABLE", "接続確認", targetResource(target, pod), "PortForwardFailed", target.Group+"/"+targetName(target)+"/"+strconv.Itoa(target.RemotePort), fmt.Sprintf("%s へのport-forwardを開始できないため、接続確認を実施できません。原因: %v", connectionTargetDescription(target, pod), err), 100))
 			continue
 		}
 		if !result.Successful {
@@ -416,7 +416,7 @@ func (checker *Checker) Check(ctx context.Context, pod *corev1.Pod, services []c
 					code = "K8S.PROBE.UNREACHABLE"
 				}
 			}
-			findings = append(findings, model.NewFinding(model.Warning, code, section, targetResource(target, pod), targetName(target), target.Group+"/"+targetName(target)+"/"+strconv.Itoa(target.RemotePort), fmt.Sprintf("%s %s/%s: %s :%d%s の単発模擬確認が失敗しました (%s)", groupLabel(target.Group), pod.Namespace, pod.Name, targetName(target), target.RemotePort, target.Path, result.Detail), confidence,
+			findings = append(findings, model.NewFinding(model.Warning, code, section, targetResource(target, pod), targetName(target), target.Group+"/"+targetName(target)+"/"+strconv.Itoa(target.RemotePort), fmt.Sprintf("%s への単発の接続確認に失敗しました。結果: %s", connectionTargetDescription(target, pod), result.Detail), confidence,
 				connectEvidence(result)...,
 			))
 			// Threshold/period evaluation is not reproduced by this one-shot
@@ -427,7 +427,7 @@ func (checker *Checker) Check(ctx context.Context, pod *corev1.Pod, services []c
 				model.Evidence{Kind: "connect", Key: "kubeletThresholdEvaluation", Value: "not-reproduced"},
 			)
 		} else if result.Warned {
-			findings = append(findings, model.NewFinding(model.Warning, "K8S.CONNECT.HTTP_RESPONSE_WARNING", "接続確認", targetResource(target, pod), "HTTPResponseWarning", target.Group+"/"+targetName(target)+"/"+strconv.Itoa(target.RemotePort), fmt.Sprintf("%s %s/%s: :%d%sは応答しましたが注意が必要です (%s)", groupLabel(target.Group), pod.Namespace, pod.Name, target.RemotePort, target.Path, result.Detail), 60, connectEvidence(result)...))
+			findings = append(findings, model.NewFinding(model.Warning, "K8S.CONNECT.HTTP_RESPONSE_WARNING", "接続確認", targetResource(target, pod), "HTTPResponseWarning", target.Group+"/"+targetName(target)+"/"+strconv.Itoa(target.RemotePort), fmt.Sprintf("%s から応答はありましたが、注意が必要です。結果: %s", connectionTargetDescription(target, pod), result.Detail), 60, connectEvidence(result)...))
 		}
 	}
 	return results, findings
@@ -511,6 +511,15 @@ func groupLabel(group string) string {
 	return "Pod直接"
 }
 
+func connectionTargetDescription(target Target, pod *corev1.Pod) string {
+	protocol := strings.ToUpper(target.Protocol)
+	if protocol == "" {
+		protocol = "TCP"
+	}
+	endpoint := fmt.Sprintf("%s :%d%s", protocol, target.RemotePort, target.Path)
+	return fmt.Sprintf("Pod %s/%s の%s（%s、確認経路: %s）", pod.Namespace, pod.Name, targetName(target), endpoint, groupLabel(target.Group))
+}
+
 func (checker *Checker) checkOne(ctx context.Context, pod *corev1.Pod, target Target, local int) (Result, error) {
 	result := Result{Target: target, LocalPort: local, Tested: true}
 	stop, ready, done, errorsFound, err := checker.forward(ctx, pod.Namespace, pod.Name, local, target.RemotePort)
@@ -530,7 +539,7 @@ func (checker *Checker) checkOne(ctx context.Context, pod *corev1.Pod, target Ta
 	if target.Protocol == "tcp" {
 		connection, err := (&net.Dialer{Timeout: timeoutFor(target.Probe, 3*time.Second)}).DialContext(ctx, "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(local)))
 		if err != nil {
-			result.Detail = err.Error()
+			result.Detail = "TCP接続に失敗しました: " + err.Error()
 			return result, nil
 		}
 		_ = connection.Close()
@@ -583,7 +592,7 @@ func (checker *Checker) checkOne(ctx context.Context, pod *corev1.Pod, target Ta
 	// endpoint; probe httpHeaders do not alter the network destination.
 	response, err := client.Do(request) // #nosec G704 -- destination is the local typed port-forward only.
 	if err != nil {
-		result.Detail = err.Error()
+		result.Detail = "HTTP要求に失敗しました: " + err.Error()
 		return result, nil
 	}
 	defer response.Body.Close()
@@ -593,18 +602,18 @@ func (checker *Checker) checkOne(ctx context.Context, pod *corev1.Pod, target Ta
 	result.BodyBytes = len(body)
 	result.Body = string(body)
 	if readErr != nil {
-		result.Detail = readErr.Error()
+		result.Detail = "HTTP応答本文を読み取れませんでした: " + readErr.Error()
 		return result, nil
 	}
 	result.Successful = response.StatusCode >= 200 && response.StatusCode < 400
 	result.Detail = fmt.Sprintf("HTTP %d", response.StatusCode)
 	if response.StatusCode >= 300 && response.StatusCode < 400 {
 		result.Warned = true
-		result.Detail += " (redirect応答)"
+		result.Detail += "（リダイレクト応答）"
 	}
 	if !result.Successful && !target.Strict {
 		result.Successful, result.Warned = true, true
-		result.Detail += " (HTTP応答あり、probe由来でないため異常確定せず)"
+		result.Detail += "（HTTP応答あり。Probe由来の確認ではないため、異常とは確定しません）"
 	}
 	return result, nil
 }

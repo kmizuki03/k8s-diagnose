@@ -26,7 +26,7 @@ const Schema = "k8s-diagnose/webhook/v1"
 func ResolveURL(environmentName string) (string, error) {
 	value := strings.TrimSpace(os.Getenv(environmentName))
 	if value == "" {
-		return "", fmt.Errorf("Webhook URLの環境変数 %s が未設定または空です", environmentName)
+		return "", fmt.Errorf("Webhook URLを保持する環境変数 %s が未設定または空です", environmentName)
 	}
 	for _, character := range value {
 		if character <= 0x20 || character == 0x7f {
@@ -34,14 +34,14 @@ func ResolveURL(environmentName string) (string, error) {
 		}
 	}
 	if strings.Contains(value, "#") {
-		return "", errors.New("Webhook URLにuserinfoまたはfragmentは指定できません")
+		return "", errors.New("Webhook URLにはフラグメント（#以降）を指定できません")
 	}
 	parsed, err := url.ParseRequestURI(value)
 	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.Hostname() == "" {
-		return "", errors.New("Webhook URLはホスト名を含むhttps:// URLで指定してください")
+		return "", errors.New("Webhook URLは、ホスト名を含む https:// URLで指定してください")
 	}
 	if parsed.User != nil || parsed.Fragment != "" {
-		return "", errors.New("Webhook URLにuserinfoまたはfragmentは指定できません")
+		return "", errors.New("Webhook URLにはユーザー情報（例: user:password@host）を指定できません")
 	}
 	// URL.Port validates bracket/port syntax while still allowing an omitted port.
 	if port := parsed.Port(); port != "" {
@@ -131,11 +131,11 @@ func Send(ctx context.Context, webhookURL string, payload map[string]any, timeou
 	}
 	body, err := json.Marshal(report.Sanitize(outgoing))
 	if err != nil {
-		return fmt.Errorf("Webhook payloadを生成できません: %w", err)
+		return fmt.Errorf("Webhookの送信データを生成できません: %w", err)
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, webhookURL, bytes.NewReader(body))
 	if err != nil {
-		return errors.New("Webhook送信要求を作成できません")
+		return errors.New("Webhookへの送信要求を作成できません")
 	}
 	request.Header.Set("Content-Type", "application/json; charset=utf-8")
 	request.Header.Set("User-Agent", "k8s-diagnose")
@@ -155,7 +155,7 @@ func Send(ctx context.Context, webhookURL string, payload map[string]any, timeou
 	defer response.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1024))
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("WebhookがHTTP %dを返しました", response.StatusCode)
+		return fmt.Errorf("Webhookの送信先がHTTP %dを返しました", response.StatusCode)
 	}
 	return nil
 }

@@ -172,15 +172,15 @@ func NewClients(cfg config.Config) (*Clients, error) {
 	addRequestTracer(restConfig, tracer)
 	kube, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
-		return nil, fmt.Errorf("Kubernetes typed clientを作成できません: %w", err)
+		return nil, fmt.Errorf("型付きKubernetesクライアントを作成できません: %w", err)
 	}
 	dynamicClient, err := dynamic.NewForConfig(restConfig)
 	if err != nil {
-		return nil, fmt.Errorf("Kubernetes dynamic clientを作成できません: %w", err)
+		return nil, fmt.Errorf("動的Kubernetesクライアントを作成できません: %w", err)
 	}
 	discoveryClient, err := discovery.NewDiscoveryClientForConfig(restConfig)
 	if err != nil {
-		return nil, fmt.Errorf("Kubernetes discovery clientを作成できません: %w", err)
+		return nil, fmt.Errorf("Kubernetes APIディスカバリークライアントを作成できません: %w", err)
 	}
 	return &Clients{Kube: kube, Dynamic: dynamicClient, Discovery: discoveryClient, RESTConfig: restConfig, Context: contextName, Namespace: cfg.Namespace, Timeout: restConfig.Timeout, warnings: warnings, trace: tracer}, nil
 }
@@ -256,7 +256,7 @@ func ErrorReason(err error) string {
 		return ""
 	}
 	label := map[ErrorStatus]string{
-		StatusNotFound: "対象が見つかりません", StatusForbidden: "アクセス権限がありません (RBAC)",
+		StatusNotFound: "対象が見つかりません", StatusForbidden: "アクセス権限がありません（RBAC）",
 		StatusUnauthorized: "認証が必要です", StatusTimeout: "要求がタイムアウトしました",
 		StatusUnavailable: "Kubernetes APIに到達できません", StatusInvalid: "API要求が不正です",
 	}[ClassifyError(err)]
@@ -266,12 +266,12 @@ func ErrorReason(err error) string {
 		detail = string(runes[:300]) + "…"
 	}
 	if label == "" {
-		return "Kubernetes APIでエラーが発生しました: " + detail
+		return "Kubernetes APIでエラーが発生しました（詳細: " + detail + "）"
 	}
 	if detail == "" {
 		return label
 	}
-	return label + ": " + detail
+	return label + "（詳細: " + detail + "）"
 }
 
 func (c *Clients) Preflight(ctx context.Context) error {
@@ -281,7 +281,7 @@ func (c *Clients) Preflight(ctx context.Context) error {
 		if c.Namespace != "" && apierrors.IsNotFound(err) {
 			return fmt.Errorf("Namespace %q が見つかりません", c.Namespace)
 		}
-		return fmt.Errorf("Kubernetesクラスタに接続できません。原因: %s", ErrorReason(err))
+		return fmt.Errorf("Kubernetesクラスタへの接続を確認できません。原因: %s", ErrorReason(err))
 	}
 	return nil
 }

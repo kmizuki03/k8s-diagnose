@@ -45,7 +45,7 @@ func commandHelp(prog, topic string) string {
   %s -a [オプション]            従来形式も利用可能
 
 対象・API:
-  -n, --namespace NAME          対象namespace（省略時は全て）
+  -n, --namespace NAME          対象Namespace（省略時はすべて）
       --context NAME            kubeconfig context
       --kubeconfig FILE         kubeconfigファイル
       --timeout SEC             API要求タイムアウト
@@ -56,22 +56,22 @@ func commandHelp(prog, topic string) string {
 このモードの追加診断:
       --logs                    失敗Podのログ
       --unused                  未使用リソース候補
-      --tail N                  --logsの表示行数
-      --log-signatures FILE     --logsの追加シグネチャ
+      --tail N                  --logsで表示する行数
+      --log-signatures FILE     --logsで使用する追加シグネチャ
       --log-signature-lines N   ログ解析行数
       --events-limit N          Warning Event表示数
       --restart-threshold N     再起動警告閾値
       --node-heartbeat-timeout SEC
       --debug                   診断後にdebugメニュー
-      --debug-image IMAGE       debug用image
-      --debug-profile NAME      kubectl debug profile
+      --debug-image IMAGE       debugで使用するコンテナイメージ
+      --debug-profile NAME      kubectl debugで使用するプロファイル
   -w, --watch SEC              定期再診断
 
 レポート・CI・履歴:
       --output FORMAT           text/json/sarif/junit/mermaid/dot
       --output-file FILE        構造化レポート保存先
       --save-snapshot FILE      今回結果を保存
-      --diff FILE               前回snapshotと比較
+      --diff FILE               前回のスナップショットと比較
       --baseline FILE           承認済み所見INI
       --fail-on LEVEL           issue/warning/unavailable/any/none
       --max-issues N            許容件数
@@ -90,10 +90,10 @@ func commandHelp(prog, topic string) string {
       --api-requests / --no-api-requests
 
 主な組み合わせ:
-  --tail / --log-signaturesは--logsが必要です。
-  --debugはtextの一度実行専用、--watchと構造化--outputは併用できません。
-  --exit-zero、--fail-on/--max-issues、--watchは互いに失敗方針が衝突する組み合わせを拒否します。
-  Webhookは--diff、--history-db、--watchのいずれかが必要です。
+  --tail または --log-signatures を使用するには、--logs も指定してください。
+  --debug は一度だけ実行するテキスト出力専用です。--watch や text 以外の --output とは併用できません。
+  --exit-zero、--fail-on、--max-issues、--watch は、失敗条件が矛盾する組み合わせを指定できません。
+  Webhookを使用するには、--diff、--history-db、--watch のいずれかも指定してください。
 
 例:
   %s all --logs --unused
@@ -133,8 +133,8 @@ func commandHelp(prog, topic string) string {
       --connect-port PORT       ローカル先頭ポート
       --connect-path PATH       /で始まるHTTPパス上書き
       --debug                   診断後にdebugメニュー
-      --debug-image IMAGE       debug用image
-      --debug-profile NAME      kubectl debug profile
+      --debug-image IMAGE       debugで使用するコンテナイメージ
+      --debug-profile NAME      kubectl debugで使用するプロファイル
       --baseline FILE           承認済み所見INI
 
 共通:
@@ -145,7 +145,7 @@ func commandHelp(prog, topic string) string {
 主な組み合わせ:
   --connect-port / --connect-pathは--connectが必要です。
   --debug-image / --debug-profileは--debugが必要です。
-  Pod個別はtext出力専用で、全体専用の--logs / --unusedは使えません。
+  Pod個別診断はテキスト出力専用です。全体診断専用の --logs と --unused は使用できません。
 
 例:
   %s pod --connect --connect-path /ready
@@ -160,7 +160,7 @@ func commandHelp(prog, topic string) string {
   %s --list [対象オプション]    従来形式も利用可能
 
 利用できるオプション:
-  -n, --namespace NAME          対象namespace
+  -n, --namespace NAME          対象Namespace
       --context NAME            kubeconfig context
       --kubeconfig FILE         kubeconfigファイル
       --timeout SEC             API要求タイムアウト
@@ -170,7 +170,7 @@ func commandHelp(prog, topic string) string {
       --cmd / --no-cmd          各診断項目の確認用kubectlを表示
       --api-requests / --no-api-requests
                                 末尾の実API要求を表示／非表示
-      --no-mask                 対話端末のtext表示でマスク解除
+      --no-mask                 対話端末のテキスト表示でマスク解除
       --config FILE             INIを明示読込
       --no-config               既定INIを読まない
 
@@ -187,7 +187,7 @@ func commandHelp(prog, topic string) string {
   %s --triage [オプション]      従来形式も利用可能
 
 利用できる主なオプション:
-  -n, --namespace NAME          対象namespace
+  -n, --namespace NAME          対象Namespace
       --context NAME            kubeconfig context
       --kubeconfig FILE         kubeconfigファイル
       --timeout SEC             API要求タイムアウト
@@ -209,22 +209,22 @@ func commandHelp(prog, topic string) string {
       --api-requests / --no-api-requests
 
 主な組み合わせ:
-  構造化--outputと--watchは併用できません。
-  --watchでは--exit-zero / --fail-on / --max-issuesを指定しません。
-  Webhookは--diff、--history-db、--watchのいずれかが必要です。
+  text 以外の --output と --watch は併用できません。
+  --watch では --exit-zero、--fail-on、--max-issues を指定できません。
+  Webhookを使用するには、--diff、--history-db、--watch のいずれかも指定してください。
 
 簡単な入口:
-  %s quick                     textで一度だけ確認
+  %s quick                     テキスト形式で一度だけ確認
   %s ci                        JSON出力、確定異常で失敗
 
 全フラグ: %s advanced --help
 `, prog, prog, prog, prog, prog, prog)
 	case "quick":
-		return presetHelp(prog, "quick", "短時間のtriageをtextで一度だけ実行", "text / 秘匿情報マスク / 確定異常でexit 1 / 確認コマンド・実API要求非表示")
+		return presetHelp(prog, "quick", "短時間の初動診断をテキスト形式で一度だけ実行", "テキスト出力 / 秘匿情報マスク / 確定異常があれば終了コード1 / 確認コマンド・実API要求は非表示")
 	case "ci":
-		return presetHelp(prog, "ci", "CI向けtriage設定を一語で適用", "JSON / 秘匿情報マスク / 確定異常でexit 1")
+		return presetHelp(prog, "ci", "CI向けの初動診断設定を一語で適用", "JSON出力 / 秘匿情報マスク / 確定異常があれば終了コード1")
 	case "deep":
-		return presetHelp(prog, "deep", "クラスタ全体をログ・未使用候補込みで診断", "text / --logs / --unused")
+		return presetHelp(prog, "deep", "クラスタ全体をログ・未使用候補込みで診断", "テキスト出力 / --logs / --unused")
 	case "config":
 		return fmt.Sprintf(`%s config — 対話式設定エディタ
 

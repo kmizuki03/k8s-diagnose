@@ -105,7 +105,7 @@ func Parse(args []string, prog string) (Config, error) {
 		return cfg, err
 	}
 	if noConfig && configPath != "" {
-		return cfg, errors.New("--configと--no-configは同時に指定できません")
+		return cfg, errors.New("--config と --no-config は同時に指定できません")
 	}
 	helpRequested, err := booleanOptionEnabled(args, "-h", "--help")
 	if err != nil {
@@ -224,10 +224,10 @@ func Parse(args []string, prog string) (Config, error) {
 		}
 	}
 	if selected > 1 {
-		return cfg, errors.New("診断モードは -a / -s / --list / --triage のいずれか1つだけ指定してください")
+		return cfg, errors.New("診断モードは -a、-s、--list、--triage のいずれか1つだけ指定してください")
 	}
 	if commandMode(command) != "" && selected > 0 {
-		return cfg, fmt.Errorf("%sコマンドでは診断モードを追加指定できません", command)
+		return cfg, fmt.Errorf("%s コマンドでは診断モードを追加指定できません", command)
 	}
 	if all {
 		cfg.Mode = "all"
@@ -242,7 +242,7 @@ func Parse(args []string, prog string) (Config, error) {
 		cfg.Mask = false
 	}
 	if showCmd && noCmd {
-		return cfg, errors.New("--cmdと--no-cmdは同時に指定できません")
+		return cfg, errors.New("--cmd と --no-cmd は同時に指定できません")
 	}
 	if showCmd {
 		cfg.ShowCmd = true
@@ -257,7 +257,7 @@ func Parse(args []string, prog string) (Config, error) {
 		cfg.ShowAPIRequests = cfg.ShowCmd
 	}
 	if showAPIRequests && noAPIRequests {
-		return cfg, errors.New("--api-requestsと--no-api-requestsは同時に指定できません")
+		return cfg, errors.New("--api-requests と --no-api-requests は同時に指定できません")
 	}
 	if showAPIRequests {
 		cfg.ShowAPIRequests = true
@@ -306,7 +306,7 @@ func (c Config) Validate(raw []string) error {
 		return nil
 	}
 	if c.Namespace != "" && !namespaceRE.MatchString(c.Namespace) {
-		return fmt.Errorf("namespace名が不正です: %s", c.Namespace)
+		return fmt.Errorf("Namespace名が不正です: %s", c.Namespace)
 	}
 	for label, value := range map[string]int{
 		"--timeout": c.RequestTimeout, "--events-limit": c.EventsLimit,
@@ -317,168 +317,168 @@ func (c Config) Validate(raw []string) error {
 		"--history-retain": c.HistoryRetain, "--webhook-timeout": c.WebhookTimeout,
 	} {
 		if value < 1 {
-			return fmt.Errorf("%sは1以上の整数で指定してください", label)
+			return fmt.Errorf("%s は1以上の整数で指定してください", label)
 		}
 	}
 	if c.Workers > 16 {
-		return errors.New("--workersは1以上16以下で指定してください")
+		return errors.New("--workers は1以上16以下で指定してください")
 	}
 	if c.LogSignatureLines > 5000 {
-		return errors.New("--log-signature-linesは5000以下で指定してください")
+		return errors.New("--log-signature-lines は5000以下で指定してください")
 	}
 	if c.RestartThreshold < 0 {
-		return errors.New("--restart-thresholdは0以上で指定してください")
+		return errors.New("--restart-threshold は0以上で指定してください")
 	}
 	if c.Watch < 0 || c.explicitlyConfigured(raw, "diagnosis.watch", "-w", "--watch") && c.Watch == 0 {
-		return errors.New("--watchは1以上の整数で指定してください")
+		return errors.New("--watch は1以上の整数で指定してください")
 	}
 	if c.ConnectPort != 0 && (c.ConnectPort < 1024 || c.ConnectPort > 65535) {
-		return errors.New("--connect-portは1024以上65535以下で指定してください")
+		return errors.New("--connect-port は1024以上65535以下で指定してください")
 	}
 	if c.ConnectPath != "" {
 		if !strings.HasPrefix(c.ConnectPath, "/") || strings.ContainsAny(c.ConnectPath, " \t\r\n") {
-			return errors.New("--connect-pathは空白を含まず / で始めてください (例: /ready)")
+			return errors.New("--connect-path は、空白を含まず「/」で始まる値を指定してください（例: /ready）")
 		}
 	}
 	if c.ConnectPort != 0 && !c.Connect || c.ConnectPath != "" && !c.Connect {
-		return errors.New("--connect-port/--connect-pathには--connectが必要です")
+		return errors.New("--connect-port または --connect-path を使用するには、--connect も指定してください")
 	}
 	if c.Connect && c.Mode != "select" {
-		return errors.New("--connectは個別診断(-s)専用です")
+		return errors.New("--connect は個別診断（-s）でのみ使用できます")
 	}
 	if c.Debug && c.Mode != "all" && c.Mode != "select" {
-		return errors.New("--debugは-aまたは-sと組み合わせてください")
+		return errors.New("--debug は -a または -s と組み合わせてください")
 	}
 	if c.Debug && c.Output != "text" {
-		return errors.New("--debugは対話表示(--output text)専用です")
+		return errors.New("--debug は対話形式のテキスト出力（--output=text）でのみ使用できます")
 	}
 	if c.Debug && (strings.TrimSpace(c.DebugImage) == "" || strings.ContainsAny(c.DebugImage, " \t\r\n")) {
-		return errors.New("--debug-imageは空白を含まない空でないimage参照で指定してください")
+		return errors.New("--debug-image には、空ではなく空白を含まないコンテナイメージを指定してください")
 	}
 	if c.Debug && (strings.TrimSpace(c.DebugProfile) == "" || strings.ContainsAny(c.DebugProfile, " \t\r\n")) {
-		return errors.New("--debug-profileは空白を含まない空でないprofile名で指定してください")
+		return errors.New("--debug-profile には、空ではなく空白を含まないプロファイル名を指定してください")
 	}
 	if (c.explicitlyConfigured(raw, "debug.image", "--debug-image") || c.explicitlyConfigured(raw, "debug.profile", "--debug-profile")) && !c.Debug {
-		return errors.New("--debug-image/--debug-profileには--debugが必要です")
+		return errors.New("--debug-image または --debug-profile を使用するには、--debug も指定してください")
 	}
 	if c.Watch > 0 && c.Mode != "all" && c.Mode != "triage" {
-		return errors.New("--watchは-aまたは--triageで使用してください")
+		return errors.New("--watch は -a または --triage と組み合わせてください")
 	}
 	if c.Watch > 0 && c.Debug {
-		return errors.New("--debugと--watchは併用できません")
+		return errors.New("--debug と --watch は併用できません")
 	}
 	if c.ShowLogs && c.Mode != "all" {
-		return errors.New("--logsは全体診断(-a)専用です")
+		return errors.New("--logs は全体診断（-a）でのみ使用できます")
 	}
 	if c.ShowUnused && c.Mode != "all" {
-		return errors.New("--unusedは全体診断(-a)専用です")
+		return errors.New("--unused は全体診断（-a）でのみ使用できます")
 	}
 	logDiagnosis := c.Mode == "select" || c.Mode == "all" && c.ShowLogs
 	if (c.LogSignatures != "" || c.explicitlyConfigured(raw, "diagnosis.log_signature_lines", "--log-signature-lines")) && !logDiagnosis {
-		return errors.New("--log-signatures/--log-signature-linesは-s、または-a --logsと組み合わせてください")
+		return errors.New("--log-signatures または --log-signature-lines は、-s または「-a --logs」と組み合わせてください")
 	}
 	if c.explicitlyConfigured(raw, "display.tail", "--tail") && !logDiagnosis {
-		return errors.New("--tailは-s、または-a --logsと組み合わせてください")
+		return errors.New("--tail は、-s または「-a --logs」と組み合わせてください")
 	}
 	if c.Mode == "list" && c.explicitlyConfigured(raw, "diagnosis.events_limit", "--events-limit") {
-		return errors.New("--events-limitは--listでは使用できません")
+		return errors.New("--events-limit は --list では使用できません")
 	}
 	if c.Mode == "list" && c.explicitlyConfigured(raw, "diagnosis.restart_threshold", "--restart-threshold") {
-		return errors.New("--restart-thresholdは--listでは使用できません")
+		return errors.New("--restart-threshold は --list では使用できません")
 	}
 	if c.Mode != "all" && c.Mode != "triage" && c.explicitlyConfigured(raw, "diagnosis.node_heartbeat_timeout", "--node-heartbeat-timeout") {
-		return errors.New("--node-heartbeat-timeoutは-aまたは--triageで使用してください")
+		return errors.New("--node-heartbeat-timeout は -a または --triage と組み合わせてください")
 	}
 	if c.Mode == "list" && c.BaselineFile != "" {
-		return errors.New("--baselineは-a、-s、または--triageで使用してください")
+		return errors.New("--baseline は -a、-s、--triage のいずれかと組み合わせてください")
 	}
 	if c.Mode == "list" && c.explicitlyConfigured(raw, "display.exit_zero", "--exit-zero") {
-		return errors.New("--exit-zeroは--listでは意味を持ちません")
+		return errors.New("--exit-zero は --list では使用しても結果が変わりません")
 	}
 	structured := c.Output != "text"
 	if !oneOf(c.Output, "text", "json", "sarif", "junit", "mermaid", "dot") {
-		return errors.New("--outputはtext/json/sarif/junit/mermaid/dotから選択してください")
+		return errors.New("--output は text、json、sarif、junit、mermaid、dot のいずれかを指定してください")
 	}
 	if structured && !c.Mask {
-		return errors.New("--no-mask/display.mask_secrets=falseはtext出力専用です")
+		return errors.New("--no-mask または display.mask_secrets=false は、テキスト出力でのみ使用できます")
 	}
 	if structured && c.explicitlyConfigured(raw, "display.show_commands", "--cmd", "--no-cmd") {
-		return errors.New("--cmd/--no-cmdはtext出力専用です")
+		return errors.New("--cmd または --no-cmd は、テキスト出力でのみ使用できます")
 	}
 	if structured && c.explicitlyConfigured(raw, "display.show_api_requests", "--api-requests", "--no-api-requests") {
-		return errors.New("--api-requests/--no-api-requestsはtext出力専用です")
+		return errors.New("--api-requests または --no-api-requests は、テキスト出力でのみ使用できます")
 	}
 	if structured && c.explicitlyConfigured(raw, "display.tail", "--tail") {
-		return errors.New("--tailはtext出力専用です")
+		return errors.New("--tail は、テキスト出力でのみ使用できます")
 	}
 	if structured && c.explicitlyConfigured(raw, "diagnosis.events_limit", "--events-limit") {
-		return errors.New("--events-limitはtext出力専用です")
+		return errors.New("--events-limit は、テキスト出力でのみ使用できます")
 	}
 	if structured && c.Mode != "all" && c.Mode != "triage" {
-		return errors.New("構造化--outputは-aまたは--triageで使用してください")
+		return errors.New("--output に text 以外の形式を指定できるのは、-a または --triage の場合だけです")
 	}
 	if structured && c.Watch > 0 {
-		return errors.New("構造化--outputと--watchは併用できません")
+		return errors.New("--output に text 以外の形式を指定した場合、--watch は併用できません")
 	}
 	if c.OutputFile != "" && !structured {
-		return errors.New("--output-fileには構造化--outputが必要です")
+		return errors.New("--output-file を使用するには、--output に text 以外の形式を指定してください")
 	}
 	if err := validateDistinctOutputPaths(c); err != nil {
 		return err
 	}
 	if (c.SaveSnapshot != "" || c.DiffFrom != "") && c.Mode != "all" && c.Mode != "triage" {
-		return errors.New("--save-snapshot/--diffは-aまたは--triageで使用してください")
+		return errors.New("--save-snapshot または --diff は、-a または --triage と組み合わせてください")
 	}
 	if (c.SaveSnapshot != "" || c.DiffFrom != "") && c.Watch > 0 {
-		return errors.New("--save-snapshot/--diffと--watchは併用できません")
+		return errors.New("--save-snapshot または --diff と、--watch は併用できません")
 	}
 	if !oneOf(c.FailOn, "issue", "warning", "unavailable", "any", "none") {
-		return errors.New("--fail-onの値が不正です")
+		return errors.New("--fail-on は issue、warning、unavailable、any、none のいずれかを指定してください")
 	}
 	failPolicyConfigured := c.explicitlyConfigured(raw, "report.fail_on", "--fail-on") || c.explicitlyConfigured(raw, "report.max_issues", "--max-issues")
 	if failPolicyConfigured && c.Mode != "all" && c.Mode != "triage" {
-		return errors.New("--fail-on/--max-issuesは-aまたは--triageで使用してください")
+		return errors.New("--fail-on または --max-issues は、-a または --triage と組み合わせてください")
 	}
 	if c.FailOn == "none" && c.MaxIssues != nil {
-		return errors.New("--fail-on noneでは--max-issuesは意味を持ちません")
+		return errors.New("--fail-on=none を指定した場合、--max-issues は使用しても結果が変わりません")
 	}
 	if c.ExitZero && failPolicyConfigured {
-		return errors.New("--exit-zeroと--fail-on/--max-issuesは併用できません")
+		return errors.New("--exit-zero は、--fail-on または --max-issues と併用できません")
 	}
 	if c.Watch > 0 && (c.ExitZero || failPolicyConfigured) {
-		return errors.New("--watchでは--exit-zero/--fail-on/--max-issuesは意味を持ちません")
+		return errors.New("--watch と、--exit-zero、--fail-on、--max-issues は併用できません")
 	}
 	if c.HistoryDB != "" && c.Mode != "all" && c.Mode != "triage" {
-		return errors.New("--history-dbは-aまたは--triageで使用してください")
+		return errors.New("--history-db は -a または --triage と組み合わせてください")
 	}
 	if c.HistoryWindow < 2 || c.FlapThreshold >= c.HistoryWindow {
-		return errors.New("--history-windowは2以上、--flap-thresholdはwindow未満で指定してください")
+		return errors.New("--history-window は2以上、--flap-threshold は --history-window 未満で指定してください")
 	}
 	if c.WebhookURLEnv != "" {
 		if !envRE.MatchString(c.WebhookURLEnv) {
-			return errors.New("--webhook-url-envは有効な環境変数名で指定してください")
+			return errors.New("--webhook-url-env には、有効な環境変数名を指定してください")
 		}
 		if c.DiffFrom == "" && c.HistoryDB == "" && c.Watch == 0 {
-			return errors.New("--webhook-url-envには--diff、--history-db、--watchのいずれかが必要です")
+			return errors.New("--webhook-url-env を使用するには、--diff、--history-db、--watch のいずれかも指定してください")
 		}
 	}
 	if c.WebhookURLEnv == "" && (c.explicitlyConfigured(raw, "notification.format", "--webhook-format") || c.explicitlyConfigured(raw, "notification.timeout", "--webhook-timeout")) {
-		return errors.New("--webhook-format/--webhook-timeoutには--webhook-url-envが必要です")
+		return errors.New("--webhook-format または --webhook-timeout を使用するには、--webhook-url-env も指定してください")
 	}
 	if !oneOf(c.WebhookFormat, "generic", "slack") {
-		return errors.New("--webhook-formatはgenericまたはslackで指定してください")
+		return errors.New("--webhook-format は generic または slack を指定してください")
 	}
 	if c.HistoryDB == "" && c.Watch == 0 && (c.explicitlyConfigured(raw, "history.window", "--history-window") || c.explicitlyConfigured(raw, "history.flap_threshold", "--flap-threshold") || c.explicitlyConfigured(raw, "history.restart_growth", "--restart-growth")) {
-		return errors.New("--history-window/--flap-threshold/--restart-growthには--history-dbまたは--watchが必要です")
+		return errors.New("--history-window、--flap-threshold、--restart-growth を使用するには、--history-db または --watch も指定してください")
 	}
 	if c.HistoryDB == "" && c.explicitlyConfigured(raw, "history.retain", "--history-retain") {
-		return errors.New("--history-retainには--history-dbが必要です")
+		return errors.New("--history-retain を使用するには、--history-db も指定してください")
 	}
 	if c.PageSize < 1 || c.PageSize > 5000 {
-		return errors.New("--page-sizeは1以上5000以下で指定してください")
+		return errors.New("--page-size は1以上5000以下で指定してください")
 	}
 	if c.QPS <= 0 || math.IsNaN(c.QPS) || math.IsInf(c.QPS, 0) || c.QPS > math.MaxFloat32 || float32(c.QPS) == 0 {
-		return errors.New("--qpsは0より大きい有限のfloat32範囲で指定してください")
+		return errors.New("--qps には、0より大きくfloat32で表現可能な有限値を指定してください")
 	}
 	return nil
 }
@@ -515,7 +515,7 @@ func validateDistinctOutputPaths(c Config) error {
 				return fmt.Errorf("出力先パスを検証できません: %w", err)
 			}
 			if same {
-				return fmt.Errorf("%sと%sに同じファイルを指定できません", writers[left].label, writers[right].label)
+				return fmt.Errorf("%s と %s に同じファイルを指定できません", writers[left].label, writers[right].label)
 			}
 		}
 		for _, reader := range readers {
@@ -527,7 +527,7 @@ func validateDistinctOutputPaths(c Config) error {
 				return fmt.Errorf("入出力パスを検証できません: %w", err)
 			}
 			if same {
-				return fmt.Errorf("%sの出力先に入力ファイル%sを指定できません", writers[left].label, reader.label)
+				return fmt.Errorf("%s の出力先には、入力ファイルとして使用している %s を指定できません", writers[left].label, reader.label)
 			}
 		}
 	}
@@ -609,7 +609,7 @@ func booleanOptionEnabled(args []string, names ...string) (bool, error) {
 		}
 		parsed, err := strconv.ParseBool(raw)
 		if err != nil {
-			return false, fmt.Errorf("%sの真偽値が不正です: %q", name, raw)
+			return false, fmt.Errorf("%s の真偽値が不正です: %q", name, raw)
 		}
 		value = parsed
 	}
@@ -638,7 +638,7 @@ func findConfigPath(args []string) (string, error) {
 			value = strings.TrimSpace(strings.SplitN(arg, "=", 2)[1])
 		} else if arg == "--config" || arg == "-config" {
 			if index+1 >= len(args) || strings.TrimSpace(args[index+1]) == "" {
-				return "", errors.New("--configには空でないパスを指定してください")
+				return "", errors.New("--config には空ではないファイルパスを指定してください")
 			}
 			index++
 			value = strings.TrimSpace(args[index])
@@ -646,10 +646,10 @@ func findConfigPath(args []string) (string, error) {
 			continue
 		}
 		if value == "" {
-			return "", errors.New("--configには空でないパスを指定してください")
+			return "", errors.New("--config には空ではないファイルパスを指定してください")
 		}
 		if path != "" {
-			return "", errors.New("--configは1回だけ指定してください")
+			return "", errors.New("--config は1回だけ指定してください")
 		}
 		path = value
 	}
@@ -706,7 +706,7 @@ Pod選択操作 (-s / -a --debug):
       --events-limit N      最新イベント数 (既定20)
       --restart-threshold N 再起動警告閾値 (既定5)
       --node-heartbeat-timeout SEC Node Lease停滞判定 (既定180)
-      --connect             Probeをport-forwardで単発確認 (-sのみ)
+      --connect             一時port-forwardで単発確認 (-sのみ・追加確認なし)
       --connect-port PORT   ローカル先頭ポート 1024〜65535
       --connect-path PATH   /で始まるHTTPパス
       --debug               診断後にdebugメニュー (-a / -s)
@@ -756,7 +756,7 @@ Pod選択操作 (-s / -a --debug):
   --fail-on none             --max-issuesと併用不可
   --watch                    --fail-on / --max-issuesと併用不可
   --no-mask/cmd/tail/events  text出力のみ
-  構造化--output             -a / --triageのみ、--watch不可
+  text以外の --output       -a / --triageのみ、--watchとの併用不可
   --history-db               -a / --triageのみ、--watch可
   --webhook-url-env          --diff / --history-db / --watchのいずれかが必要
   --webhook-format/timeout   --webhook-url-envが必要
@@ -822,7 +822,7 @@ func EnsureReadableFile(path string) error {
 		return err
 	}
 	if !info.Mode().IsRegular() {
-		return errors.New("通常ファイルではありません")
+		return errors.New("指定されたパスは通常ファイルではありません")
 	}
 	return nil
 }

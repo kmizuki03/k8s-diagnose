@@ -31,7 +31,7 @@ func (PodMetricsRule) Metadata() Metadata {
 	return Metadata{
 		ID: "pod-metrics", Section: "メトリクス", Description: "Pod使用量",
 		Required: []string{"pod_metrics"}, UnavailableCode: "K8S.METRICS.D0439E88",
-		Permissions: namespaced("metrics.k8s.io", "pods"), Modes: []string{"all"},
+		Permissions: namespaced("metrics.k8s.io", "pods"), Modes: []string{"all", "select"},
 	}
 }
 

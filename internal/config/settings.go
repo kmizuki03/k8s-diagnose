@@ -14,7 +14,7 @@ import (
 func LoadINI(path string, cfg *Config) error {
 	file, err := os.Open(path) // #nosec G304 -- --config explicitly selects the INI file.
 	if err != nil {
-		return fmt.Errorf("設定ファイルを読み込めません: %s (%w)", path, err)
+		return fmt.Errorf("設定ファイルを読み込めません: %s（%w）", path, err)
 	}
 	defer file.Close()
 	return loadINI(file, cfg)
@@ -45,11 +45,11 @@ func loadINI(reader io.Reader, cfg *Config) error {
 			continue
 		}
 		if section == "" {
-			return fmt.Errorf("設定値はセクション内に記述してください (%d行目)", lineNo)
+			return fmt.Errorf("設定値はセクション内に記述してください（%d行目）", lineNo)
 		}
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) != 2 {
-			return fmt.Errorf("設定ファイルの形式が不正です (%d行目)", lineNo)
+			return fmt.Errorf("設定ファイルの形式が不正です（%d行目）", lineNo)
 		}
 		key := strings.ToLower(strings.TrimSpace(parts[0]))
 		name := section + "." + key
@@ -62,13 +62,13 @@ func loadINI(reader io.Reader, cfg *Config) error {
 		seenKeys[name] = struct{}{}
 		value, err := parseINIValue(parts[1])
 		if err != nil {
-			return fmt.Errorf("設定ファイルの値が不正です (%d行目): %w", lineNo, err)
+			return fmt.Errorf("設定ファイルの値が不正です（%d行目）: %w", lineNo, err)
 		}
 		if value == "" {
 			continue
 		}
 		if err := applySetting(cfg, section, key, value); err != nil {
-			return fmt.Errorf("設定値が不正です: [%s] %s=%q (%w)", section, key, value, err)
+			return fmt.Errorf("設定値が不正です: [%s] %s=%q（理由: %w）", section, key, value, err)
 		}
 		if cfg.explicitSettings == nil {
 			cfg.explicitSettings = map[string]bool{}
@@ -152,7 +152,7 @@ func applySetting(cfg *Config, section, key, value string) error {
 		case "0", "no", "false", "off":
 			return false, nil
 		default:
-			return false, fmt.Errorf("true/false、yes/no、on/off、1/0で指定してください")
+			return false, fmt.Errorf("true、false、yes、no、on、off、1、0 のいずれかを指定してください")
 		}
 	}
 	integer := func(minimum int) (int, error) {
@@ -201,7 +201,7 @@ func applySetting(cfg *Config, section, key, value string) error {
 		cfg.PageSize = int64(n)
 	case "diagnosis.mode":
 		if !oneOf(value, "all", "select", "list", "triage") {
-			return fmt.Errorf("all/select/list/triageから選択してください")
+			return fmt.Errorf("all、select、list、triage のいずれかを指定してください")
 		}
 		cfg.Mode = value
 	case "diagnosis.logs":

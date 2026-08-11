@@ -118,7 +118,7 @@ func UnusedFindings(snapshot *kube.Snapshot, excludeSystemNamespaces bool) []mod
 		if _, exists := used[resource]; exists {
 			continue
 		}
-		result = append(result, model.NewFinding(model.Candidate, "K8S.UNUSED.CANDIDATE", "未使用候補", resource, "NoObservedReference", "unused", fmt.Sprintf("%s %sは取得できた範囲で参照を確認できませんでした", value.kind, shortRef(value.namespace, value.name)), 35))
+		result = append(result, model.NewFinding(model.Candidate, "K8S.UNUSED.CANDIDATE", "未使用候補", resource, "NoObservedReference", "unused", fmt.Sprintf("%s %s は、取得できたリソースの参照関係には現れませんでした。実際に未使用か確認してください", value.kind, shortRef(value.namespace, value.name)), 35))
 	}
 	return result
 }

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/kmizuki03/k8s-diagnose/internal/console"
@@ -100,14 +101,18 @@ func (screen *podSelectionScreen) cursor(visible bool) error {
 	return err
 }
 
-func (screen *podSelectionScreen) pageSize(total int) int {
+func (screen *podSelectionScreen) pageSize(total int, notice bool) int {
 	if !screen.alternate {
 		return max(1, total)
 	}
-	// Header, filters, chapter, legend, table header, position and operation
-	// guide use roughly 18 rows. Keep at least three Pods visible on a short
-	// terminal and scroll before terminal wrapping corrupts the fifth row.
-	return min(max(3, screen.height-18), max(1, total))
+	// Header、検索条件、chapter、凡例、表ヘッダ、選択中表示、3行の操作
+	// ガイドと最終改行を先に確保する。通知がある再描画ではさらに1行を
+	// 確保し、最下行への改行で端末全体がスクロールすることを防ぐ。
+	reserved := 20
+	if notice {
+		reserved++
+	}
+	return min(max(3, screen.height-reserved), max(1, total))
 }
 
 func (screen *podSelectionScreen) menuPageSize(total int) int {
@@ -118,6 +123,16 @@ func (screen *podSelectionScreen) menuPageSize(total int) int {
 	// enough lines that moving to the fifth item scrolls instead of wrapping
 	// into the terminal footer.
 	return min(max(3, screen.height-20), max(1, total))
+}
+
+func (screen *podSelectionScreen) rootMenuPageSize(total int) int {
+	if !screen.alternate {
+		return max(1, total)
+	}
+	// The root guide has only eight entries and uses a compact description and
+	// footer layout. Fifteen rows cover the header and fixed text, so a common
+	// 23-line terminal can show every entry without scrolling.
+	return min(max(3, screen.height-15), max(1, total))
 }
 
 func (runner *Runner) promptPod(pods []corev1.Pod) (*corev1.Pod, bool, error) {
@@ -148,32 +163,42 @@ func (runner *Runner) promptPod(pods []corev1.Pod) (*corev1.Pod, bool, error) {
 		namespaceFilter := namespaceQuery
 		if runner.Config.Namespace != "" {
 			namespaceFilter = runner.Config.Namespace
-			runner.Console.Write("  Namespace検索: " + console.MaskSecrets(runner.Config.Namespace, runner.Config.Mask) + " (-nで固定)")
+			line := "  Namespace検索: " + console.MaskSecrets(runner.Config.Namespace, runner.Config.Mask) + " (-nで固定)"
+			runner.Console.Write(console.TruncateDisplay(line, runner.Console.Width()))
 		} else {
-			runner.Console.Write("  Namespace検索: " + podFilterLabel(namespaceQuery, runner.Config.Mask) + "  [nで編集]")
+			line := "  Namespace検索: " + podFilterLabel(namespaceQuery, runner.Config.Mask) + "  [nで編集]"
+			runner.Console.Write(console.TruncateDisplay(line, runner.Console.Width()))
 		}
-		runner.Console.Write("  Pod名検索    : " + podFilterLabel(nameQuery, runner.Config.Mask) + "  [/ または f で編集]")
-		if notice != "" {
-			runner.Console.Write("  " + notice)
+		nameFilterLine := "  Pod名検索    : " + podFilterLabel(nameQuery, runner.Config.Mask) + "  [/ または f で編集]"
+		runner.Console.Write(console.TruncateDisplay(nameFilterLine, runner.Console.Width()))
+		hasNotice := notice != ""
+		if hasNotice {
+			runner.Console.Write(console.TruncateDisplay("  "+notice, runner.Console.Width()))
 			notice = ""
 		}
 
 		candidates := sortedPods(filterPods(pods, namespaceFilter, nameQuery))
 		if len(candidates) > 0 {
 			selected = min(selected, len(candidates)-1)
-			start, end := selectionWindow(len(candidates), selected, screen.pageSize(len(candidates)))
-			runner.Console.PodTable([]string{"", "NAMESPACE", "NAME", "READY", "STATUS"}, selectionPodRows(candidates[start:end], selected-start))
+			start, end := selectionWindow(len(candidates), selected, screen.pageSize(len(candidates), hasNotice))
+			// 全候補から列幅を一度だけ決めてから表示範囲を切り出す。スクロール
+			// のたびに列位置が左右へ揺れることを防ぐ。
+			rows := fitSelectionPodRows(selectionPodRows(candidates, selected), runner.Console.Width())
+			runner.Console.PodTable(podSelectionHeaders, rows[start:end])
 			if start > 0 || end < len(candidates) {
-				runner.Console.Write(fmt.Sprintf("\n  表示 %d-%d / %d件", start+1, end, len(candidates)))
+				runner.Console.Write(fmt.Sprintf("  表示 %d-%d / %d件", start+1, end, len(candidates)))
 			}
-			runner.Console.Write(fmt.Sprintf("  選択中: %s/%s", candidates[selected].Namespace, candidates[selected].Name))
+			selectedLabel := fmt.Sprintf("  選択中: %s/%s", candidates[selected].Namespace, candidates[selected].Name)
+			runner.Console.Write(console.TruncateDisplay(selectedLabel, runner.Console.Width()))
 		} else {
 			selected = 0
-			runner.Console.PodTable([]string{"", "NAMESPACE", "NAME", "READY", "STATUS"}, nil)
-			runner.Console.Write("  ▲ 一致するPodがありません。n または / で検索条件を変更してください。")
+			runner.Console.PodTable(podSelectionHeaders, nil)
+			runner.Console.Write("  ▲ 一致するPodがありません。")
+			runner.Console.Write("    n または / で検索条件を変更してください。")
 		}
-		runner.Console.Write("  ↑/↓: 選択  Enter/→: 決定  n: Namespace検索  /・f: Pod名検索")
-		runner.Console.Write("  r: 両方を編集  c: 条件を消去  b: 戻る  q: 終了")
+		runner.Console.Write("  ↑/↓: 選択  Enter/→: 決定")
+		runner.Console.Write("  n: Namespace検索  /・f: Pod名検索  r: 両方を編集")
+		runner.Console.Write("  c: 条件を消去  b: 戻る  q: 終了")
 
 		action, err := readPodSelectionKey(reader, runner.Streams.In)
 		if err != nil {
@@ -198,11 +223,11 @@ func (runner *Runner) promptPod(pods []corev1.Pod) (*corev1.Pod, bool, error) {
 			}
 		case podSelectionPageUp:
 			if len(candidates) > 0 {
-				selected = max(0, selected-screen.pageSize(len(candidates)))
+				selected = max(0, selected-screen.pageSize(len(candidates), hasNotice))
 			}
 		case podSelectionPageDown:
 			if len(candidates) > 0 {
-				selected = min(len(candidates)-1, selected+screen.pageSize(len(candidates)))
+				selected = min(len(candidates)-1, selected+screen.pageSize(len(candidates), hasNotice))
 			}
 		case podSelectionChoose:
 			if len(candidates) == 0 {
@@ -260,7 +285,7 @@ func (runner *Runner) promptPod(pods []corev1.Pod) (*corev1.Pod, bool, error) {
 
 func podFilterLabel(value string, mask bool) string {
 	if value == "" {
-		return "(全て)"
+		return "（すべて）"
 	}
 	return console.MaskSecrets(value, mask)
 }
@@ -391,10 +416,48 @@ func readPodEscapeSequence(reader *bufio.Reader) (podSelectionAction, error) {
 			case "6":
 				return podSelectionPageDown, nil
 			}
+		case 'M', 'm':
+			if prefix != '[' {
+				return podSelectionNone, nil
+			}
+			if len(parameters) == 0 && value == 'M' {
+				// X10形式: Mの後ろにボタン、X、Yが各1バイト続く。
+				button, readErr := reader.ReadByte()
+				if readErr != nil {
+					return podSelectionNone, readErr
+				}
+				for range 2 {
+					if _, readErr = reader.ReadByte(); readErr != nil {
+						return podSelectionNone, readErr
+					}
+				}
+				return podMouseWheelAction(int(button) - 32), nil
+			}
+			// SGR形式: <button;x;yM。座標は選択に不要なのでbuttonだけ使う。
+			encoded := strings.TrimPrefix(string(parameters), "<")
+			buttonText, _, _ := strings.Cut(encoded, ";")
+			button, parseErr := strconv.Atoi(buttonText)
+			if parseErr == nil {
+				return podMouseWheelAction(button), nil
+			}
 		}
 		return podSelectionNone, nil
 	}
 	return podSelectionNone, nil
+}
+
+func podMouseWheelAction(button int) podSelectionAction {
+	if button&64 == 0 {
+		return podSelectionNone
+	}
+	switch button & 3 {
+	case 0:
+		return podSelectionUp
+	case 1:
+		return podSelectionDown
+	default:
+		return podSelectionNone
+	}
 }
 
 func filterPods(pods []corev1.Pod, namespaceQuery, nameQuery string) []corev1.Pod {
@@ -446,6 +509,62 @@ func selectionPodRows(pods []corev1.Pod, selected int) []console.TableRow {
 		result = append(result, console.TableRow{
 			Cells: append([]string{pointer}, row.Cells[:4]...), Status: row.Status, Selected: index == selected,
 		})
+	}
+	return result
+}
+
+var podSelectionHeaders = []string{"", "NAMESPACE", "NAME", "READY", "STATUS"}
+
+func fitSelectionPodRows(rows []console.TableRow, maxWidth int) []console.TableRow {
+	if len(rows) == 0 {
+		return rows
+	}
+	widths := make([]int, len(podSelectionHeaders))
+	for index, header := range podSelectionHeaders {
+		widths[index] = console.DisplayWidth(header)
+	}
+	widths[0] = max(widths[0], 1)
+	for _, row := range rows {
+		for index, value := range row.Cells {
+			if index < len(widths) {
+				widths[index] = max(widths[index], console.DisplayWidth(value))
+			}
+		}
+	}
+	minimums := []int{1, 9, 12, 5, 6}
+	lineWidth := func() int {
+		total := 2 * (len(widths) - 1)
+		for _, width := range widths {
+			total += width
+		}
+		return total
+	}
+	// Pod名、Namespace、状態のうち、最も余裕がある列から1桁ずつ
+	// 縮める。READYと選択マーカーは常に全文を残す。
+	shrinkable := []int{2, 1, 4}
+	for lineWidth() > maxWidth {
+		candidate, excess := -1, 0
+		for _, index := range shrinkable {
+			if current := widths[index] - minimums[index]; current > excess {
+				candidate, excess = index, current
+			}
+		}
+		if candidate < 0 {
+			break
+		}
+		widths[candidate]--
+	}
+
+	result := make([]console.TableRow, 0, len(rows))
+	for _, row := range rows {
+		cells := append([]string{}, row.Cells...)
+		for index := range cells {
+			if index < len(widths) {
+				cells[index] = console.TruncateDisplay(cells[index], widths[index])
+			}
+		}
+		row.Cells = cells
+		result = append(result, row)
 	}
 	return result
 }

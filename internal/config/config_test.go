@@ -149,6 +149,29 @@ func TestAPIRequestDisplayCanBeControlledIndependently(t *testing.T) {
 	}
 }
 
+func TestBooleanSettingsExposeSelectionMetadataAndReadableSummary(t *testing.T) {
+	var spec SettingSpec
+	for _, candidate := range SettingCatalog() {
+		if candidate.Name == "display.show_api_requests" {
+			spec = candidate
+			break
+		}
+	}
+	if !spec.Boolean {
+		t.Fatalf("真偽値設定として定義されていない: %#v", spec)
+	}
+	if got := SettingSummary(Defaults(), spec); got != "有効（true）［組み込み既定］" {
+		t.Fatalf("既定値の表示=%q", got)
+	}
+	updated, err := Defaults().WithSetting(spec.Name, "false")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := SettingSummary(updated, spec); got != "無効（false）" {
+		t.Fatalf("明示値の表示=%q", got)
+	}
+}
+
 func TestAPIRequestINISettingIsOrderIndependentAndBackwardCompatible(t *testing.T) {
 	for _, body := range []string{
 		"[display]\nshow_commands = false\nshow_api_requests = true\n",

@@ -158,6 +158,16 @@ type TableRow struct {
 	Selected bool
 }
 
+// DiagnosticItem is the text-rendering view of one diagnostic check. The app
+// layer resolves findings and equivalent kubectl commands so the console does
+// not need to know about rule metadata or Kubernetes collection keys.
+type DiagnosticItem struct {
+	Check        model.Check
+	Findings     []model.Finding
+	Commands     []string
+	Supplemental bool
+}
+
 func (c *Console) Table(headers []string, rows []TableRow, colorize bool) {
 	if len(rows) == 0 {
 		return
@@ -204,10 +214,10 @@ func (c *Console) Table(headers []string, rows []TableRow, colorize bool) {
 
 func (c *Console) PodTable(headers []string, rows []TableRow) {
 	if c.ColorEnabled() {
-		fmt.Fprintf(c.Out, "  %s■ 異常%s  %s■ 待機・要注意%s  %s■%s■ 正常 (ゼブラ)%s\n", c.C.Red, c.C.Reset, c.C.Yellow, c.C.Reset, c.C.Green, c.C.Lime, c.C.Reset)
+		fmt.Fprintf(c.Out, "  %s■ 異常%s  %s■ 待機・要注意%s  %s■%s■ 正常（ゼブラ表示）%s\n", c.C.Red, c.C.Reset, c.C.Yellow, c.C.Reset, c.C.Green, c.C.Lime, c.C.Reset)
 	}
 	if len(rows) == 0 {
-		c.printColor(c.C.Green, "(Podなし)")
+		c.printColor(c.C.Green, "（Podなし）")
 		return
 	}
 	headers = append([]string{}, headers...)
@@ -243,6 +253,294 @@ func (c *Console) PodTable(headers []string, rows []TableRow) {
 		}
 		c.printColor(style, line(row.Cells))
 	}
+}
+
+// DiagnosticContents shows what each enabled rule inspected, the equivalent
+// kubectl command, and the result attributed to that rule. An available check
+// means that the rule had enough input to run; abnormalities are determined by
+// the findings attached to the item.
+func (c *Console) DiagnosticContents(items []DiagnosticItem) {
+	if len(items) == 0 {
+		return
+	}
+	values := append([]DiagnosticItem{}, items...)
+	sort.SliceStable(values, func(i, j int) bool {
+		leftSection, rightSection := strings.TrimSpace(values[i].Check.Section), strings.TrimSpace(values[j].Check.Section)
+		if leftSection != rightSection {
+			return leftSection < rightSection
+		}
+		leftDescription, rightDescription := strings.TrimSpace(values[i].Check.Description), strings.TrimSpace(values[j].Check.Description)
+		if leftDescription != rightDescription {
+			return leftDescription < rightDescription
+		}
+		return values[i].Check.ID < values[j].Check.ID
+	})
+
+	available, unavailable := 0, 0
+	for _, item := range values {
+		if item.Check.Available {
+			available++
+		} else {
+			unavailable++
+		}
+	}
+
+	c.Section("診断内容（実施状況）", c.C.Cyan)
+	if c.ColorEnabled() {
+		fmt.Fprintf(c.Out, "  実施状況: %s✔ 実施済み %d件%s / %s? 確認不能 %d件%s\n",
+			c.C.Green+c.C.Bold, available, c.C.Reset, c.C.Yellow+c.C.Bold, unavailable, c.C.Reset)
+	} else {
+		c.Write(fmt.Sprintf("  実施状況: ✔ 実施済み %d件 / ? 確認不能 %d件", available, unavailable))
+	}
+	c.printWrapped(c.C.Dim, "  ※ ", "各項目の確認コマンドを結果の前に表示します。実施済みは正常という意味ではなく、判定を実行できたことを表します")
+
+	currentSection := ""
+	availableIndex := 0
+	for _, item := range values {
+		check := item.Check
+		section := strings.TrimSpace(check.Section)
+		if section == "" {
+			section = "その他"
+		}
+		if section != currentSection {
+			if currentSection == "" {
+				c.Write()
+			}
+			c.printColor(c.C.Cyan+c.C.Bold, "  "+MaskSecrets(section, c.Config.Mask))
+			currentSection = section
+		}
+
+		description := strings.TrimSpace(check.Description)
+		if description == "" {
+			description = strings.TrimSpace(check.ID)
+		}
+		if description == "" {
+			description = "検査内容が設定されていません"
+		}
+		descriptionColor := c.C.Yellow
+		if check.Available {
+			descriptionColor = c.C.Green
+			if availableIndex%2 == 1 {
+				descriptionColor = c.C.Lime
+			}
+			availableIndex++
+		}
+		c.printWrapped(descriptionColor, "    検査: ", description)
+		if c.Config.ShowCmd {
+			for _, command := range item.Commands {
+				c.printWrapped(c.C.Dim, "      $ ", command)
+			}
+		}
+
+		result, resultColor := c.diagnosticResult(item)
+		c.printWrapped(resultColor+c.C.Bold, "    結果: ", result)
+		if !check.Available {
+			reason := strings.TrimSpace(check.Reason)
+			if reason == "" {
+				reason = "判定に必要な情報を取得できませんでした"
+			}
+			c.printWrapped(c.C.Yellow, "      └─ 理由: ", reason)
+			continue
+		}
+		c.renderDiagnosticFindings(item.Findings)
+	}
+}
+
+func (c *Console) diagnosticResult(item DiagnosticItem) (string, string) {
+	if !item.Check.Available {
+		return "? 確認不能", c.C.Yellow
+	}
+	if item.Supplemental {
+		return "✔ 追加情報を取得済み", c.C.Green
+	}
+	counts := map[model.Severity]int{}
+	acknowledged := 0
+	for _, finding := range item.Findings {
+		counts[finding.Severity]++
+		if finding.Acknowledged {
+			acknowledged++
+		}
+	}
+	parts := []string{}
+	color := c.C.Green
+	for _, value := range []struct {
+		severity model.Severity
+		label    string
+		style    string
+	}{
+		{model.Issue, "✘ 確定異常", c.C.Red},
+		{model.Warning, "▲ 警告", c.C.Yellow},
+		{model.Unavailable, "? 確認不能", c.C.Yellow},
+		{model.Candidate, "◇ 要確認", c.C.Magenta},
+	} {
+		if count := counts[value.severity]; count > 0 {
+			parts = append(parts, fmt.Sprintf("%s %d件", value.label, count))
+			if len(parts) == 1 {
+				color = value.style
+			}
+		}
+	}
+	if len(parts) == 0 {
+		return "✔ 所見なし", c.C.Green
+	}
+	result := strings.Join(parts, " / ")
+	if acknowledged > 0 {
+		result += fmt.Sprintf("（承認済み %d件）", acknowledged)
+	}
+	return result, color
+}
+
+func (c *Console) renderDiagnosticFindings(findings []model.Finding) {
+	if len(findings) == 0 {
+		return
+	}
+	values := append([]model.Finding{}, findings...)
+	sort.SliceStable(values, func(i, j int) bool {
+		left, right := diagnosticSeverityRank(values[i].Severity), diagnosticSeverityRank(values[j].Severity)
+		if left != right {
+			return left < right
+		}
+		return values[i].Message < values[j].Message
+	})
+	for index, finding := range values {
+		branch := "├─"
+		if index == len(values)-1 {
+			branch = "└─"
+		}
+		icon, label, color := "◇", "要確認", c.C.Magenta
+		switch finding.Severity {
+		case model.Issue:
+			icon, label, color = "✘", "確定異常", c.C.Red
+		case model.Warning:
+			icon, label, color = "▲", "警告", c.C.Yellow
+		case model.Unavailable:
+			icon, label, color = "?", "確認不能", c.C.Yellow
+		}
+		acknowledged := ""
+		if finding.Acknowledged {
+			acknowledged = " [承認済み]"
+		}
+		c.printWrapped(color, "      "+branch+" "+icon+" ", "["+label+"] "+finding.Message+acknowledged)
+	}
+}
+
+func diagnosticSeverityRank(severity model.Severity) int {
+	switch severity {
+	case model.Issue:
+		return 0
+	case model.Warning:
+		return 1
+	case model.Unavailable:
+		return 2
+	default:
+		return 3
+	}
+}
+
+func (c *Console) printWrapped(color, prefix, value string) {
+	prefix = redact.SanitizeText(prefix)
+	value = MaskSecrets(value, c.Config.Mask)
+	lineWidth := c.width
+	if lineWidth <= 0 {
+		lineWidth = 68
+	}
+	lines := wrapDisplay(value, max(12, lineWidth-DisplayWidth(prefix)))
+	if len(lines) == 0 {
+		lines = []string{"（内容なし）"}
+	}
+	continuation := strings.Repeat(" ", DisplayWidth(prefix))
+	for index, line := range lines {
+		linePrefix := prefix
+		if index > 0 {
+			linePrefix = continuation
+		}
+		c.printColor(color, linePrefix+line)
+	}
+}
+
+func wrapDisplay(value string, limit int) []string {
+	value = strings.TrimSpace(strings.Join(strings.Fields(redact.SanitizeText(value)), " "))
+	if value == "" {
+		return nil
+	}
+	limit = max(1, limit)
+	lines := []string{}
+	var line strings.Builder
+	width := 0
+	flush := func() {
+		if line.Len() == 0 {
+			return
+		}
+		if value := strings.TrimRight(line.String(), " "); value != "" {
+			lines = append(lines, value)
+		}
+		line.Reset()
+		width = 0
+	}
+	appendToken := func(token string) {
+		tokenWidth := DisplayWidth(token)
+		if token == " " && width == 0 {
+			return
+		}
+		if tokenWidth <= limit {
+			if width > 0 && width+tokenWidth > limit {
+				flush()
+			}
+			if token == " " && width == 0 {
+				return
+			}
+			line.WriteString(token)
+			width += tokenWidth
+			return
+		}
+		// Exceptionally long URLs and identifiers cannot move to a fresh line as
+		// one unit. Split only those tokens at display-rune boundaries.
+		if width > 0 {
+			flush()
+		}
+		for _, r := range token {
+			runeWidth := DisplayWidth(string(r))
+			if width > 0 && width+runeWidth > limit {
+				flush()
+			}
+			line.WriteRune(r)
+			width += runeWidth
+		}
+	}
+
+	runes := []rune(value)
+	for index := 0; index < len(runes); {
+		start := index
+		// Keep Latin identifiers such as targetPort and Endpoint intact. A
+		// Japanese middle dot immediately before one belongs to the same token,
+		// avoiding an orphaned separator at the end of the previous line.
+		if runes[index] == '・' && index+1 < len(runes) && isWrapIdentifierRune(runes[index+1]) {
+			index++
+			for index < len(runes) && isWrapIdentifierRune(runes[index]) {
+				index++
+			}
+			appendToken(string(runes[start:index]))
+			continue
+		}
+		if isWrapIdentifierRune(runes[index]) {
+			for index < len(runes) && isWrapIdentifierRune(runes[index]) {
+				index++
+			}
+			appendToken(string(runes[start:index]))
+			continue
+		}
+		index++
+		appendToken(string(runes[start:index]))
+	}
+	flush()
+	return lines
+}
+
+func isWrapIdentifierRune(r rune) bool {
+	if r > unicode.MaxASCII {
+		return false
+	}
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || strings.ContainsRune("_./:@%+-=", r)
 }
 
 var errorRow = regexp.MustCompile(`(?i)CrashLoopBackOff|ImagePullBackOff|ErrImagePull|CreateContainerConfigError|RunContainerError|InvalidImageName|CreateContainerError|OOMKilled|Error|Failed|Evicted|Lost|NotReady|Unknown`)
@@ -347,7 +645,7 @@ func (c *Console) RootCauseReport(values []model.RootCause) {
 		impacts := append(append([]model.Impact{}, root.DirectImpacts...), root.PropagatedImpacts...)
 		if len(impacts) > 0 {
 			c.Write()
-			c.printColor(c.C.Magenta+c.C.Bold, "影響経路 (直接影響 → 波及影響)")
+			c.printColor(c.C.Magenta+c.C.Bold, "影響経路（直接影響 → 波及影響）")
 			c.renderImpactTree(impacts, color)
 		}
 		if len(root.Remediations) > 0 {
@@ -363,22 +661,96 @@ func (c *Console) RootCauseReport(values []model.RootCause) {
 func rootCauseEvidenceLabel(evidence model.Evidence) string {
 	key := strings.Trim(strings.TrimSpace(evidence.Kind)+"."+strings.TrimSpace(evidence.Key), ".")
 	switch key {
+	case "api.errors", "api.reason":
+		return "Kubernetes APIのエラー"
+	case "container.state":
+		return "コンテナの状態"
+	case "container.lastTerminationReason":
+		return "前回終了した理由"
+	case "container.lastExitCode":
+		return "前回の終了コード"
+	case "container.restartCount":
+		return "再起動回数"
+	case "pod.phase":
+		return "Podの状態（phase）"
+	case "pod.deletionTimestamp", "namespace.deletionTimestamp":
+		return "削除開始時刻"
+	case "pod.nominatedNodeName":
+		return "候補として指名されたNode"
+	case "status.readyReplicas":
+		return "Ready状態のレプリカ数"
+	case "status.currentHealthy":
+		return "現在正常なPod数"
+	case "status.desiredHealthy":
+		return "必要な正常Pod数"
+	case "status.disruptionsAllowed":
+		return "安全に退避（Eviction）できるPod数"
+	case "reference.source":
+		return "参照元の設定"
+	case "reference.pod":
+		return "参照しているPod"
+	case "reference.secret":
+		return "参照先のSecret"
+	case "reference.service":
+		return "参照先のService"
+	case "spec.storageClassName":
+		return "指定されたStorageClass"
 	case "service.spec.ports":
 		return "Serviceポート設定"
 	case "service.spec.selector":
 		return "Service selector"
 	case "service.selectorMatches", "pod.selectorMatches":
-		return "selector一致Pod"
+		return "selectorに一致したPod"
 	case "pod.containerPortNames":
-		return "Pod側のcontainerPort"
+		return "Podに定義されたcontainerPort"
 	case "decision.unresolved":
 		return "判定"
 	case "endpointSlice.resolvedPort":
-		return "EndpointSlice確認"
+		return "EndpointSliceの確認結果"
 	case "probe.portName":
-		return "Probeポート設定"
+		return "Probeのポート設定"
 	case "container.ports[].name":
-		return "containerPort設定"
+		return "containerPortの設定"
+	case "endpoint.ready":
+		return "Ready状態のEndpoint数"
+	case "endpoint.terminatingServing":
+		return "終了処理中で通信可能な代替Endpoint数"
+	case "event.directEvidence":
+		return "FailedScheduling Event"
+	case "unknown.constraint":
+		return "静的に評価できなかった条件"
+	case "lease.renewTime":
+		return "Leaseの最終更新時刻"
+	case "connect.detail":
+		return "接続確認の結果"
+	case "connect.sampleCount":
+		return "確認回数"
+	case "connect.kubeletThresholdEvaluation":
+		return "kubeletの連続判定"
+	case "http.statusCode":
+		return "HTTPステータス"
+	case "http.contentType":
+		return "HTTP Content-Type"
+	case "http.bodyBytesRead":
+		return "読み取ったHTTP本文のバイト数"
+	case "log.match":
+		return "ログで一致した箇所"
+	case "x509.error":
+		return "証明書の解析エラー"
+	case "x509.keyPairError":
+		return "証明書と秘密鍵の検証エラー"
+	}
+	if strings.HasPrefix(key, "condition.") {
+		return "状態条件（condition） " + strings.TrimPrefix(key, "condition.")
+	}
+	if strings.HasPrefix(key, "node.") {
+		return "Node " + strings.TrimPrefix(key, "node.") + " の配置不可理由"
+	}
+	if strings.HasPrefix(key, "scheduling.") {
+		return "スケジューリング判定（" + strings.TrimPrefix(key, "scheduling.") + "）"
+	}
+	if strings.HasPrefix(key, "x509.") {
+		return "証明書情報（" + strings.TrimPrefix(key, "x509.") + "）"
 	}
 	return key
 }
@@ -474,9 +846,17 @@ func (c *Console) Summary(state *model.State, beforeFinding ...func(model.Findin
 			}
 			c.Flag(finding)
 		}
-		c.Write(fmt.Sprintf("  (%d 件)", len(values)))
+		c.Write(fmt.Sprintf("  （%d件）", len(values)))
 	}
-	c.Section("クラスタ健全性スコア")
+	scoreTitle := "クラスタ健全性スコア"
+	healthDescription := "Health＝クラスタ状態 / Coverage＝診断できた範囲"
+	var scopedScore *model.ScopedScore
+	if c.Config.Mode == "select" {
+		scoreTitle = "Pod総合スコア"
+		healthDescription = "総合＝選択Podの12診断項目（状態・依存・通信・TLS等） / Coverage＝確認できた範囲"
+		scopedScore = state.ScopedScoreValue()
+	}
+	c.Section(scoreTitle)
 	health, coverage := state.Health(), state.Coverage()
 	grade, gradeLabel, healthColor := "A", "良好", c.C.Green
 	if health < 90 {
@@ -489,9 +869,43 @@ func (c *Console) Summary(state *model.State, beforeFinding ...func(model.Findin
 		grade, gradeLabel, healthColor = "D", "重大", c.C.Red
 	}
 	barWidth := max(12, min(24, c.width-38))
-	c.printColor(healthColor+c.C.Bold, fmt.Sprintf("  Health:   [%s] %3d/100  [%s] %s", scoreBar(health, barWidth), health, grade, gradeLabel))
+	healthLabel := "Health:"
+	if c.Config.Mode == "select" {
+		healthLabel = "総合:"
+	}
+	healthLabel += strings.Repeat(" ", max(0, 9-DisplayWidth(healthLabel)))
+	c.printColor(healthColor+c.C.Bold, fmt.Sprintf("  %s [%s] %3d/100  [%s] %s", healthLabel, scoreBar(health, barWidth), health, grade, gradeLabel))
+	if scopedScore != nil && len(scopedScore.Dimensions) > 0 {
+		c.printColor(c.C.Bold, "  内訳:")
+		labelWidth := 0
+		for _, dimension := range scopedScore.Dimensions {
+			labelWidth = max(labelWidth, DisplayWidth(dimension.Label))
+		}
+		dimensionBarWidth := max(6, min(12, barWidth/2))
+		for _, dimension := range scopedScore.Dimensions {
+			percentage := 100
+			if dimension.Maximum > 0 {
+				percentage = max(0, min(100, dimension.Score*100/dimension.Maximum))
+			}
+			color := c.C.Green
+			if percentage < 90 {
+				color = c.C.Yellow
+			}
+			if percentage < 60 {
+				color = c.C.Red
+			}
+			label := dimension.Label + strings.Repeat(" ", labelWidth-DisplayWidth(dimension.Label))
+			line := fmt.Sprintf("    %s [%s] %2d/%-2d", label, scoreBar(percentage, dimensionBarWidth), dimension.Score, dimension.Maximum)
+			if dimension.Detail != "" {
+				line += "  " + Snip(dimension.Detail, max(20, c.width-DisplayWidth(line)-2))
+			}
+			c.printColor(color, line)
+		}
+	}
 	ok, unavailable, total := state.CoverageCounts()
-	c.printColor(c.C.Cyan+c.C.Bold, fmt.Sprintf("  Coverage: [%s] %3d%%", scoreBar(coverage, barWidth), coverage))
+	coverageLabel := "Coverage:"
+	coverageLabel += strings.Repeat(" ", max(0, 9-DisplayWidth(coverageLabel)))
+	c.printColor(c.C.Cyan+c.C.Bold, fmt.Sprintf("  %s [%s] %3d%%", coverageLabel, scoreBar(coverage, barWidth), coverage))
 	coverageDetail := fmt.Sprintf("確認済み %d/%d・確認不能 %d項目", ok, total, unavailable)
 	if total == 0 {
 		coverageDetail = "確認対象なし"
@@ -510,7 +924,7 @@ func (c *Console) Summary(state *model.State, beforeFinding ...func(model.Findin
 	} else {
 		c.Write(fmt.Sprintf("  所見:      ✘ 確定 %d   ▲ 警告 %d   ? 確認不能 %d   ◇ 候補 %d", issues, warnings, unavailableFindings, candidates))
 	}
-	c.printColor(c.C.Dim, "  Health＝クラスタ状態 / Coverage＝診断できた範囲")
+	c.printColor(c.C.Dim, "  "+healthDescription)
 }
 
 func scoreBar(value, width int) string {

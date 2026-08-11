@@ -15,7 +15,7 @@ import (
 type ConfigRiskRule struct{}
 
 func (ConfigRiskRule) Metadata() Metadata {
-	return Metadata{ID: "config-risks", Section: "構成リスク", Description: "image tag・requests・Probe構成", Required: []string{"pods"}, Permissions: namespaced("", "pods"), Modes: []string{"all", "triage"}}
+	return Metadata{ID: "config-risks", Section: "構成リスク", Description: "イメージタグ・リソース要求・Probe設定", Required: []string{"pods"}, Permissions: namespaced("", "pods"), Modes: []string{"all", "triage", "select"}}
 }
 
 func (ConfigRiskRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Config) []model.Finding {
@@ -50,7 +50,11 @@ func (ConfigRiskRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ con
 			if reason == "" {
 				continue
 			}
-			result = append(result, model.NewFinding(model.Candidate, "K8S.CONFIG.IMAGE_TAG_RISK", "構成リスク", ref("Pod", pod.Namespace, pod.Name), reason, value.name+"/"+reason, fmt.Sprintf("Pod %s / container %s: image %sは%sです", shortRef(pod.Namespace, pod.Name), value.name, value.image, map[string]string{"LatestTag": ":latest", "UntaggedImage": "タグなし"}[reason]), 45))
+			description := fmt.Sprintf("イメージ %q にタグが指定されていません", value.image)
+			if reason == "LatestTag" {
+				description = fmt.Sprintf("イメージ %q に可変タグ :latest が指定されています", value.image)
+			}
+			result = append(result, model.NewFinding(model.Candidate, "K8S.CONFIG.IMAGE_TAG_RISK", "構成リスク", ref("Pod", pod.Namespace, pod.Name), reason, value.name+"/"+reason, fmt.Sprintf("Pod %s のコンテナ %q では、%s", shortRef(pod.Namespace, pod.Name), value.name, description), 45))
 		}
 		workloadContainers := append([]corev1.Container{}, pod.Spec.Containers...)
 		for _, container := range pod.Spec.InitContainers {
@@ -72,10 +76,10 @@ func (ConfigRiskRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ con
 				}
 			}
 			if len(missing) > 0 {
-				result = append(result, model.NewFinding(model.Candidate, "K8S.CONFIG.REQUESTS_MISSING", "構成リスク", ref("Pod", pod.Namespace, pod.Name), "RequestsMissing", container.Name+"/requests", fmt.Sprintf("Pod %s / container %s: requests未設定 (%s)", shortRef(pod.Namespace, pod.Name), container.Name, strings.Join(missing, ", ")), 40))
+				result = append(result, model.NewFinding(model.Candidate, "K8S.CONFIG.REQUESTS_MISSING", "構成リスク", ref("Pod", pod.Namespace, pod.Name), "RequestsMissing", container.Name+"/requests", fmt.Sprintf("Pod %s のコンテナ %q では、resources.requests に %s が設定されていません", shortRef(pod.Namespace, pod.Name), container.Name, strings.Join(missing, "、")), 40))
 			}
 			if !jobPod && container.LivenessProbe == nil {
-				result = append(result, model.NewFinding(model.Candidate, "K8S.CONFIG.LIVENESS_PROBE_MISSING", "構成リスク", ref("Pod", pod.Namespace, pod.Name), "LivenessProbeMissing", container.Name+"/liveness", fmt.Sprintf("Pod %s / container %s: livenessProbeがありません", shortRef(pod.Namespace, pod.Name), container.Name), 35))
+				result = append(result, model.NewFinding(model.Candidate, "K8S.CONFIG.LIVENESS_PROBE_MISSING", "構成リスク", ref("Pod", pod.Namespace, pod.Name), "LivenessProbeMissing", container.Name+"/liveness", fmt.Sprintf("Pod %s のコンテナ %q には、livenessProbe が設定されていません", shortRef(pod.Namespace, pod.Name), container.Name), 35))
 			}
 		}
 	}
@@ -85,7 +89,7 @@ func (ConfigRiskRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ con
 type NamespaceRule struct{}
 
 func (NamespaceRule) Metadata() Metadata {
-	return Metadata{ID: "namespaces", Section: "Namespace", Description: "Namespace終了状態", Required: []string{"namespaces"}, Permissions: cluster("", "namespaces"), Modes: []string{"all", "triage"}}
+	return Metadata{ID: "namespaces", Section: "Namespace", Description: "Namespaceの削除状態", Required: []string{"namespaces"}, Permissions: cluster("", "namespaces"), Modes: []string{"all", "triage"}}
 }
 
 func (NamespaceRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Config) []model.Finding {
@@ -99,7 +103,7 @@ func (NamespaceRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ conf
 		if minutes < 10 {
 			continue
 		}
-		result = append(result, model.NewFinding(model.Warning, "K8S.NAMESPACE.TERMINATING_STUCK", "Namespace", ref("Namespace", "", namespace.Name), "Terminating", "terminating", fmt.Sprintf("Namespace %s: Terminatingが%d分継続", namespace.Name, minutes), 75, model.Evidence{Kind: "namespace", Key: "deletionTimestamp", Value: namespace.DeletionTimestamp.String()}))
+		result = append(result, model.NewFinding(model.Warning, "K8S.NAMESPACE.TERMINATING_STUCK", "Namespace", ref("Namespace", "", namespace.Name), "Terminating", "terminating", fmt.Sprintf("Namespace %s の削除処理が完了せず、Terminating 状態が %d分間続いています", namespace.Name, minutes), 75, model.Evidence{Kind: "namespace", Key: "deletionTimestamp", Value: namespace.DeletionTimestamp.String()}))
 	}
 	return result
 }
@@ -107,7 +111,7 @@ func (NamespaceRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ conf
 type CRDRule struct{}
 
 func (CRDRule) Metadata() Metadata {
-	return Metadata{ID: "crds", Section: "CRD", Description: "CRD Established/NamesAccepted condition", Required: []string{"crds"}, Permissions: cluster("apiextensions.k8s.io", "customresourcedefinitions"), Modes: []string{"all", "triage"}}
+	return Metadata{ID: "crds", Section: "CRD", Description: "CRDのEstablished・NamesAccepted条件", Required: []string{"crds"}, Permissions: cluster("apiextensions.k8s.io", "customresourcedefinitions"), Modes: []string{"all", "triage"}}
 }
 
 func (CRDRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Config) []model.Finding {
@@ -120,13 +124,13 @@ func (CRDRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Con
 			if !ok {
 				continue
 			}
-			typeName, status := fmt.Sprint(condition["type"]), fmt.Sprint(condition["status"])
+			typeName, status := objectStringField(condition, "type"), objectStringField(condition, "status")
 			bad := typeName == "Established" && status != "True" || typeName == "NamesAccepted" && status == "False"
 			if !bad {
 				continue
 			}
-			reason := fmt.Sprint(condition["reason"])
-			result = append(result, model.NewFinding(model.Warning, "K8S.CRD.CONDITION", "CRD", ref("CustomResourceDefinition", "", item.GetName()), reason, typeName, fmt.Sprintf("CRD %s: %s=%s (%s)", item.GetName(), typeName, status, reason), 85, model.Evidence{Kind: "condition", Key: typeName, Value: fmt.Sprint(condition["message"])}))
+			reason := objectStringField(condition, "reason")
+			result = append(result, model.NewFinding(model.Warning, "K8S.CRD.CONDITION", "CRD", ref("CustomResourceDefinition", "", item.GetName()), reason, typeName, conditionStateMessage("CRD", item.GetName(), typeName, status, reason), 85, model.Evidence{Kind: "condition", Key: typeName, Value: objectStringField(condition, "message")}))
 		}
 	}
 	return result

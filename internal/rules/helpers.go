@@ -1,6 +1,8 @@
 package rules
 
 import (
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/kmizuki03/k8s-diagnose/internal/kube"
@@ -9,6 +11,29 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
+
+func reasonSuffix(reason string) string {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return ""
+	}
+	return fmt.Sprintf("（Kubernetesが報告した理由: %s）", reason)
+}
+
+func conditionStateMessage(kind, reference, conditionType, status, reason string) string {
+	return fmt.Sprintf("%s %s の状態条件（condition） %q は %s です%s", kind, reference, conditionType, status, reasonSuffix(reason))
+}
+
+func readyCountMessage(kind, reference string, ready, desired int32) string {
+	return fmt.Sprintf("%s %s のReady状態のレプリカ数は %d/%d です", kind, reference, ready, desired)
+}
+
+func objectStringField(values map[string]any, key string) string {
+	if values == nil || values[key] == nil {
+		return ""
+	}
+	return fmt.Sprint(values[key])
+}
 
 func ref(kind, namespace, name string) string {
 	if namespace == "" {

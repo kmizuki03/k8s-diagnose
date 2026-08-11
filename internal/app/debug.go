@@ -24,7 +24,7 @@ func (runner *Runner) debugPod(ctx context.Context, pod *corev1.Pod) error {
 	pod = current
 	kubectl, err := exec.LookPath("kubectl")
 	if err != nil {
-		return errors.New("--debugに必要なkubectlがPATHにありません")
+		return errors.New("--debug に必要な kubectl が PATH に見つかりません")
 	}
 	base := []string{}
 	if runner.Config.Kubeconfig != "" {
@@ -39,7 +39,7 @@ func (runner *Runner) debugPod(ctx context.Context, pod *corev1.Pod) error {
 	helpCommand := exec.CommandContext(ctx, kubectl, append(base, "debug", "--help")...) // #nosec G204 -- intentional argv-only kubectl integration.
 	helpOutput, helpErr := helpCommand.CombinedOutput()
 	if helpErr != nil || !strings.Contains(string(helpOutput), "--image") {
-		return errors.New("このkubectlはdebugをサポートしていません")
+		return errors.New("この環境の kubectl は debug コマンドをサポートしていません")
 	}
 	runner.Console.Section(fmt.Sprintf("kubectl debug: %s/%s", pod.Namespace, pod.Name))
 	runner.Console.Write("  1) Ephemeral Containerを追加 (Running Pod向け)")
@@ -48,7 +48,7 @@ func (runner *Runner) debugPod(ctx context.Context, pod *corev1.Pod) error {
 	fmt.Fprint(runner.Streams.Out, "選択 [1-3]: ")
 	choice, readErr := runner.reader.ReadString('\n')
 	if readErr != nil && !errors.Is(readErr, io.EOF) {
-		return fmt.Errorf("debugの選択を読み取れませんでした: %w", readErr)
+		return fmt.Errorf("debugメニューの選択を読み取れませんでした: %w", readErr)
 	}
 	choice = strings.TrimSpace(choice)
 	if choice == "" || choice == "3" {
@@ -65,14 +65,14 @@ func (runner *Runner) debugPod(ctx context.Context, pod *corev1.Pod) error {
 	switch choice {
 	case "1":
 		if pod.Status.Phase != corev1.PodRunning {
-			return fmt.Errorf("Pod phase=%s のためEphemeral Containerは追加できません", pod.Status.Phase)
+			return fmt.Errorf("Podの状態（phase）が %s のため、Ephemeral Containerを追加できません", pod.Status.Phase)
 		}
 		allowed, err := canI("update", "pods/ephemeralcontainers")
 		if err != nil {
 			return err
 		}
 		if !allowed {
-			return errors.New("pods/ephemeralcontainersのupdate権限がありません")
+			return errors.New("pods/ephemeralcontainersを更新する権限がありません")
 		}
 		if len(pod.Spec.Containers) > 0 && strings.Contains(string(helpOutput), "--target") {
 			debugArgs = append(debugArgs, "--target="+pod.Spec.Containers[0].Name)
@@ -83,7 +83,7 @@ func (runner *Runner) debugPod(ctx context.Context, pod *corev1.Pod) error {
 			return err
 		}
 		if !allowed {
-			return errors.New("Podのcreate権限がありません")
+			return errors.New("Podを作成する権限がありません")
 		}
 		copyName := fmt.Sprintf("%s-debug-%s", pod.Name, time.Now().Format("150405"))
 		if len(copyName) > 63 {
@@ -120,7 +120,7 @@ func (runner *Runner) debugPod(ctx context.Context, pod *corev1.Pod) error {
 		return err
 	}
 	if choice == "1" && current.Status.Phase != corev1.PodRunning {
-		return fmt.Errorf("Pod phase=%s に変化したためEphemeral Containerを追加できません", current.Status.Phase)
+		return fmt.Errorf("Podの状態（phase）が %s に変化したため、Ephemeral Containerを追加できません", current.Status.Phase)
 	}
 	command := exec.CommandContext(ctx, kubectl, debugArgs...) // #nosec G204 -- confirmed argv-only kubectl debug execution.
 	command.Stdin, command.Stdout, command.Stderr = runner.Streams.In, runner.Streams.Out, runner.Streams.Err
@@ -138,15 +138,15 @@ func interpretCanIResult(output []byte, commandErr error) (bool, error) {
 		return false, nil
 	}
 	if commandErr != nil {
-		return false, fmt.Errorf("kubectl auth can-iに失敗しました: %s", console.Snip(redact.MaskSecrets(string(output)), 300))
+		return false, fmt.Errorf("kubectl auth can-i の実行に失敗しました: %s", console.Snip(redact.MaskSecrets(string(output)), 300))
 	}
-	return false, fmt.Errorf("kubectl auth can-iが解釈できない応答を返しました: %s", console.Snip(redact.MaskSecrets(string(output)), 300))
+	return false, fmt.Errorf("kubectl auth can-i が解釈できない応答を返しました: %s", console.Snip(redact.MaskSecrets(string(output)), 300))
 }
 
 func (runner *Runner) refreshPodTarget(ctx context.Context, selected *corev1.Pod) (*corev1.Pod, error) {
 	current, err := runner.Clients.Kube.CoreV1().Pods(selected.Namespace).Get(ctx, selected.Name, metav1.GetOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("対象Pod %s/%sの現在状態を確認できませんでした。原因: %s", selected.Namespace, selected.Name, kube.ErrorReason(err))
+		return nil, fmt.Errorf("対象Pod %s/%s の現在の状態を確認できませんでした。原因: %s", selected.Namespace, selected.Name, kube.ErrorReason(err))
 	}
 	if selected.UID != "" && current.UID != "" && selected.UID != current.UID {
 		return nil, fmt.Errorf("対象Pod %s/%s は再作成されています。debugを中止して再度選択してください", selected.Namespace, selected.Name)

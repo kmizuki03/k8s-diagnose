@@ -30,7 +30,7 @@ func (SchedulingRule) Metadata() Metadata {
 	permissions = append(permissions, cluster("", "persistentvolumes")...)
 	permissions = append(permissions, cluster("storage.k8s.io", "storageclasses")...)
 	return Metadata{
-		ID: "pending-scheduling", Section: "Scheduling", Description: "Pending PodのNode配置可否",
+		ID: "pending-scheduling", Section: "Scheduling", Description: "Pending PodをNodeへ配置できるかの判定",
 		Required:    []string{"pods", "nodes"},
 		Optional:    []string{"all_pods", "pvcs", "pvs", "storageclasses", "events"},
 		Permissions: permissions, Modes: []string{"all", "triage", "select"},
@@ -84,21 +84,21 @@ func (SchedulingRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ con
 				continue
 			}
 			code, reason, confidence := "K8S.SCHEDULING.NOMINATED_NODE_PENDING", "NominatedNodePending", 70
-			message := fmt.Sprintf("Pod %s: 候補Node %sが指名され、bindingを待っています", short, pod.Status.NominatedNodeName)
+			message := fmt.Sprintf("Pod %s では、候補として指名されたNode %q へのバインド処理が5分以上完了していません", short, pod.Status.NominatedNodeName)
 			if confirmsPreemption(events) {
 				code, reason, confidence = "K8S.SCHEDULING.PREEMPTION_PENDING", "PreemptionPending", 90
-				message = fmt.Sprintf("Pod %s: preemption根拠があり、候補Node %sへの配置を待っています", short, pod.Status.NominatedNodeName)
+				message = fmt.Sprintf("Pod %s はPreemption処理中ですが、候補Node %q への配置が5分以上完了していません", short, pod.Status.NominatedNodeName)
 			}
 			result = append(result, model.NewFinding(model.Warning, code, "Scheduling", resourceRef, reason, "nominated-node", message, confidence, model.Evidence{Kind: "pod", Key: "nominatedNodeName", Value: pod.Status.NominatedNodeName}))
 			continue
 		}
 
 		if len(pod.Spec.SchedulingGates) > 0 {
-			result = append(result, model.NewFinding(model.Candidate, "K8S.SCHEDULING.GATED", "Scheduling", resourceRef, "SchedulingGated", "scheduling-gates", fmt.Sprintf("Pod %s: schedulingGate %d件の解除待ちです", short, len(pod.Spec.SchedulingGates)), 50))
+			result = append(result, model.NewFinding(model.Candidate, "K8S.SCHEDULING.GATED", "Scheduling", resourceRef, "SchedulingGated", "scheduling-gates", fmt.Sprintf("Pod %s は、%d件の schedulingGate が解除されるのを待っています", short, len(pod.Spec.SchedulingGates)), 50))
 			continue
 		}
 		if pod.Spec.SchedulerName != "" && pod.Spec.SchedulerName != corev1.DefaultSchedulerName {
-			result = append(result, model.NewFinding(model.Candidate, "K8S.SCHEDULING.CUSTOM_SCHEDULER", "Scheduling", resourceRef, "CustomScheduler", pod.Spec.SchedulerName, fmt.Sprintf("Pod %s: custom scheduler %sの判定は静的に完全再現できません", short, pod.Spec.SchedulerName), 40))
+			result = append(result, model.NewFinding(model.Candidate, "K8S.SCHEDULING.CUSTOM_SCHEDULER", "Scheduling", resourceRef, "CustomScheduler", pod.Spec.SchedulerName, fmt.Sprintf("Pod %s はカスタムScheduler %q を使用しています。このツールでは、そのSchedulerによる配置判定を完全には再現できません", short, pod.Spec.SchedulerName), 40))
 			continue
 		}
 
@@ -125,10 +125,10 @@ func (SchedulingRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ con
 		}
 		unknowns := unsupportedSchedulingConstraints(pod)
 		if !allPodsKnown {
-			unknowns = append(unknowns, "全namespace Podを取得できずNode使用量が部分評価")
+			unknowns = append(unknowns, "すべてのNamespaceのPodを取得できなかったため、Nodeの使用量は取得できた範囲で評価しています")
 		}
 		if podUsesPVC(pod) && !pvcDataKnown {
-			unknowns = append(unknowns, "PVCまたはStorageClassを取得できずvolume制約が未評価")
+			unknowns = append(unknowns, "PVCまたはStorageClassを取得できなかったため、ボリューム制約を評価していません")
 		}
 		for _, assessment := range assessments {
 			unknowns = append(unknowns, assessment.Unknowns...)
@@ -142,12 +142,12 @@ func (SchedulingRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ con
 		if feasible > 0 {
 			code, reason = "K8S.SCHEDULING.FAILED_SCHEDULING_REPORTED", "FailedSchedulingReported"
 		}
-		message := fmt.Sprintf("Pod %s: 配置可能Node %d/%d", short, feasible, len(snapshot.Nodes))
+		message := fmt.Sprintf("Pod %s を配置できるNodeは、%d台中 %d台です", short, len(snapshot.Nodes), feasible)
 		if !complete {
-			message += " (未評価制約あり)"
+			message += "。未評価の制約があるため、この結果だけでは配置可否を確定できません"
 		}
 		if feasibleWithUnknowns > 0 {
-			message += fmt.Sprintf(" (配置可能だが未評価あり: %d台)", feasibleWithUnknowns)
+			message += fmt.Sprintf("。配置可能と判定したNodeのうち、%d台には未評価の項目があります", feasibleWithUnknowns)
 		}
 		evidenceValues := []model.Evidence{
 			{Kind: "scheduling", Key: "podAge", Value: age.Round(time.Second).String()},
@@ -199,15 +199,15 @@ func assessNodeWithPVC(pod *corev1.Pod, node *corev1.Node, requests, used corev1
 	assessment := nodeAssessment{Node: node.Name, Categories: map[schedulingCategory]struct{}{}}
 	for key, expected := range pod.Spec.NodeSelector {
 		if node.Labels[key] != expected {
-			assessment.reject(categoryNodeAffinity, fmt.Sprintf("nodeSelector %s=%s 不一致", key, expected))
+			assessment.reject(categoryNodeAffinity, fmt.Sprintf("Nodeのラベルが、nodeSelector で要求された %s=%s と一致しません", key, expected))
 		}
 	}
 	if affinity := pod.Spec.Affinity; affinity != nil && affinity.NodeAffinity != nil && affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
 		matched, err := schedulinghelper.MatchNodeSelectorTerms(node, affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution)
 		if err != nil {
-			assessment.Unknowns = append(assessment.Unknowns, "required nodeAffinity解析失敗: "+err.Error())
+			assessment.Unknowns = append(assessment.Unknowns, "必須の nodeAffinity を解析できません。原因: "+err.Error())
 		} else if !matched {
-			assessment.reject(categoryNodeAffinity, "required nodeAffinity不一致")
+			assessment.reject(categoryNodeAffinity, "必須の nodeAffinity 条件と一致しません")
 		}
 	}
 
@@ -222,7 +222,7 @@ func assessNodeWithPVC(pod *corev1.Pod, node *corev1.Node, requests, used corev1
 	if taint, untolerated := schedulinghelper.FindMatchingUntoleratedTaint(taints, pod.Spec.Tolerations, func(taint *corev1.Taint) bool {
 		return taint.Effect == corev1.TaintEffectNoSchedule || taint.Effect == corev1.TaintEffectNoExecute
 	}); untolerated {
-		assessment.reject(categoryTaint, fmt.Sprintf("taint %s:%s をtolerateしない", taint.Key, taint.Effect))
+		assessment.reject(categoryTaint, fmt.Sprintf("Podには、taint %s:%s を許容する toleration が設定されていません", taint.Key, taint.Effect))
 	}
 
 	for name, requested := range requests {
@@ -241,7 +241,7 @@ func assessNodeWithPVC(pod *corev1.Pod, node *corev1.Node, requests, used corev1
 			available = *resource.NewQuantity(0, requested.Format)
 		}
 		if requested.Cmp(available) > 0 {
-			assessment.reject(categoryResources, fmt.Sprintf("%s 要求=%s 空き=%s", name, requested.String(), available.String()))
+			assessment.reject(categoryResources, fmt.Sprintf("リソース %s の要求量は %s ですが、空き容量は %s です", name, requested.String(), available.String()))
 		}
 	}
 
@@ -252,10 +252,10 @@ func assessNodeWithPVC(pod *corev1.Pod, node *corev1.Node, requests, used corev1
 			remaining.Sub(usedPods)
 			one := *resource.NewQuantity(1, resource.DecimalSI)
 			if one.Cmp(remaining) > 0 {
-				assessment.reject(categoryResources, "Pod数上限に到達")
+				assessment.reject(categoryResources, "Nodeに配置できるPod数の上限に達しています")
 			}
 		} else {
-			assessment.Unknowns = append(assessment.Unknowns, "allocatable.podsが未報告")
+			assessment.Unknowns = append(assessment.Unknowns, "Nodeから allocatable.pods が報告されていないため、配置可能なPod数の上限を評価できません")
 		}
 	}
 	for _, reason := range pvcReasons {
@@ -324,35 +324,35 @@ func pvcNodeSchedulingConstraints(pod *corev1.Pod, node *corev1.Node, snapshot *
 		}
 		if pvc == nil {
 			if reference.ephemeral {
-				result = append(result, fmt.Sprintf("generic ephemeral volume %sのPVC %sが存在しない", reference.volume, name))
+				result = append(result, fmt.Sprintf("Generic Ephemeral Volume %q に必要なPVC %q が存在しません", reference.volume, name))
 			} else {
-				result = append(result, "PVC "+name+"が存在しない")
+				result = append(result, fmt.Sprintf("参照しているPVC %q が存在しません", name))
 			}
 			continue
 		}
 		if reference.ephemeral {
 			if err := ephemeralhelper.VolumeIsForPod(pod, pvc); err != nil {
-				result = append(result, fmt.Sprintf("generic ephemeral volume %sのPVC %sがPod所有ではない", reference.volume, name))
+				result = append(result, fmt.Sprintf("Generic Ephemeral Volume %q のPVC %q は、このPodによって所有されていません", reference.volume, name))
 				continue
 			}
 		}
 		if node != nil {
 			if selectedNode := pvc.Annotations[volumehelper.AnnSelectedNode]; selectedNode != "" && selectedNode != node.Name {
-				result = append(result, fmt.Sprintf("PVC %sのselected-node=%sと不一致", name, selectedNode))
+				result = append(result, fmt.Sprintf("PVC %q はNode %q 向けに選択済みのため、現在評価中のNodeとは一致しません", name, selectedNode))
 				continue
 			}
 		}
 		if pvc.DeletionTimestamp != nil {
-			result = append(result, fmt.Sprintf("PVC %sが削除中", name))
+			result = append(result, fmt.Sprintf("PVC %q は削除処理中です", name))
 			continue
 		}
 		if pvc.Status.Phase == corev1.ClaimBound {
 			if pvc.Spec.VolumeName == "" {
-				unknowns = append(unknowns, "Bound PVC "+name+"のspec.volumeNameが空でPV制約を確認不能")
+				unknowns = append(unknowns, fmt.Sprintf("Bound 状態のPVC %q で spec.volumeName が空のため、PVの制約を確認できません", name))
 				continue
 			}
 			if !pvsKnown {
-				unknowns = append(unknowns, "PVを取得できずPVC "+name+"のnodeAffinityが未評価")
+				unknowns = append(unknowns, fmt.Sprintf("PVを取得できなかったため、PVC %q の nodeAffinity は評価していません", name))
 				continue
 			}
 			var persistentVolume *corev1.PersistentVolume
@@ -363,12 +363,12 @@ func pvcNodeSchedulingConstraints(pod *corev1.Pod, node *corev1.Node, snapshot *
 				}
 			}
 			if persistentVolume == nil {
-				result = append(result, fmt.Sprintf("PVC %sが参照するPV %sが存在しない", name, pvc.Spec.VolumeName))
+				result = append(result, fmt.Sprintf("PVC %q が参照するPV %q は存在しません", name, pvc.Spec.VolumeName))
 				continue
 			}
 			if node != nil {
 				if err := volumehelper.CheckNodeAffinity(persistentVolume, node.Labels); err != nil {
-					result = append(result, fmt.Sprintf("PV %sのnodeAffinity不一致", persistentVolume.Name))
+					result = append(result, fmt.Sprintf("PV %q の nodeAffinity と、このNodeのラベルが一致しません", persistentVolume.Name))
 				}
 			}
 			continue
@@ -381,13 +381,13 @@ func pvcNodeSchedulingConstraints(pod *corev1.Pod, node *corev1.Node, snapshot *
 		waitForConsumer := class != nil && class.VolumeBindingMode != nil && *class.VolumeBindingMode == storagev1.VolumeBindingWaitForFirstConsumer
 		if pvc.Status.Phase == corev1.ClaimPending && waitForConsumer {
 			if node != nil && !matchesAllowedTopologies(class.AllowedTopologies, node.Labels) {
-				result = append(result, fmt.Sprintf("StorageClass %sのallowedTopologies不一致", className))
+				result = append(result, fmt.Sprintf("StorageClass %q の allowedTopologies には、このNodeが含まれていません", className))
 				continue
 			}
-			unknowns = append(unknowns, fmt.Sprintf("PVC %sの動的provisioning容量/PV選択は未評価", name))
+			unknowns = append(unknowns, fmt.Sprintf("PVC %q の動的プロビジョニングでは、容量の確保とPVの選択を静的に評価できません", name))
 			continue
 		}
-		result = append(result, fmt.Sprintf("PVC %s phase=%s", name, pvc.Status.Phase))
+		result = append(result, fmt.Sprintf("PVC %q はバインドされていません（現在のphase: %s）", name, pvc.Status.Phase))
 	}
 	return uniqueSorted(result), uniqueSorted(unknowns)
 }
@@ -416,25 +416,25 @@ func unsupportedSchedulingConstraints(pod *corev1.Pod) []string {
 	result := []string{}
 	if pod.Spec.Affinity != nil {
 		if pod.Spec.Affinity.PodAffinity != nil && len(pod.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution) > 0 {
-			result = append(result, "required podAffinity")
+			result = append(result, "必須の podAffinity は静的に評価していません")
 		}
 		if pod.Spec.Affinity.PodAntiAffinity != nil && len(pod.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution) > 0 {
-			result = append(result, "required podAntiAffinity")
+			result = append(result, "必須の podAntiAffinity は静的に評価していません")
 		}
 	}
 	if len(pod.Spec.TopologySpreadConstraints) > 0 {
-		result = append(result, "topologySpreadConstraints")
+		result = append(result, "topologySpreadConstraints は静的に評価していません")
 	}
 	for _, container := range append(append([]corev1.Container{}, pod.Spec.InitContainers...), pod.Spec.Containers...) {
 		for _, port := range container.Ports {
 			if port.HostPort > 0 {
-				result = append(result, "hostPort")
+				result = append(result, "hostPort の競合は静的に評価していません")
 				break
 			}
 		}
 	}
 	if len(pod.Spec.ResourceClaims) > 0 {
-		result = append(result, "DRA resourceClaims")
+		result = append(result, "DRAの resourceClaims は静的に評価していません")
 	}
 	return uniqueSorted(result)
 }

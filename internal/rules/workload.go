@@ -14,7 +14,7 @@ type WorkloadRule struct{}
 
 func (WorkloadRule) Metadata() Metadata {
 	return Metadata{
-		ID: "workloads", Section: "ワークロード (Deployment等)", Description: "Workloadのreplicaとrollout condition",
+		ID: "workloads", Section: "ワークロード（Deploymentなど）", Description: "ワークロードのレプリカ数とロールアウト状態",
 		Required:    []string{"deployments", "statefulsets", "daemonsets", "replicasets"},
 		Permissions: namespaced("apps", "deployments,statefulsets,daemonsets,replicasets"),
 		Modes:       []string{"all", "triage"},
@@ -36,16 +36,16 @@ func (WorkloadRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ confi
 			if c.Type == appsv1.DeploymentProgressing && c.Status == "False" && c.Reason == "ProgressDeadlineExceeded" {
 				hardRolloutFailure = true
 				result = append(result, model.NewFinding(
-					model.Issue, "K8S.WORKLOAD.PROGRESS_DEADLINE_EXCEEDED", "ワークロード (Deployment等)", resource,
-					c.Reason, "progress-deadline", fmt.Sprintf("Deployment %s: rolloutがprogressDeadlineSecondsを超えて停滞しています", short), 100,
+					model.Issue, "K8S.WORKLOAD.PROGRESS_DEADLINE_EXCEEDED", "ワークロード（Deploymentなど）", resource,
+					c.Reason, "progress-deadline", fmt.Sprintf("Deployment %s のロールアウトは、progressDeadlineSecondsを超えても完了していません", short), 100,
 					model.Evidence{Kind: "condition", Key: string(c.Type), Value: c.Message},
 				))
 			}
 			if c.Type == appsv1.DeploymentReplicaFailure && c.Status == "True" {
 				hardRolloutFailure = true
 				result = append(result, model.NewFinding(
-					model.Issue, "K8S.WORKLOAD.REPLICA_FAILURE", "ワークロード (Deployment等)", resource,
-					c.Reason, "replica-failure", fmt.Sprintf("Deployment %s: Replica作成に失敗しています (%s)", short, c.Reason), 100,
+					model.Issue, "K8S.WORKLOAD.REPLICA_FAILURE", "ワークロード（Deploymentなど）", resource,
+					c.Reason, "replica-failure", fmt.Sprintf("Deployment %s はレプリカ（Pod）を作成できません%s", short, reasonSuffix(c.Reason)), 100,
 					model.Evidence{Kind: "condition", Key: string(c.Type), Value: c.Message},
 				))
 			}
@@ -56,8 +56,8 @@ func (WorkloadRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ confi
 		desired := int32Value(deployment.Spec.Replicas, 1)
 		if desired > 0 && deployment.Status.ReadyReplicas < desired && (!normalRollout || hardRolloutFailure) {
 			result = append(result, model.NewFinding(
-				model.Warning, "K8S.WORKLOAD.REPLICAS_UNAVAILABLE", "ワークロード (Deployment等)", resource,
-				"ReadyReplicasUnavailable", "ready-replicas", fmt.Sprintf("Deployment %s: Ready %d/%d", short, deployment.Status.ReadyReplicas, desired), 75,
+				model.Warning, "K8S.WORKLOAD.REPLICAS_UNAVAILABLE", "ワークロード（Deploymentなど）", resource,
+				"ReadyReplicasUnavailable", "ready-replicas", readyCountMessage("Deployment", short, deployment.Status.ReadyReplicas, desired), 75,
 				model.Evidence{Kind: "status", Key: "readyReplicas", Value: fmt.Sprintf("%d/%d", deployment.Status.ReadyReplicas, desired)},
 			))
 		}
@@ -70,8 +70,8 @@ func (WorkloadRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ confi
 		for _, c := range rs.Status.Conditions {
 			if c.Type == appsv1.ReplicaSetReplicaFailure && c.Status == "True" {
 				result = append(result, model.NewFinding(
-					model.Issue, "K8S.WORKLOAD.REPLICA_FAILURE", "ワークロード (Deployment等)", ref("ReplicaSet", rs.Namespace, rs.Name),
-					c.Reason, "replica-failure", fmt.Sprintf("ReplicaSet %s: Replica作成に失敗しています (%s)", shortRef(rs.Namespace, rs.Name), c.Reason), 100,
+					model.Issue, "K8S.WORKLOAD.REPLICA_FAILURE", "ワークロード（Deploymentなど）", ref("ReplicaSet", rs.Namespace, rs.Name),
+					c.Reason, "replica-failure", fmt.Sprintf("ReplicaSet %s はレプリカ（Pod）を作成できません%s", shortRef(rs.Namespace, rs.Name), reasonSuffix(c.Reason)), 100,
 					model.Evidence{Kind: "condition", Key: string(c.Type), Value: c.Message},
 				))
 			}
@@ -84,7 +84,7 @@ func (WorkloadRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ confi
 		}
 		desired := int32Value(item.Spec.Replicas, 1)
 		if desired > 0 && item.Status.ReadyReplicas < desired {
-			result = append(result, model.NewFinding(model.Warning, "K8S.WORKLOAD.REPLICAS_UNAVAILABLE", "ワークロード (Deployment等)", ref("StatefulSet", item.Namespace, item.Name), "ReadyReplicasUnavailable", "ready-replicas", fmt.Sprintf("StatefulSet %s: Ready %d/%d", shortRef(item.Namespace, item.Name), item.Status.ReadyReplicas, desired), 75))
+			result = append(result, model.NewFinding(model.Warning, "K8S.WORKLOAD.REPLICAS_UNAVAILABLE", "ワークロード（Deploymentなど）", ref("StatefulSet", item.Namespace, item.Name), "ReadyReplicasUnavailable", "ready-replicas", readyCountMessage("StatefulSet", shortRef(item.Namespace, item.Name), item.Status.ReadyReplicas, desired), 75))
 		}
 	}
 	for i := range snapshot.DaemonSets {
@@ -93,7 +93,7 @@ func (WorkloadRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ confi
 			continue
 		}
 		if item.Status.DesiredNumberScheduled > 0 && item.Status.NumberReady < item.Status.DesiredNumberScheduled {
-			result = append(result, model.NewFinding(model.Warning, "K8S.WORKLOAD.REPLICAS_UNAVAILABLE", "ワークロード (Deployment等)", ref("DaemonSet", item.Namespace, item.Name), "ReadyReplicasUnavailable", "ready-replicas", fmt.Sprintf("DaemonSet %s: Ready %d/%d", shortRef(item.Namespace, item.Name), item.Status.NumberReady, item.Status.DesiredNumberScheduled), 75))
+			result = append(result, model.NewFinding(model.Warning, "K8S.WORKLOAD.REPLICAS_UNAVAILABLE", "ワークロード（Deploymentなど）", ref("DaemonSet", item.Namespace, item.Name), "ReadyReplicasUnavailable", "ready-replicas", readyCountMessage("DaemonSet", shortRef(item.Namespace, item.Name), item.Status.NumberReady, item.Status.DesiredNumberScheduled), 75))
 		}
 	}
 	return result

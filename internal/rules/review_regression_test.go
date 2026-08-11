@@ -226,7 +226,7 @@ func TestSchedulingEvaluatesBoundPVNodeAffinity(t *testing.T) {
 		snapshot.Statuses[key] = kube.FetchStatus{Available: true}
 	}
 	finding := schedulingFinding(t, snapshot, "K8S.SCHEDULING.FAILED_SCHEDULING_REPORTED")
-	if !strings.Contains(finding.Message, "配置可能Node 1/2") || !evidenceContains(finding, "PV pv-dataのnodeAffinity不一致") {
+	if !strings.Contains(finding.Message, "2台中 1台") || !evidenceContains(finding, "PV \"pv-data\" の nodeAffinity") || !evidenceContains(finding, "一致しません") {
 		t.Fatalf("Bound PV nodeAffinityをNode別に評価できない: %#v", finding)
 	}
 }
@@ -248,7 +248,7 @@ func TestSchedulingEvaluatesWaitForConsumerAllowedTopologiesConservatively(t *te
 		snapshot.Statuses[key] = kube.FetchStatus{Available: true}
 	}
 	finding := schedulingFinding(t, snapshot, "K8S.SCHEDULING.FAILED_SCHEDULING_REPORTED")
-	if finding.Severity == model.Issue || !strings.Contains(finding.Message, "配置可能Node 1/2") || !evidenceContains(finding, "allowedTopologies不一致") || !evidenceContains(finding, "動的provisioning") {
+	if finding.Severity == model.Issue || !strings.Contains(finding.Message, "2台中 1台") || !evidenceContains(finding, "allowedTopologies") || !evidenceContains(finding, "動的プロビジョニング") {
 		t.Fatalf("WFFC topologyまたはunknownを不正評価した: %#v", finding)
 	}
 }
@@ -274,11 +274,11 @@ func TestSchedulingHandlesGenericEphemeralPVCAndSelectedNode(t *testing.T) {
 	}
 	nodeA, nodeB := schedulableNode("node-a"), schedulableNode("node-b")
 	reasonsA, _ := pvcNodeSchedulingConstraints(&pod, &nodeA, snapshot)
-	if !containsText(reasonsA, "selected-node=node-b") {
+	if !containsText(reasonsA, "Node \"node-b\" 向けに選択済み") {
 		t.Fatalf("generic ephemeral PVCのselected-nodeを評価できない: %v", reasonsA)
 	}
 	reasonsB, unknownsB := pvcNodeSchedulingConstraints(&pod, &nodeB, snapshot)
-	if len(reasonsB) != 0 || !containsText(unknownsB, "動的provisioning") || !podUsesPVC(&pod) {
+	if len(reasonsB) != 0 || !containsText(unknownsB, "動的プロビジョニング") || !podUsesPVC(&pod) {
 		t.Fatalf("selected node上のgeneric ephemeral PVC評価が不正: reasons=%v unknowns=%v", reasonsB, unknownsB)
 	}
 }
@@ -289,7 +289,7 @@ func TestSchedulingRejectsUnownedGenericEphemeralPVC(t *testing.T) {
 	pvc := corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "scratch-owner-cache", Namespace: "ns"}}
 	node := schedulableNode("node-a")
 	reasons, _ := pvcNodeSchedulingConstraints(&pod, &node, &kube.Snapshot{PersistentVolumeClaims: []corev1.PersistentVolumeClaim{pvc}})
-	if !containsText(reasons, "Pod所有ではない") {
+	if !containsText(reasons, "このPodによって所有されていません") {
 		t.Fatalf("無関係な同名PVCをgeneric ephemeral volumeへ使用した: %v", reasons)
 	}
 }
@@ -487,7 +487,7 @@ func TestFeasibleNodeCountIncludesNodesWithUnknownConstraints(t *testing.T) {
 	node := schedulableNode("node-a")
 	delete(node.Status.Allocatable, corev1.ResourcePods)
 	finding := schedulingFinding(t, &kube.Snapshot{Pods: []corev1.Pod{pod}, Nodes: []corev1.Node{node}}, "K8S.SCHEDULING.FAILED_SCHEDULING_REPORTED")
-	if !strings.Contains(finding.Message, "配置可能Node 1/1") || !strings.Contains(finding.Message, "未評価") {
+	if !strings.Contains(finding.Message, "1台中 1台") || !strings.Contains(finding.Message, "未評価") {
 		t.Fatalf("配置可能と未評価を分離できていない: %#v", finding)
 	}
 }
@@ -586,7 +586,7 @@ func TestLogSignatureBecomesRootCauseEvidence(t *testing.T) {
 		t.Fatalf("Pod異常のRoot Causeがない: %#v", state.RootCauses)
 	}
 	root := state.RootCauses[0]
-	if !evidenceContains(model.Finding{Evidence: root.Evidence}, "Go panic") || !evidenceContains(model.Finding{Evidence: root.Evidence}, "panic: runtime error") {
+	if !evidenceContains(model.Finding{Evidence: root.Evidence}, "Goのpanic") || !evidenceContains(model.Finding{Evidence: root.Evidence}, "panic: runtime error") {
 		t.Fatalf("ログシグネチャがRoot Cause根拠へ入らない: %#v", root.Evidence)
 	}
 	if !contains(root.RelatedFindingIDs, logs[0].ID) {
@@ -649,7 +649,7 @@ func TestNamedTargetPortFindingExplainsTheComparedConfiguration(t *testing.T) {
 	if finding.Code == "" {
 		t.Fatalf("名前付きtargetPort不一致を検出できない: %#v", findings)
 	}
-	for _, want := range []string{"ポート \"web\"（80/TCP）", "targetPortに \"admin\" が指定されています", "\"admin\" という名前のTCP containerPortがありません"} {
+	for _, want := range []string{"ポート \"web\"（80/TCP）", "targetPort に \"admin\" が指定されています", "\"admin\" という名前の TCP containerPort が定義されていない"} {
 		if !strings.Contains(finding.Message, want) {
 			t.Fatalf("所見に比較内容%qがない: %q", want, finding.Message)
 		}
@@ -657,14 +657,77 @@ func TestNamedTargetPortFindingExplainsTheComparedConfiguration(t *testing.T) {
 	for _, want := range []string{
 		"Serviceポート \"web\"（80/TCP） → targetPort \"admin\"",
 		"Serviceのselector: app=api, tier=backend",
-		"selectorに一致したPod: 1件 (ns/api-abc)",
-		"TCP containerPort名: http",
-		"targetPort \"admin\" と同名のTCP containerPortは見つかりませんでした（0件）",
+		"selectorに一致したPod: 1件（ns/api-abc）",
+		"TCP の containerPort 名: http",
+		"targetPort \"admin\" と同名の TCP containerPort は見つかりませんでした（0件）",
 		"EndpointSliceからも転送先ポートを確認できませんでした",
 	} {
 		if !evidenceContains(finding, want) {
 			t.Fatalf("targetPort判定の根拠%qがない: %#v", want, finding.Evidence)
 		}
+	}
+}
+
+func TestRepresentativeFindingMessagesAreNaturalAndExplainTheTrigger(t *testing.T) {
+	now := time.Now()
+	failedPod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "failed", Namespace: "ns"},
+		Status:     corev1.PodStatus{Phase: corev1.PodFailed, Reason: "Evicted", Message: "disk pressure"},
+	}
+	replicas := int32(3)
+	deployment := appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "ns", Generation: 1},
+		Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
+		Status:     appsv1.DeploymentStatus{ObservedGeneration: 1, ReadyReplicas: 1},
+	}
+	hpa := autoscalingv2.HorizontalPodAutoscaler{
+		ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "ns"},
+		Spec:       autoscalingv2.HorizontalPodAutoscalerSpec{MaxReplicas: 10},
+		Status: autoscalingv2.HorizontalPodAutoscalerStatus{Conditions: []autoscalingv2.HorizontalPodAutoscalerCondition{{
+			Type: autoscalingv2.AbleToScale, Status: corev1.ConditionFalse, Reason: "FailedGetScale",
+		}}},
+	}
+	pdb := policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "ns", Generation: 1},
+		Status:     policyv1.PodDisruptionBudgetStatus{ObservedGeneration: 1, CurrentHealthy: 1, DesiredHealthy: 2},
+	}
+	tlsSnapshot := &kube.Snapshot{
+		ServerTime: now,
+		Secrets: []kube.SecretProjection{{
+			Namespace: "ns", Name: "tls", Type: corev1.SecretTypeTLS,
+			TLSCert: certificatePEMWindow(t, now.Add(-24*time.Hour), now.Add(-time.Hour), 300),
+		}},
+	}
+	pvc := corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "data", Namespace: "ns"},
+		Status:     corev1.PersistentVolumeClaimStatus{Phase: corev1.ClaimPending},
+	}
+
+	cases := []struct {
+		name     string
+		finding  model.Finding
+		required []string
+	}{
+		{"Pod", findingWithCode(t, (PodHealthRule{}).Evaluate(context.Background(), &kube.Snapshot{Pods: []corev1.Pod{failedPod}}, config.Defaults()), "K8S.POD.FAILED_PHASE"), []string{"Pod ns/failed の状態（phase）は Failed です", "Kubernetesが報告した理由: Evicted", "詳細: disk pressure"}},
+		{"Deployment", findingWithCode(t, (WorkloadRule{}).Evaluate(context.Background(), &kube.Snapshot{Deployments: []appsv1.Deployment{deployment}}, config.Defaults()), "K8S.WORKLOAD.REPLICAS_UNAVAILABLE"), []string{"Deployment ns/api", "Ready状態のレプリカ数は 1/3 です"}},
+		{"HPA", findingWithCode(t, (HPARule{}).Evaluate(context.Background(), &kube.Snapshot{HPAs: []autoscalingv2.HorizontalPodAutoscaler{hpa}}, config.Defaults()), "K8S.HPA.CONDITION"), []string{"状態条件（condition） \"AbleToScale\" は False です", "Kubernetesが報告した理由: FailedGetScale"}},
+		{"PDB", findingWithCode(t, (PDBRule{}).Evaluate(context.Background(), &kube.Snapshot{PodDisruptionBudgets: []policyv1.PodDisruptionBudget{pdb}}, config.Defaults()), "K8S.PDB.HEALTH_BELOW_DESIRED"), []string{"正常なPodが 1個", "必要な 2個"}},
+		{"TLS", findingWithCode(t, (TLSRule{}).Evaluate(context.Background(), tlsSnapshot, config.Defaults()), "K8S.TLS.CERT_EXPIRED"), []string{"TLS証明書 ns/tls", "有効期限", "を過ぎています"}},
+		{"PVC", findingWithCode(t, (StorageRule{}).Evaluate(context.Background(), &kube.Snapshot{PersistentVolumeClaims: []corev1.PersistentVolumeClaim{pvc}}, config.Defaults()), "K8S.PVC.NOT_BOUND"), []string{"PVC ns/data はバインドされていません", "現在のphase: Pending"}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			for _, required := range test.required {
+				if !strings.Contains(test.finding.Message, required) {
+					t.Fatalf("診断文に発生条件%qがありません: %q", required, test.finding.Message)
+				}
+			}
+			for _, forbidden := range []string{"phase=", "Ready condition", "currentHealthy=", "desiredHealthy=", "期限切れしています", "Failed状態", "必要な3個", "Bound状態ではありません", ": :"} {
+				if strings.Contains(test.finding.Message, forbidden) {
+					t.Fatalf("診断文に機械的または不自然な表現%qが残っています: %q", forbidden, test.finding.Message)
+				}
+			}
+		})
 	}
 }
 
@@ -963,6 +1026,17 @@ func evidenceContains(finding model.Finding, value string) bool {
 		}
 	}
 	return false
+}
+
+func findingWithCode(t *testing.T, findings []model.Finding, code string) model.Finding {
+	t.Helper()
+	for _, finding := range findings {
+		if finding.Code == code {
+			return finding
+		}
+	}
+	t.Fatalf("所見 %s がありません: %#v", code, findings)
+	return model.Finding{}
 }
 
 func hasCodeAndResource(findings []model.Finding, code, resource string) bool {

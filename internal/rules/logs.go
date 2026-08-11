@@ -29,14 +29,14 @@ type logSignature struct {
 }
 
 var builtInLogSignatures = []logSignature{
-	{"oom", "K8S.LOG.OOM", "Out of Memoryの痕跡", regexp.MustCompile(`(?i)\b(?:oomkilled|out of memory|cannot allocate memory|memory cgroup out of memory)\b`), model.Warning, 85, 1},
-	{"go_panic", "K8S.LOG.GO_PANIC", "Go panic", regexp.MustCompile(`(?m)^panic:\s+`), model.Warning, 85, 1},
-	{"python_traceback", "K8S.LOG.PYTHON_TRACEBACK", "Python Traceback", regexp.MustCompile(`(?m)^Traceback \(most recent call last\):`), model.Warning, 80, 1},
+	{"oom", "K8S.LOG.OOM", "メモリ不足（Out of Memory）の痕跡", regexp.MustCompile(`(?i)\b(?:oomkilled|out of memory|cannot allocate memory|memory cgroup out of memory)\b`), model.Warning, 85, 1},
+	{"go_panic", "K8S.LOG.GO_PANIC", "Goのpanic", regexp.MustCompile(`(?m)^panic:\s+`), model.Warning, 85, 1},
+	{"python_traceback", "K8S.LOG.PYTHON_TRACEBACK", "PythonのTraceback", regexp.MustCompile(`(?m)^Traceback \(most recent call last\):`), model.Warning, 80, 1},
 	{"x509_expired", "K8S.LOG.X509_EXPIRED", "X.509証明書の期限切れ", regexp.MustCompile(`(?i)(?:x509|certificate).{0,80}(?:expired|has expired|not valid after)`), model.Warning, 90, 1},
-	{"address_in_use", "K8S.LOG.ADDRESS_IN_USE", "listen addressの競合", regexp.MustCompile(`(?i)(?:bind|listen).{0,80}address already in use`), model.Warning, 85, 1},
+	{"address_in_use", "K8S.LOG.ADDRESS_IN_USE", "待受アドレスの競合", regexp.MustCompile(`(?i)(?:bind|listen).{0,80}address already in use`), model.Warning, 85, 1},
 	{"network_unreachable", "K8S.LOG.NETWORK_UNREACHABLE", "通信先への接続失敗", regexp.MustCompile(`(?i)connection refused|no route to host`), model.Candidate, 55, 2},
-	{"permission_denied", "K8S.LOG.PERMISSION_DENIED", "permission denied", regexp.MustCompile(`(?i)permission denied`), model.Candidate, 50, 2},
-	{"connection_reset", "K8S.LOG.CONNECTION_RESET", "connection reset by peer", regexp.MustCompile(`(?i)connection reset by peer`), model.Candidate, 50, 2},
+	{"permission_denied", "K8S.LOG.PERMISSION_DENIED", "権限拒否（permission denied）", regexp.MustCompile(`(?i)permission denied`), model.Candidate, 50, 2},
+	{"connection_reset", "K8S.LOG.CONNECTION_RESET", "接続切断（connection reset by peer）", regexp.MustCompile(`(?i)connection reset by peer`), model.Candidate, 50, 2},
 }
 
 // AnalyzeLogs matches raw text, but every persisted evidence line is always
@@ -51,7 +51,7 @@ func NewLogAnalyzer(path string, lastLines int) (*LogAnalyzer, error) {
 	}
 	absolute, err := filepath.Abs(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("ログシグネチャ設定のパスを解決できません: %w", err)
 	}
 	info, err := os.Stat(absolute)
 	if err != nil {
@@ -62,7 +62,7 @@ func NewLogAnalyzer(path string, lastLines int) (*LogAnalyzer, error) {
 	}
 	file, err := os.Open(absolute) // #nosec G304 -- --log-signatures explicitly selects a validated regular file.
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("ログシグネチャ設定を開けません: %w", err)
 	}
 	defer file.Close()
 	return loadLogAnalyzer(file, lastLines)
@@ -90,26 +90,26 @@ func loadLogAnalyzer(reader io.Reader, lastLines int) (*LogAnalyzer, error) {
 			continue
 		}
 		if section == "" {
-			return nil, fmt.Errorf("設定値はセクション内に記述してください (%d行目)", lineNo)
+			return nil, fmt.Errorf("設定値はセクション内に記述してください（%d行目）", lineNo)
 		}
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) != 2 {
-			return nil, fmt.Errorf("設定形式が不正です (%d行目)", lineNo)
+			return nil, fmt.Errorf("設定形式が不正です（%d行目）", lineNo)
 		}
 		key := strings.ToLower(strings.TrimSpace(parts[0]))
 		if _, exists := sections[section][key]; exists {
-			return nil, fmt.Errorf("[%s]のキーが重複しています: %s", section, key)
+			return nil, fmt.Errorf("[%s] でキーが重複しています: %s", section, key)
 		}
 		sections[section][key] = strings.TrimSpace(parts[1])
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("ログシグネチャ設定を読み込めません: %w", err)
 	}
 	disabled := map[string]struct{}{}
 	if settings := sections["settings"]; settings != nil {
 		for key := range settings {
 			if key != "disabled" {
-				return nil, fmt.Errorf("[settings]の未知のキーです: %s", key)
+				return nil, fmt.Errorf("[settings] に未対応のキーがあります: %s", key)
 			}
 		}
 		for _, value := range strings.Split(settings["disabled"], ",") {
@@ -147,37 +147,37 @@ func loadLogAnalyzer(reader io.Reader, lastLines int) (*LogAnalyzer, error) {
 			switch key {
 			case "pattern", "title", "severity", "confidence", "min_count", "case_sensitive":
 			default:
-				return nil, fmt.Errorf("[%s]の未知のキーです: %s", name, key)
+				return nil, fmt.Errorf("[%s] に未対応のキーがあります: %s", name, key)
 			}
 		}
 		pattern, title := values["pattern"], strings.Join(strings.Fields(values["title"]), " ")
 		if pattern == "" || title == "" || utf8.RuneCountInString(pattern) > 500 || utf8.RuneCountInString(title) > 500 {
-			return nil, fmt.Errorf("[%s]には500文字以下のpatternとtitleが必要です", name)
+			return nil, fmt.Errorf("[%s] には、500文字以下の pattern と title が必要です", name)
 		}
 		caseSensitive, err := parseLogBool(values["case_sensitive"], false)
 		if err != nil {
-			return nil, fmt.Errorf("[%s] case_sensitive: %w", name, err)
+			return nil, fmt.Errorf("[%s] の case_sensitive が不正です: %w", name, err)
 		}
 		if !caseSensitive {
 			pattern = "(?i)" + pattern
 		}
 		compiled, err := regexp.Compile(pattern)
 		if err != nil || compiled.MatchString("") {
-			return nil, fmt.Errorf("[%s] patternが不正または空文字に一致します", name)
+			return nil, fmt.Errorf("[%s] の pattern が不正であるか、空文字に一致します", name)
 		}
 		severity := model.Candidate
 		if values["severity"] == "warning" {
 			severity = model.Warning
 		} else if values["severity"] != "" && values["severity"] != "candidate" {
-			return nil, fmt.Errorf("[%s] severityはwarningまたはcandidateです", name)
+			return nil, fmt.Errorf("[%s] の severity には warning または candidate を指定してください", name)
 		}
 		confidence, err := parseLogInt(values["confidence"], 60, 0, 100)
 		if err != nil {
-			return nil, fmt.Errorf("[%s] confidence: %w", name, err)
+			return nil, fmt.Errorf("[%s] の confidence が不正です: %w", name, err)
 		}
 		minimum, err := parseLogInt(values["min_count"], 2, 1, 100)
 		if err != nil {
-			return nil, fmt.Errorf("[%s] min_count: %w", name, err)
+			return nil, fmt.Errorf("[%s] の min_count が不正です: %w", name, err)
 		}
 		code := "K8S.LOG." + strings.ToUpper(regexp.MustCompile(`[^A-Z0-9]+`).ReplaceAllString(strings.ToUpper(id), "_"))
 		filtered = append(filtered, logSignature{id, code, title, compiled, severity, confidence, minimum})
@@ -200,7 +200,7 @@ func parseLogBool(value string, fallback bool) (bool, error) {
 	case "0", "no", "false", "off":
 		return false, nil
 	default:
-		return false, fmt.Errorf("true/falseで指定してください")
+		return false, fmt.Errorf("true または false を指定してください")
 	}
 }
 
@@ -238,7 +238,7 @@ func (analyzer *LogAnalyzer) Analyze(namespace, pod, source, text string) []mode
 		}
 		result = append(result, model.NewFinding(
 			signature.Severity, signature.Code, "ログ", ref("Pod", namespace, pod), signature.ID,
-			source+"/"+signature.ID, fmt.Sprintf("Pod %s: %sをログ末尾で%d回検出", shortRef(namespace, pod), signature.Title, len(matches)), signature.Confidence, evidence...,
+			source+"/"+signature.ID, fmt.Sprintf("Pod %s のログ末尾から、「%s」に該当する記録を %d件検出しました", shortRef(namespace, pod), signature.Title, len(matches)), signature.Confidence, evidence...,
 		))
 	}
 	return result

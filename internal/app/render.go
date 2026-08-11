@@ -21,6 +21,7 @@ func (runner *Runner) renderText(snapshot *kube.Snapshot, state *model.State) {
 		runner.Console.PodTable([]string{"NAMESPACE", "NAME", "READY", "STATUS", "RESTARTS", "AGE", "NODE"}, podRows(snapshot.Pods))
 		runner.renderMetrics(snapshot, state)
 	}
+	runner.Console.DiagnosticContents(runner.diagnosticItems(snapshot, state))
 	runner.renderEvents(snapshot, snapshot.Events, "")
 	runner.renderLogs()
 	runner.Console.RootCauseReport(state.RootCauses)
@@ -106,10 +107,10 @@ func (runner *Runner) renderHistory(analysis history.Analysis) {
 		for _, trend := range analysis.Trends {
 			runner.Console.Write("  ▲ " + console.MaskSecrets(trend.Message, runner.Config.Mask))
 		}
-		runner.Console.Write(fmt.Sprintf("  (%d 件 / 分析サンプル %d)", len(analysis.Trends), analysis.Samples))
+		runner.Console.Write(fmt.Sprintf("  （所見 %d件・分析対象 %d回）", len(analysis.Trends), analysis.Samples))
 	}
 	if analysis.UnknownEvaluations > 0 {
-		runner.Console.Write(fmt.Sprintf("  状態を確認できなかった%d件は、正常・異常の遷移判定から除外しました", analysis.UnknownEvaluations))
+		runner.Console.Write(fmt.Sprintf("  状態を確認できなかった %d件は、正常・異常の遷移判定から除外しました", analysis.UnknownEvaluations))
 	}
 }
 

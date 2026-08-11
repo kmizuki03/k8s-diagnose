@@ -159,7 +159,7 @@ func enforceInteractiveMaskPolicy(cfg config.Config, output io.Writer) (config.C
 	}
 	file, ok := output.(*os.File)
 	if !ok || !term.IsTerminal(int(file.Fd())) { // #nosec G115 -- canonical x/term descriptor conversion.
-		return cfg, errors.New("--no-maskは対話端末へのtext出力でのみ使用できます")
+		return cfg, errors.New("--no-mask は、対話端末へのテキスト出力でのみ使用できます")
 	}
 	return cfg, nil
 }
@@ -232,15 +232,13 @@ func (runner *Runner) diagnose(ctx context.Context, selected *corev1.Pod) (*mode
 	snapshot := collector.Collect(ctx)
 	if selected != nil {
 		if status := snapshot.Status("pods"); !status.Available {
-			return nil, snapshot, fmt.Errorf("選択したPodを診断直前に再取得できません (%s)", status.Reason)
+			return nil, snapshot, fmt.Errorf("選択したPodを診断直前に再取得できません。原因: %s", status.Reason)
 		}
 		fresh, err := resolveSelectedPod(snapshot.Pods, selected)
 		if err != nil {
 			return nil, snapshot, err
 		}
-		copySnapshot := *snapshot
-		copySnapshot.Pods = []corev1.Pod{*fresh}
-		snapshot = &copySnapshot
+		snapshot = scopeSnapshotToSelectedPod(snapshot, fresh)
 	}
 	state := model.NewState()
 	runner.Registry.Run(ctx, snapshot, runner.Config, state)
@@ -251,6 +249,9 @@ func (runner *Runner) diagnose(ctx context.Context, selected *corev1.Pod) (*mode
 		runner.collectLogs(ctx, snapshot, state, selected != nil)
 	}
 	runner.correlateAndApplyBaseline(snapshot, state)
+	if selected != nil && len(snapshot.Pods) == 1 {
+		state.SetScopedScore(calculatePodScore(&snapshot.Pods[0], state, snapshot))
+	}
 	return state, snapshot, nil
 }
 
@@ -298,7 +299,7 @@ func addUnusedDiagnostics(snapshot *kube.Snapshot, state *model.State, excludeSy
 	if len(unavailable) > 0 {
 		finding := model.NewFinding(
 			model.Unavailable, "K8S.UNUSED.PARTIAL_UNAVAILABLE", "未使用候補", "Rule/unused",
-			"FetchUnavailable", "collections", fmt.Sprintf("未使用リソース診断は取得できた範囲だけで実施しました (取得不能: %s)", strings.Join(unavailable, ", ")), 100,
+			"FetchUnavailable", "collections", fmt.Sprintf("必要なリソースの一部を取得できなかったため、未使用リソース診断は取得できた範囲で実施しました（取得できなかった項目: %s）", strings.Join(unavailable, ", ")), 100,
 		)
 		finding.RuleID = "unused"
 		state.Add(finding)
@@ -391,6 +392,7 @@ func (runner *Runner) selectPod(ctx context.Context) int {
 		runner.Console.Chapter("Pod個別診断: " + selected.Namespace + "/" + selected.Name)
 		runner.renderCommandGroup(runner.commandsForResource("Pod/" + selected.Namespace + "/" + selected.Name))
 		runner.Console.PodTable([]string{"NAMESPACE", "NAME", "READY", "STATUS", "RESTARTS", "AGE", "NODE"}, podRows([]corev1.Pod{*selected}))
+		runner.Console.DiagnosticContents(runner.diagnosticItems(selectedSnapshot, state))
 		runner.renderEvents(selectedSnapshot, selectedSnapshot.Events, selected.Name)
 		runner.renderLogs()
 		if runner.Config.Connect {
@@ -401,6 +403,7 @@ func (runner *Runner) selectPod(ctx context.Context) int {
 			}
 			if ran {
 				runner.correlateAndApplyBaseline(selectedSnapshot, state)
+				state.SetScopedScore(calculatePodScore(selected, state, selectedSnapshot))
 				runner.renderConnectResults(results)
 			}
 		}

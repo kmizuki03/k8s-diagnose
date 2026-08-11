@@ -16,63 +16,70 @@ type SettingSpec struct {
 	Key         string
 	Label       string
 	Description string
+	Boolean     bool
 }
 
 func setting(section, key, label, description string) SettingSpec {
 	return SettingSpec{Name: section + "." + key, Section: section, Key: key, Label: label, Description: description}
 }
 
-var settingCatalog = []SettingSpec{
-	setting("target", "namespace", "Namespace", "空欄なら全Namespace"),
-	setting("target", "context", "Context", "使用するkubeconfig context"),
-	setting("target", "kubeconfig", "Kubeconfig", "kubeconfigファイル"),
-	setting("target", "timeout", "API timeout", "API要求タイムアウト秒"),
-	setting("target", "qps", "Client QPS", "client-goのQPS"),
-	setting("target", "burst", "Client burst", "client-goのBurst"),
-	setting("target", "page_size", "Page size", "List APIページサイズ"),
+func booleanSetting(section, key, label, description string) SettingSpec {
+	spec := setting(section, key, label, description)
+	spec.Boolean = true
+	return spec
+}
 
-	setting("diagnosis", "mode", "既定モード", "all/select/list/triage"),
-	setting("diagnosis", "logs", "全体診断ログ", "allで失敗Podログを取得"),
-	setting("diagnosis", "unused", "未使用候補", "allで未使用候補を診断"),
-	setting("diagnosis", "events_limit", "Event表示数", "最新Warning Event件数"),
+var settingCatalog = []SettingSpec{
+	setting("target", "namespace", "Namespace", "空欄の場合は、すべてのNamespaceを対象にします"),
+	setting("target", "context", "Context", "使用するkubeconfigのcontext"),
+	setting("target", "kubeconfig", "Kubeconfig", "使用するkubeconfigファイル"),
+	setting("target", "timeout", "APIタイムアウト", "Kubernetes API要求のタイムアウト秒数"),
+	setting("target", "qps", "Client QPS", "client-goクライアントのQPS"),
+	setting("target", "burst", "Client burst", "client-goクライアントのBurst値"),
+	setting("target", "page_size", "ページサイズ", "List APIで1回に取得する件数"),
+
+	setting("diagnosis", "mode", "既定モード", "all、select、list、triage のいずれか"),
+	booleanSetting("diagnosis", "logs", "全体診断ログ", "allモードで異常なPodのログを取得します"),
+	booleanSetting("diagnosis", "unused", "未使用候補", "allモードで未使用リソースの候補を診断します"),
+	setting("diagnosis", "events_limit", "Event表示数", "表示する最新のWarning Event件数"),
 	setting("diagnosis", "restart_threshold", "再起動閾値", "再起動警告の回数"),
-	setting("diagnosis", "node_heartbeat_timeout", "Node heartbeat", "Lease停滞判定秒"),
+	setting("diagnosis", "node_heartbeat_timeout", "Nodeハートビート", "Leaseの停滞と判定する秒数"),
 	setting("diagnosis", "watch", "Watch間隔", "0ではなく1以上の秒数で定期実行"),
 	setting("diagnosis", "workers", "並列取得数", "1〜16"),
-	setting("diagnosis", "log_signatures_file", "ログ署名INI", "追加ログシグネチャ定義"),
+	setting("diagnosis", "log_signatures_file", "ログシグネチャINI", "追加のログシグネチャ定義ファイル"),
 	setting("diagnosis", "log_signature_lines", "ログ解析行数", "末尾1〜5000行"),
 
-	setting("connection", "enabled", "接続確認", "selectモードでProbe/TCPを確認"),
+	booleanSetting("connection", "enabled", "接続確認", "一時的なport-forwardを作成し、ProbeまたはTCP接続を確認します（実行前の追加確認なし）"),
 	setting("connection", "port", "ローカルポート", "1024〜65535、未設定なら自動"),
-	setting("connection", "path", "HTTPパス", "/で始まる上書きパス"),
+	setting("connection", "path", "HTTPパス", "「/」で始まる上書き用のパス"),
 
-	setting("debug", "enabled", "Debugメニュー", "all/select診断後に表示"),
-	setting("debug", "image", "Debug image", "kubectl debug用image"),
-	setting("debug", "profile", "Debug profile", "kubectl debug profile"),
+	booleanSetting("debug", "enabled", "Debugメニュー", "allまたはselectモードの診断後に表示します"),
+	setting("debug", "image", "Debugイメージ", "kubectl debugで使用するコンテナイメージ"),
+	setting("debug", "profile", "Debugプロファイル", "kubectl debugで使用するプロファイル"),
 
-	setting("display", "tail", "ログ表示行数", "selectまたはall+logs用"),
-	setting("display", "mask_secrets", "秘匿情報マスク", "通常はtrueを推奨"),
-	setting("display", "exit_zero", "常にexit 0", "所見による失敗を抑止"),
-	setting("display", "show_commands", "確認コマンド", "各診断項目の等価kubectlを表示"),
-	setting("display", "show_api_requests", "実API要求", "末尾に実行したKubernetes API要求を表示"),
+	setting("display", "tail", "ログ表示行数", "selectモードまたはallモードのログ診断で使用します"),
+	booleanSetting("display", "mask_secrets", "秘匿情報マスク", "通常は有効を推奨"),
+	booleanSetting("display", "exit_zero", "常にexit 0", "所見による失敗を抑止"),
+	booleanSetting("display", "show_commands", "確認コマンド", "各診断項目で使用できる同等のkubectlコマンドを表示します"),
+	booleanSetting("display", "show_api_requests", "実API要求", "末尾に実行したKubernetes API要求を表示"),
 
-	setting("report", "format", "出力形式", "text/json/sarif/junit/mermaid/dot"),
+	setting("report", "format", "出力形式", "text、json、sarif、junit、mermaid、dot のいずれか"),
 	setting("report", "file", "レポート保存先", "構造化出力の保存先"),
-	setting("report", "save_snapshot", "Snapshot保存先", "今回結果をJSON保存"),
-	setting("report", "diff", "比較Snapshot", "前回結果と比較"),
-	setting("report", "baseline", "Baseline", "承認済み所見INI"),
-	setting("report", "fail_on", "CI失敗重大度", "issue/warning/unavailable/any/none"),
-	setting("report", "max_issues", "許容件数", "fail_on対象の上限"),
+	setting("report", "save_snapshot", "スナップショット保存先", "今回の診断結果をJSON形式で保存します"),
+	setting("report", "diff", "比較スナップショット", "保存済みの診断結果と比較します"),
+	setting("report", "baseline", "ベースライン", "承認済み所見を定義したINIファイル"),
+	setting("report", "fail_on", "CI失敗重大度", "issue、warning、unavailable、any、none のいずれか"),
+	setting("report", "max_issues", "許容件数", "fail_onの対象として許容する最大件数"),
 
 	setting("history", "database", "履歴DB", "SQLite履歴ファイル"),
-	setting("history", "window", "履歴Window", "分析する実行回数"),
-	setting("history", "flap_threshold", "Flap閾値", "状態遷移回数"),
+	setting("history", "window", "履歴ウィンドウ", "分析対象とする過去の実行回数"),
+	setting("history", "flap_threshold", "フラッピング閾値", "フラッピングと判定する状態遷移回数"),
 	setting("history", "restart_growth", "再起動増加閾値", "restartCount増加数"),
 	setting("history", "retain", "履歴保持数", "DB全体の最大実行数"),
 
 	setting("notification", "webhook_url_env", "Webhook URL環境変数", "HTTPS URLを保持する環境変数名"),
-	setting("notification", "format", "Webhook形式", "generic/slack"),
-	setting("notification", "timeout", "Webhook timeout", "送信タイムアウト秒"),
+	setting("notification", "format", "Webhook形式", "generic または slack"),
+	setting("notification", "timeout", "Webhookタイムアウト", "送信のタイムアウト秒数"),
 }
 
 var settingByName = func() map[string]SettingSpec {
@@ -212,7 +219,7 @@ func (c Config) WithSetting(name, value string) (Config, error) {
 	candidate.explicitSettings = cloneExplicitSettings(c.explicitSettings)
 	spec := settingByName[name]
 	if err := applySetting(&candidate, spec.Section, spec.Key, value); err != nil {
-		return c, fmt.Errorf("設定値が不正です: [%s] %s=%q (%w)", spec.Section, spec.Key, value, err)
+		return c, fmt.Errorf("設定値が不正です: [%s] %s=%q（理由: %w）", spec.Section, spec.Key, value, err)
 	}
 	candidate.explicitSettings[name] = true
 	inheritLegacyAPIRequestSetting(&candidate)
@@ -346,11 +353,19 @@ func SaveINI(path string, c Config) (string, error) {
 // it clear whether the value is explicitly persisted or inherited.
 func SettingSummary(c Config, spec SettingSpec) string {
 	value := c.SettingValue(spec.Name)
+	if spec.Boolean {
+		switch strings.ToLower(value) {
+		case "true":
+			value = "有効（true）"
+		case "false":
+			value = "無効（false）"
+		}
+	}
 	if value == "" {
-		value = "(空欄)"
+		value = "（空欄）"
 	}
 	if !c.SettingExplicit(spec.Name) {
-		value += " [組み込み既定]"
+		value += "［組み込み既定］"
 	}
 	return strings.TrimSpace(value)
 }

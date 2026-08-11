@@ -76,20 +76,24 @@ func Build(state *model.State, cfg config.Config, context string) Document {
 		}
 		observations[category] = rows
 	}
+	summary := map[string]any{
+		"health": state.Health(), "coverage": state.Coverage(),
+		"checks":   map[string]any{"ok": ok, "unavailable": unavailable, "total": total},
+		"findings": counts, "active_findings": active,
+		"acknowledged_findings": acknowledgedCount(state.Findings),
+		"root_causes":           map[string]any{"confirmed": confirmed, "probable": probable, "related": related, "total": len(state.RootCauses)},
+	}
+	if scopedScore := state.ScopedScoreValue(); scopedScore != nil {
+		summary["scoped_score"] = scopedScore
+	}
 	return Document{
 		"schema":       Schema,
 		"generated_at": time.Now().UTC().Format(time.RFC3339Nano),
 		"tool":         map[string]any{"name": "k8s-diagnose", "version": config.Version, "runtime": "go"},
 		"target":       map[string]any{"context": context, "namespace": nullable(cfg.Namespace), "scope": cfg.ScopeLabel(), "mode": cfg.Mode, "config_file": nullable(cfg.ConfigFile)},
-		"summary": map[string]any{
-			"health": state.Health(), "coverage": state.Coverage(),
-			"checks":   map[string]any{"ok": ok, "unavailable": unavailable, "total": total},
-			"findings": counts, "active_findings": active,
-			"acknowledged_findings": acknowledgedCount(state.Findings),
-			"root_causes":           map[string]any{"confirmed": confirmed, "probable": probable, "related": related, "total": len(state.RootCauses)},
-		},
-		"policy":   map[string]any{"fail_on": cfg.FailOn, "max_issues": cfg.MaxIssues, "would_fail": state.ShouldFail(cfg.FailOn, cfg.MaxIssues)},
-		"findings": findings, "root_causes": roots, "observations": observations,
+		"summary":      summary,
+		"policy":       map[string]any{"fail_on": cfg.FailOn, "max_issues": cfg.MaxIssues, "would_fail": state.ShouldFail(cfg.FailOn, cfg.MaxIssues)},
+		"findings":     findings, "root_causes": roots, "observations": observations,
 	}
 }
 
@@ -711,19 +715,19 @@ func WriteAtomic(path string, data []byte) error {
 	defer os.Remove(temporary)
 	if _, err := file.Write(data); err != nil {
 		_ = file.Close()
-		return err
+		return fmt.Errorf("一時ファイルへレポートを書き込めません: %w", err)
 	}
 	if err := file.Sync(); err != nil {
 		_ = file.Close()
-		return err
+		return fmt.Errorf("レポートの一時ファイルを同期できません: %w", err)
 	}
 	if err := file.Close(); err != nil {
-		return err
+		return fmt.Errorf("レポートの一時ファイルを閉じられません: %w", err)
 	}
 	// path is the explicit CLI/config output destination; CreateTemp in the
 	// same directory plus Rename is the atomic-write boundary, not a sandbox.
 	if err := os.Rename(temporary, path); err != nil { // #nosec G703 -- user-selected report destination is intentional.
-		return fmt.Errorf("レポートを確定できません: %w", err)
+		return fmt.Errorf("レポートを保存先へ反映できません: %w", err)
 	}
 	// fsync the parent so the rename itself survives a sudden power loss on
 	// filesystems that require explicit directory durability.
@@ -747,7 +751,7 @@ func WriteAtomic(path string, data []byte) error {
 func Load(path string) (Document, error) {
 	data, err := os.ReadFile(path) // #nosec G304 -- --diff explicitly selects the snapshot to read.
 	if err != nil {
-		return nil, fmt.Errorf("snapshotを読み込めません: %w", err)
+		return nil, fmt.Errorf("スナップショットを読み込めません: %w", err)
 	}
 	return decodeDocument(bytes.NewReader(data))
 }
@@ -757,17 +761,17 @@ func decodeDocument(reader io.Reader) (Document, error) {
 	decoder := json.NewDecoder(reader)
 	decoder.UseNumber()
 	if err := decoder.Decode(&document); err != nil {
-		return nil, fmt.Errorf("snapshot JSONが壊れています: %w", err)
+		return nil, fmt.Errorf("スナップショットのJSONが不正です: %w", err)
 	}
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		if err == nil {
-			return nil, errors.New("snapshot JSONの末尾に余分な値があります")
+			return nil, errors.New("スナップショットのJSONの末尾に余分な値があります")
 		}
-		return nil, fmt.Errorf("snapshot JSONの末尾が壊れています: %w", err)
+		return nil, fmt.Errorf("スナップショットのJSONの末尾が不正です: %w", err)
 	}
 	if document["schema"] != Schema {
-		return nil, fmt.Errorf("snapshotスキーマが対応外です: %v", document["schema"])
+		return nil, fmt.Errorf("スナップショットのスキーマには対応していません: %v", document["schema"])
 	}
 	return document, nil
 }
@@ -841,7 +845,7 @@ func Compare(before, after Document) map[string]any {
 
 func DiffText(diff map[string]any) string {
 	counts, _ := diff["counts"].(map[string]any)
-	return fmt.Sprintf("診断結果の差分\n  新規 %v / 解消 %v / 判定不能(unknown) %v / 再確認 %v / 悪化 %v / 改善 %v / 内容変更 %v / 継続 %v",
+	return fmt.Sprintf("診断結果の差分\n  新規 %v / 解消 %v / 確認不能 %v / 再確認 %v / 悪化 %v / 改善 %v / 内容変更 %v / 継続 %v",
 		counts["new"], counts["resolved"], counts["unknown"], counts["reconfirmed"], counts["worsened"], counts["improved"], counts["changed"], counts["unchanged"])
 }
 

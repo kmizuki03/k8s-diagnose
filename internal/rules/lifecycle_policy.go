@@ -16,7 +16,7 @@ import (
 type PersistentVolumeRule struct{}
 
 func (PersistentVolumeRule) Metadata() Metadata {
-	return Metadata{ID: "persistent-volumes", Section: "PV", Description: "PersistentVolume phase", Required: []string{"pvs"}, Permissions: cluster("", "persistentvolumes"), Modes: []string{"all", "triage"}}
+	return Metadata{ID: "persistent-volumes", Section: "PV", Description: "PersistentVolumeの状態", Required: []string{"pvs"}, Permissions: cluster("", "persistentvolumes"), Modes: []string{"all", "triage", "select"}}
 }
 
 func (PersistentVolumeRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Config) []model.Finding {
@@ -26,12 +26,16 @@ func (PersistentVolumeRule) Evaluate(_ context.Context, snapshot *kube.Snapshot,
 		resource := ref("PersistentVolume", "", volume.Name)
 		switch volume.Status.Phase {
 		case corev1.VolumeFailed:
-			result = append(result, model.NewFinding(model.Issue, "K8S.PV.FAILED", "PV", resource, string(volume.Status.Phase), "phase", fmt.Sprintf("PersistentVolume %s: phase=Failed (%s)", volume.Name, volume.Status.Message), 98))
+			message := fmt.Sprintf("PersistentVolume %s の状態（phase）は Failed です", volume.Name)
+			if volume.Status.Message != "" {
+				message += "。詳細: " + volume.Status.Message
+			}
+			result = append(result, model.NewFinding(model.Issue, "K8S.PV.FAILED", "PV", resource, string(volume.Status.Phase), "phase", message, 98))
 		case corev1.VolumeReleased:
-			result = append(result, model.NewFinding(model.Warning, "K8S.PV.RELEASED", "PV", resource, string(volume.Status.Phase), "phase", fmt.Sprintf("PersistentVolume %s: phase=Released (reclaim待ちまたは手動回収が必要)", volume.Name), 75))
+			result = append(result, model.NewFinding(model.Warning, "K8S.PV.RELEASED", "PV", resource, string(volume.Status.Phase), "phase", fmt.Sprintf("PersistentVolume %s の状態（phase）は Released です。再利用ポリシーに応じた回収処理を確認してください", volume.Name), 75))
 		case corev1.VolumePending:
 			if elapsedSince(snapshot, volume.CreationTimestamp.Time) >= 10*time.Minute {
-				result = append(result, model.NewFinding(model.Candidate, "K8S.PV.PENDING", "PV", resource, string(volume.Status.Phase), "phase", fmt.Sprintf("PersistentVolume %s: Pendingが10分以上継続しています", volume.Name), 45))
+				result = append(result, model.NewFinding(model.Candidate, "K8S.PV.PENDING", "PV", resource, string(volume.Status.Phase), "phase", fmt.Sprintf("PersistentVolume %s の Pending 状態が10分以上続いています", volume.Name), 45))
 			}
 		}
 	}
@@ -41,7 +45,7 @@ func (PersistentVolumeRule) Evaluate(_ context.Context, snapshot *kube.Snapshot,
 type CronJobRule struct{}
 
 func (CronJobRule) Metadata() Metadata {
-	return Metadata{ID: "cronjobs", Section: "Job", Description: "CronJob suspend・schedule状態", Required: []string{"cronjobs"}, Permissions: namespaced("batch", "cronjobs"), Modes: []string{"all", "triage"}}
+	return Metadata{ID: "cronjobs", Section: "Job", Description: "CronJobの一時停止状態とスケジュール", Required: []string{"cronjobs"}, Permissions: namespaced("batch", "cronjobs"), Modes: []string{"all", "triage"}}
 }
 
 func (CronJobRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Config) []model.Finding {
@@ -49,7 +53,7 @@ func (CronJobRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config
 	for i := range snapshot.CronJobs {
 		cronJob := &snapshot.CronJobs[i]
 		if cronJob.Spec.Suspend != nil && *cronJob.Spec.Suspend {
-			result = append(result, model.NewFinding(model.Candidate, "K8S.CRONJOB.SUSPENDED", "Job", ref("CronJob", cronJob.Namespace, cronJob.Name), "Suspended", "suspend", fmt.Sprintf("CronJob %s: suspend=trueです", shortRef(cronJob.Namespace, cronJob.Name)), 45))
+			result = append(result, model.NewFinding(model.Candidate, "K8S.CRONJOB.SUSPENDED", "Job", ref("CronJob", cronJob.Namespace, cronJob.Name), "Suspended", "suspend", fmt.Sprintf("CronJob %s は一時停止されています（spec.suspend: true）", shortRef(cronJob.Namespace, cronJob.Name)), 45))
 		}
 	}
 	return result
@@ -60,13 +64,13 @@ type NetworkPolicyRule struct{}
 func (NetworkPolicyRule) Metadata() Metadata {
 	permissions := namespaced("networking.k8s.io", "networkpolicies")
 	permissions = append(permissions, namespaced("", "pods")...)
-	return Metadata{ID: "network-policies", Section: "NetworkPolicy", Description: "NetworkPolicyのPod selector適用状況", Required: []string{"networkpolicies", "pods"}, Permissions: permissions, Modes: []string{"all", "triage"}}
+	return Metadata{ID: "network-policies", Section: "NetworkPolicy", Description: "NetworkPolicyのPod選択条件の適用状況", Required: []string{"networkpolicies", "pods"}, Permissions: permissions, Modes: []string{"all", "triage", "select"}}
 }
 
 type LimitRangeRule struct{}
 
 func (LimitRangeRule) Metadata() Metadata {
-	return Metadata{ID: "limit-ranges", Section: "LimitRange", Description: "既存PodとLimitRangeのmin/max整合", Required: []string{"limitranges", "pods"}, Permissions: namespaced("", "limitranges,pods"), Modes: []string{"all", "triage"}}
+	return Metadata{ID: "limit-ranges", Section: "LimitRange", Description: "既存PodとLimitRangeの最小値・最大値の整合性", Required: []string{"limitranges", "pods"}, Permissions: namespaced("", "limitranges,pods"), Modes: []string{"all", "triage", "select"}}
 }
 
 func (LimitRangeRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Config) []model.Finding {
@@ -104,8 +108,10 @@ func (LimitRangeRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ con
 }
 
 func limitRangeMismatch(limitRangeName string, pod *corev1.Pod, container string, resourceName corev1.ResourceName, actualLabel, actual, boundaryLabel, boundary string) model.Finding {
+	actualText := map[string]string{"request": "要求量（request）", "limit": "上限値（limit）"}[actualLabel]
+	boundaryText := map[string]string{"min": "最小値（min）", "max": "最大値（max）"}[boundaryLabel]
 	return model.NewFinding(model.Candidate, "K8S.LIMIT_RANGE.EXISTING_POD_MISMATCH", "LimitRange", ref("Pod", pod.Namespace, pod.Name), "ExistingPodMismatch", container+"/"+string(resourceName)+"/"+boundaryLabel,
-		fmt.Sprintf("Pod %s / container %s: %s %s=%s はLimitRange %sの%s=%sと不一致です (Policy変更前に作成された可能性)", shortRef(pod.Namespace, pod.Name), container, resourceName, actualLabel, actual, limitRangeName, boundaryLabel, boundary), 45)
+		fmt.Sprintf("Pod %s のコンテナ %q では、リソース %q の%sが %s です。LimitRange %q で定められた%s %s を満たしていないため、LimitRangeの変更前に作成されたPodか確認してください", shortRef(pod.Namespace, pod.Name), container, resourceName, actualText, actual, limitRangeName, boundaryText, boundary), 45)
 }
 
 func (NetworkPolicyRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Config) []model.Finding {
@@ -114,7 +120,7 @@ func (NetworkPolicyRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ 
 		policy := &snapshot.NetworkPolicies[i]
 		selector, err := metav1.LabelSelectorAsSelector(&policy.Spec.PodSelector)
 		if err != nil {
-			result = append(result, model.NewFinding(model.Unavailable, "K8S.NETWORK_POLICY.SELECTOR_UNAVAILABLE", "NetworkPolicy", ref("NetworkPolicy", policy.Namespace, policy.Name), "SelectorParseFailed", "selector", fmt.Sprintf("NetworkPolicy %s: selectorを解析できません", shortRef(policy.Namespace, policy.Name)), 100))
+			result = append(result, model.NewFinding(model.Unavailable, "K8S.NETWORK_POLICY.SELECTOR_UNAVAILABLE", "NetworkPolicy", ref("NetworkPolicy", policy.Namespace, policy.Name), "SelectorParseFailed", "selector", fmt.Sprintf("NetworkPolicy %s のPod選択条件（podSelector）を解析できません", shortRef(policy.Namespace, policy.Name)), 100))
 			continue
 		}
 		matched := 0
@@ -125,7 +131,7 @@ func (NetworkPolicyRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ 
 			}
 		}
 		if matched == 0 && elapsedSince(snapshot, policy.CreationTimestamp.Time) >= 5*time.Minute {
-			result = append(result, model.NewFinding(model.Candidate, "K8S.NETWORK_POLICY.SELECTOR_NO_MATCH", "NetworkPolicy", ref("NetworkPolicy", policy.Namespace, policy.Name), "SelectorNoMatch", "selector", fmt.Sprintf("NetworkPolicy %s: podSelectorに一致するPodが0件です", shortRef(policy.Namespace, policy.Name)), 40))
+			result = append(result, model.NewFinding(model.Candidate, "K8S.NETWORK_POLICY.SELECTOR_NO_MATCH", "NetworkPolicy", ref("NetworkPolicy", policy.Namespace, policy.Name), "SelectorNoMatch", "selector", fmt.Sprintf("NetworkPolicy %s のPod選択条件（podSelector）に一致するPodが見つかりません", shortRef(policy.Namespace, policy.Name)), 40))
 		}
 	}
 	return result

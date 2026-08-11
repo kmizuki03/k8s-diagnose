@@ -30,6 +30,8 @@ type wizardSession struct {
 
 var errWizardQuit = errors.New("対話メニューを終了します")
 
+const rootWizardTitle = "何を診断しますか？"
+
 // InteractiveTerminal reports whether both input and output support the
 // terminal controls required by the guided menu. Piped invocations retain the
 // historical non-interactive default instead of waiting for input.
@@ -79,7 +81,7 @@ func Guide(base config.Config, streams Streams) (config.Config, bool, error) {
 
 	for {
 		choice, quit, err := session.choose(
-			"何を診断しますか？",
+			rootWizardTitle,
 			"↑/↓で移動し、Enterで決定します。フラグを覚える必要はありません。",
 			[]wizardItem{
 				{"クラスタ全体", "対象範囲をまとめて診断し、必要な追加項目だけ選ぶ"},
@@ -231,12 +233,12 @@ func (session *wizardSession) configureAll(cfg config.Config) (config.Config, []
 		session.setConfig(cfg)
 		details := make([]guidedSetting, 0, 3)
 		if selected[0] && cfg.Output == "text" {
-			details = append(details, guidedSetting{"display.tail", "ログ表示の設定", "表示する末尾行数", "Enter=現在値、-=組み込み既定値"})
+			details = append(details, guidedSetting{"display.tail", "ログ表示の設定", "表示する末尾行数", "1以上の行数を指定します"})
 		}
 		if debugEnabled {
 			details = append(details,
-				guidedSetting{"debug.image", "debugの設定", "debug image", "Enter=現在値、例: busybox:1.36"},
-				guidedSetting{"debug.profile", "debugの設定", "debug profile", "Enter=現在値、例: general"},
+				guidedSetting{"debug.image", "debugの設定", "debug image", "例: busybox:1.36"},
+				guidedSetting{"debug.profile", "debugの設定", "debug profile", "例: general"},
 			)
 		}
 		cfg, back, err = session.runGuidedSettings(cfg, details)
@@ -252,7 +254,7 @@ func (session *wizardSession) configureAll(cfg config.Config) (config.Config, []
 
 func (session *wizardSession) configurePod(cfg config.Config) (config.Config, []guidedSetting, bool, error) {
 	items := []wizardItem{
-		{"接続確認", "ProbeまたはTCPポートをport-forward経由で実際に確認"},
+		{"接続確認", "注意: 一時port-forwardを作成し、追加確認なしで実行します"},
 		{"ログ表示行数を変更", "個別診断で表示するログ末尾行数を変更"},
 		{"診断後にdebugメニューを開く", "確認後にkubectl debugの対話メニューを表示"},
 	}
@@ -277,18 +279,18 @@ func (session *wizardSession) configurePod(cfg config.Config) (config.Config, []
 		session.setConfig(cfg)
 		details := make([]guidedSetting, 0, 5)
 		if selected[1] {
-			details = append(details, guidedSetting{"display.tail", "ログ表示の設定", "表示する末尾行数", "Enter=現在値、-=組み込み既定値"})
+			details = append(details, guidedSetting{"display.tail", "ログ表示の設定", "表示する末尾行数", "1以上の行数を指定します"})
 		}
 		if selected[0] {
 			details = append(details,
-				guidedSetting{"connection.port", "接続確認の設定", "ローカルポート", "Enter=現在値（未設定なら自動）、-=自動"},
-				guidedSetting{"connection.path", "接続確認の設定", "HTTPパス", "Enter=現在値、-=Probe定義へ戻す、例: /ready"},
+				guidedSetting{"connection.port", "接続確認の設定", "ローカルポート", "1024〜65535。組み込み既定値では自動選択します"},
+				guidedSetting{"connection.path", "接続確認の設定", "HTTPパス", "例: /ready。組み込み既定値ではProbe定義を使用します"},
 			)
 		}
 		if selected[2] {
 			details = append(details,
-				guidedSetting{"debug.image", "debugの設定", "debug image", "Enter=現在値、例: busybox:1.36"},
-				guidedSetting{"debug.profile", "debugの設定", "debug profile", "Enter=現在値、例: general"},
+				guidedSetting{"debug.image", "debugの設定", "debug image", "例: busybox:1.36"},
+				guidedSetting{"debug.profile", "debugの設定", "debug profile", "例: general"},
 			)
 		}
 		cfg, back, err = session.runGuidedSettings(cfg, details)
@@ -441,7 +443,7 @@ func applyPromptedSetting(cfg config.Config, name, value string) (config.Config,
 
 func (session *wizardSession) promptSetting(cfg config.Config, name, title, label, hint string) (config.Config, bool, error) {
 	for {
-		value, canceled, err := session.promptValue(title, label, cfg.SettingValue(name), hint+"、bを入力してEnter=戻る")
+		value, canceled, err := session.promptValue(title, label, cfg.SettingValue(name), hint)
 		if err != nil || canceled {
 			return cfg, canceled, err
 		}
@@ -483,7 +485,14 @@ func (session *wizardSession) confirm(cfg config.Config) (bool, error) {
 }
 
 func (session *wizardSession) choose(title, description string, items []wizardItem, nested bool) (int, bool, error) {
-	selected := 0
+	return session.chooseAt(title, description, items, nested, 0)
+}
+
+func (session *wizardSession) chooseAt(title, description string, items []wizardItem, nested bool, initial int) (int, bool, error) {
+	if len(items) == 0 {
+		return 0, false, errors.New("選択項目がありません")
+	}
+	selected := min(max(initial, 0), len(items)-1)
 	for {
 		if err := session.drawMenu(title, description, items, selected, nil, nested); err != nil {
 			return 0, false, err
@@ -566,8 +575,9 @@ func (session *wizardSession) drawMenu(title, description string, items []wizard
 	if err := session.screen.clear(); err != nil {
 		return err
 	}
+	rootMenu := title == rootWizardTitle
 	headerConsole := session.console
-	if title == "何を診断しますか？" {
+	if rootMenu {
 		displayConfig := session.config
 		displayConfig.Mode = "guide"
 		headerConsole = console.New(displayConfig, session.streams.Out, session.streams.Err)
@@ -579,10 +589,18 @@ func (session *wizardSession) drawMenu(title, description string, items []wizard
 		session.notice = ""
 	}
 	if description != "" {
-		session.console.Write("  " + description)
-		session.console.Write()
+		for _, line := range strings.Split(description, "\n") {
+			session.console.Write("  " + line)
+		}
+		if !rootMenu {
+			session.console.Write()
+		}
 	}
-	start, end := selectionWindow(len(items), selected, session.screen.menuPageSize(len(items)))
+	pageSize := session.screen.menuPageSize(len(items))
+	if rootMenu {
+		pageSize = session.screen.rootMenuPageSize(len(items))
+	}
+	start, end := selectionWindow(len(items), selected, pageSize)
 	rows := make([]console.TableRow, 0, end-start)
 	labelLimit := max(12, session.console.Width()-7)
 	for index := start; index < end; index++ {
@@ -606,7 +624,20 @@ func (session *wizardSession) drawMenu(title, description string, items []wizard
 	}
 	if selected >= 0 && selected < len(items) && items[selected].Description != "" {
 		detailLimit := max(10, session.console.Width()-8)
-		session.console.Write("\n  内容: " + console.TruncateDisplay(items[selected].Description, detailLimit))
+		warning := strings.HasPrefix(items[selected].Description, "注意:")
+		if warning {
+			detailLimit = max(10, detailLimit-2)
+		}
+		prefix := "\n  内容: "
+		if rootMenu {
+			prefix = "  内容: "
+		}
+		detail := prefix + console.TruncateDisplay(items[selected].Description, detailLimit)
+		if warning {
+			detail = prefix + "▲ " + console.TruncateDisplay(items[selected].Description, detailLimit)
+			detail = session.console.C.Yellow + session.console.C.Bold + detail + session.console.C.Reset
+		}
+		session.console.Write(detail)
 	}
 	guide := "  ↑/↓: 選択  Enter/→: 決定"
 	if toggles != nil {
@@ -617,7 +648,11 @@ func (session *wizardSession) drawMenu(title, description string, items []wizard
 	} else {
 		guide += "  q: 終了"
 	}
-	session.console.Write("\n" + guide)
+	if rootMenu {
+		session.console.Write(guide)
+	} else {
+		session.console.Write("\n" + guide)
+	}
 	return nil
 }
 
@@ -634,11 +669,10 @@ func (session *wizardSession) promptValue(title, label, current, hint string) (s
 		session.console.Write("  ▲ " + console.MaskSecrets(session.notice, true))
 		session.notice = ""
 	}
-	session.console.Write("  " + label + ": " + emptyLabel(console.MaskSecrets(current, session.config.Mask)))
-	if hint != "" {
-		session.console.Write("  " + hint)
-	}
-	fmt.Fprint(session.streams.Out, "  > ")
+	session.renderValuePromptTable(label, current, hint)
+	session.console.Write()
+	session.console.Write("  入力（Enterで確定）")
+	fmt.Fprint(session.streams.Out, "    > ")
 	line, err := readWizardLine(session.reader, session.streams.In, session.streams.Out)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return "", false, err
@@ -651,6 +685,106 @@ func (session *wizardSession) promptValue(title, label, current, hint string) (s
 		return "", true, nil
 	}
 	return line, false, nil
+}
+
+func (session *wizardSession) renderValuePromptTable(label, current, hint string) {
+	type tableRow struct {
+		label string
+		value string
+		bold  bool
+	}
+
+	rows := []tableRow{
+		{label: "設定項目", value: console.MaskSecrets(label, session.config.Mask), bold: true},
+	}
+	if hint != "" {
+		rows = append(rows, tableRow{label: "説明", value: console.MaskSecrets(hint, session.config.Mask)})
+	}
+	rows = append(rows,
+		tableRow{label: "現在値", value: emptyLabel(console.MaskSecrets(current, session.config.Mask)), bold: true},
+		tableRow{label: "入力値", value: "Enterで確定したときの動作", bold: true},
+		tableRow{label: "空欄", value: "変更しない"},
+		tableRow{label: "-", value: "組み込み既定値に戻す"},
+		tableRow{label: "b", value: "1つ前へ戻る"},
+	)
+
+	leftWidth := 0
+	for _, row := range rows {
+		leftWidth = max(leftWidth, console.DisplayWidth(row.label))
+	}
+	// 罫線・左右余白・インデントを差し引き、端末による意図しない
+	// 折返しが起きない幅に収める。インデントは2桁に抑えて説明欄を広く取る。
+	const (
+		indent     = "  "
+		fixedWidth = 9
+	)
+	rightWidth := max(20, session.console.Width()-fixedWidth-leftWidth)
+	line := func(left, middle, right string) string {
+		return indent + left + strings.Repeat("─", leftWidth+2) + middle + strings.Repeat("─", rightWidth+2) + right
+	}
+	border := func(value string) string {
+		return session.console.C.Cyan + value + session.console.C.Reset
+	}
+	writeRow := func(row tableRow) {
+		valueLines := wrapPromptCell(row.value, rightWidth)
+		for index, value := range valueLines {
+			rowLabel := ""
+			if index == 0 {
+				rowLabel = row.label
+			}
+			leftPadding := strings.Repeat(" ", leftWidth-console.DisplayWidth(rowLabel))
+			rightPadding := strings.Repeat(" ", rightWidth-console.DisplayWidth(value))
+			styledLabel := session.console.C.Cyan + session.console.C.Bold + rowLabel + session.console.C.Reset
+			styledValue := value
+			if row.bold {
+				styledValue = session.console.C.Bold + value + session.console.C.Reset
+			}
+			session.console.Write(indent + "│ " + styledLabel + leftPadding + " │ " + styledValue + rightPadding + " │")
+		}
+	}
+
+	session.console.Write(border(line("┌", "┬", "┐")))
+	operationStart := len(rows) - 4
+	for index, row := range rows {
+		if index == operationStart {
+			session.console.Write(border(line("├", "┼", "┤")))
+		}
+		writeRow(row)
+		if index == operationStart {
+			session.console.Write(border(line("├", "┼", "┤")))
+		}
+	}
+	session.console.Write(border(line("└", "┴", "┘")))
+}
+
+func wrapPromptCell(value string, width int) []string {
+	if width <= 0 {
+		return []string{""}
+	}
+	result := make([]string, 0, 1)
+	for _, sourceLine := range strings.Split(value, "\n") {
+		if sourceLine == "" {
+			result = append(result, "")
+			continue
+		}
+		var line strings.Builder
+		lineWidth := 0
+		for _, runeValue := range sourceLine {
+			runeWidth := max(1, console.DisplayWidth(string(runeValue)))
+			if lineWidth > 0 && lineWidth+runeWidth > width {
+				result = append(result, line.String())
+				line.Reset()
+				lineWidth = 0
+			}
+			line.WriteRune(runeValue)
+			lineWidth += runeWidth
+		}
+		result = append(result, line.String())
+	}
+	if len(result) == 0 {
+		return []string{""}
+	}
+	return result
 }
 
 func readWizardLine(reader *bufio.Reader, input io.Reader, output io.Writer) (string, error) {
@@ -724,6 +858,13 @@ func readWizardLine(reader *bufio.Reader, input io.Reader, output io.Writer) (st
 					_, _ = io.WriteString(output, "\b \b")
 				}
 			}
+		case 0x1b:
+			// 矢印キーやマウスホイールは ESC で始まる制御シーケンスを
+			// 送る。ESC だけを捨てると残りの "[A" や "[<64;...M" が
+			// 設定値へ混入するため、終端文字までまとめて読み捨てる。
+			if err := discardWizardEscapeSequence(reader); err != nil && !errors.Is(err, io.EOF) {
+				return "", err
+			}
 		default:
 			if character < 0x20 {
 				continue
@@ -732,6 +873,47 @@ func readWizardLine(reader *bufio.Reader, input io.Reader, output io.Writer) (st
 			_, _ = output.Write([]byte{character})
 		}
 	}
+}
+
+func discardWizardEscapeSequence(reader *bufio.Reader) error {
+	prefix, err := reader.ReadByte()
+	if err != nil {
+		return err
+	}
+	switch prefix {
+	case '[', 'O': // CSI / SS3: 最終バイトは 0x40〜0x7e。
+		for index := range 128 {
+			value, readErr := reader.ReadByte()
+			if readErr != nil {
+				return readErr
+			}
+			if value >= 0x40 && value <= 0x7e {
+				// 古いX10マウス形式は ESC [ M の後ろにボタン・X・Yの
+				// 3バイトを続ける。ここまで捨てないと座標が文字になる。
+				if prefix == '[' && index == 0 && value == 'M' {
+					for range 3 {
+						if _, readErr = reader.ReadByte(); readErr != nil {
+							return readErr
+						}
+					}
+				}
+				return nil
+			}
+		}
+	case ']': // OSC: BEL または ST (ESC \\) まで。
+		escape := false
+		for range 1024 {
+			value, readErr := reader.ReadByte()
+			if readErr != nil {
+				return readErr
+			}
+			if value == '\a' || escape && value == '\\' {
+				return nil
+			}
+			escape = value == 0x1b
+		}
+	}
+	return nil
 }
 
 func emptyLabel(value string) string {
@@ -743,48 +925,39 @@ func emptyLabel(value string) string {
 
 func (session *wizardSession) editSettings(base config.Config) (config.Config, string, bool, error) {
 	candidate := base
+	lastSaved := ""
 	sections := settingSections()
 	for {
-		items := make([]wizardItem, 0, len(sections)+1)
+		items := make([]wizardItem, 0, len(sections))
 		for _, section := range sections {
 			items = append(items, wizardItem{settingSectionLabel(section), settingSectionDescription(section)})
 		}
-		savePath := candidate.ConfigFile
-		if savePath == "" {
-			if defaultPath, err := config.DefaultConfigPath(); err == nil {
-				savePath = defaultPath
-			} else {
-				savePath = config.DefaultConfigFilename
-			}
-		}
-		items = append(items, wizardItem{"設定を保存", "保存先: " + savePath})
 		session.setConfig(candidate)
-		choice, quit, err := session.choose("設定を変更する", "カテゴリを選ぶと、関係する設定だけを表示します。", items, true)
+		choice, back, err := session.choose(
+			"設定を変更する",
+			"カテゴリを選ぶと、関係する設定だけを表示します。\n各設定はEnterで確定した時点でINIへ自動保存されます。",
+			items,
+			true,
+		)
 		if err != nil {
 			return base, "", false, err
 		}
-		if quit {
-			return base, "", true, nil
+		if back {
+			return candidate, lastSaved, false, nil
 		}
-		if choice == len(items)-1 {
-			path := candidate.ConfigFile
-			saved, err := config.SaveINI(path, candidate)
-			if err != nil {
-				session.notice = err.Error()
-				continue
-			}
-			candidate.ConfigFile = saved
-			return candidate, saved, false, nil
-		}
-		updated, err := session.editSettingsSection(candidate, sections[choice])
+		updated, saved, err := session.editSettingsSection(candidate, sections[choice])
 		if err != nil {
 			return base, "", false, err
 		}
 		candidate = updated
+		if saved != "" {
+			lastSaved = saved
+		}
 	}
 }
 
-func (session *wizardSession) editSettingsSection(cfg config.Config, section string) (config.Config, error) {
+func (session *wizardSession) editSettingsSection(cfg config.Config, section string) (config.Config, string, error) {
+	lastSaved := ""
 	for {
 		specs := settingsForSection(section)
 		items := make([]wizardItem, 0, len(specs))
@@ -792,28 +965,80 @@ func (session *wizardSession) editSettingsSection(cfg config.Config, section str
 			items = append(items, wizardItem{spec.Label + ": " + config.SettingSummary(cfg, spec), spec.Description})
 		}
 		session.setConfig(cfg)
-		choice, quit, err := session.choose(settingSectionLabel(section), "値を選び、入力します。空Enter=変更なし、-=組み込み既定値。", items, true)
+		choice, back, err := session.choose(
+			settingSectionLabel(section),
+			"変更する設定を選びます。\n値をEnterで確定すると、検証後すぐにINIへ保存されます。",
+			items,
+			true,
+		)
 		if err != nil {
-			return cfg, err
+			return cfg, lastSaved, err
 		}
-		if quit {
-			return cfg, nil
+		if back {
+			return cfg, lastSaved, nil
 		}
 		spec := specs[choice]
-		value, canceled, err := session.promptValue(spec.Label, spec.Name, cfg.SettingValue(spec.Name), spec.Description+" / 空Enter=変更なし、-=既定値、bを入力してEnter=戻る")
+		var value string
+		var canceled bool
+		if spec.Boolean {
+			value, canceled, err = session.promptBooleanValue(cfg, spec)
+		} else {
+			value, canceled, err = session.promptValue(spec.Label, spec.Name, config.SettingSummary(cfg, spec), spec.Description)
+		}
 		if err != nil {
-			return cfg, err
+			return cfg, lastSaved, err
 		}
 		if canceled || value == "" {
 			continue
 		}
-		updated, err := applyPromptedSetting(cfg, spec.Name, value)
+		updated, saved, err := persistPromptedSetting(cfg, spec, value)
 		if err != nil {
 			session.notice = err.Error()
 			continue
 		}
 		cfg = updated
+		lastSaved = saved
+		session.notice = fmt.Sprintf("%sを「%s」へ変更し、設定を保存しました: %s", spec.Label, config.SettingSummary(cfg, spec), saved)
 	}
+}
+
+func (session *wizardSession) promptBooleanValue(cfg config.Config, spec config.SettingSpec) (string, bool, error) {
+	items := []wizardItem{
+		{"有効にする (true)", "この機能を有効にしてINIへ保存します"},
+		{"無効にする (false)", "この機能を無効にしてINIへ保存します"},
+		{"組み込み既定値に戻す", "INIの明示値を削除し、組み込み既定値を使用します"},
+	}
+	initial := 2
+	if cfg.SettingExplicit(spec.Name) {
+		initial = 1
+		if strings.EqualFold(cfg.SettingValue(spec.Name), "true") {
+			initial = 0
+		}
+	}
+	description := strings.Join([]string{
+		spec.Description,
+		"設定キー: " + spec.Name,
+		"現在値: " + config.SettingSummary(cfg, spec),
+		"Enterで選択内容を保存します。bで1つ前へ戻ります。",
+	}, "\n")
+	choice, back, err := session.chooseAt(spec.Label, description, items, true, initial)
+	if err != nil || back {
+		return "", back, err
+	}
+	return []string{"true", "false", "-"}[choice], false, nil
+}
+
+func persistPromptedSetting(cfg config.Config, spec config.SettingSpec, value string) (config.Config, string, error) {
+	updated, err := applyPromptedSetting(cfg, spec.Name, value)
+	if err != nil {
+		return cfg, "", err
+	}
+	saved, err := config.SaveINI(updated.ConfigFile, updated)
+	if err != nil {
+		return cfg, "", err
+	}
+	updated.ConfigFile = saved
+	return updated, saved, nil
 }
 
 func settingSections() []string {

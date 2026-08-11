@@ -79,7 +79,7 @@ func TestErrorReasonUsesNaturalUserFacingLabels(t *testing.T) {
 
 func TestErrorReasonTruncatesWithoutBreakingUTF8(t *testing.T) {
 	reason := ErrorReason(errors.New(strings.Repeat("障", 400)))
-	if !utf8.ValidString(reason) || !strings.HasSuffix(reason, "…") {
+	if !utf8.ValidString(reason) || !strings.Contains(reason, "…") || !strings.HasSuffix(reason, "…）") {
 		t.Fatalf("APIエラーの切り詰めでUTF-8が壊れた: %q", reason)
 	}
 }

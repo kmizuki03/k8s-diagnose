@@ -116,7 +116,7 @@ func ensurePrivateDatabaseFile(path string) error {
 		return fmt.Errorf("履歴DBのパスがファイルではありません: %s", path)
 	}
 	if err := os.Chmod(path, 0o600); err != nil {
-		return fmt.Errorf("履歴DBの権限を0600へ設定できません: %w", err)
+		return fmt.Errorf("履歴DBの権限を0600に設定できません: %w", err)
 	}
 	return nil
 }
@@ -127,7 +127,7 @@ func ensureSchema(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("履歴DBのスキーマを確認できません: %w", err)
 	}
 	if version != 0 && version != SchemaVersion {
-		return fmt.Errorf("未対応の履歴DBスキーマです: %d (対応: %d)", version, SchemaVersion)
+		return fmt.Errorf("履歴DBのスキーマバージョン %d には対応していません（対応バージョン: %d）", version, SchemaVersion)
 	}
 	var tableCount, diagnosisTable int
 	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").Scan(&tableCount); err != nil {
@@ -137,10 +137,10 @@ func ensureSchema(ctx context.Context, db *sql.DB) error {
 		return fmt.Errorf("履歴DBのテーブルを確認できません: %w", err)
 	}
 	if version == 0 && tableCount > 0 && diagnosisTable == 0 {
-		return errors.New("指定されたSQLite DBはk8s-diagnose履歴DBではありません")
+		return errors.New("指定されたSQLiteデータベースは、k8s-diagnoseの履歴DBではありません")
 	}
 	if version == SchemaVersion && diagnosisTable == 0 {
-		return errors.New("履歴DBのdiagnostic_runsテーブルがありません")
+		return errors.New("履歴DBに diagnostic_runs テーブルがありません")
 	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -247,7 +247,7 @@ func Append(ctx context.Context, path string, document report.Document, retain i
             WHERE context_name=? AND namespace_name=? AND mode_name=?
             ORDER BY id DESC LIMIT 1`, contextName, namespace, mode).Scan(&previousPayload)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return false, fmt.Errorf("履歴DBの直前レコードを読めません: %w", err)
+			return false, fmt.Errorf("履歴DBの直前のレコードを読み込めません: %w", err)
 		}
 		if err == nil {
 			previous, decodeErr := decodeDocument(previousPayload)
@@ -288,12 +288,12 @@ func decodeDocument(payload string) (report.Document, error) {
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		if err == nil {
-			return nil, errors.New("履歴DB内の診断JSON末尾に余分な値があります")
+			return nil, errors.New("履歴DB内の診断JSONの末尾に余分な値があります")
 		}
-		return nil, fmt.Errorf("履歴DB内の診断JSON末尾が不正です: %w", err)
+		return nil, fmt.Errorf("履歴DB内の診断JSONの末尾が不正です: %w", err)
 	}
 	if document["schema"] != report.Schema {
-		return nil, fmt.Errorf("履歴DB内の診断スキーマが対応外です: %v", document["schema"])
+		return nil, fmt.Errorf("履歴DB内の診断スキーマには対応していません: %v", document["schema"])
 	}
 	if _, ok := document["findings"].([]any); !ok {
 		return nil, errors.New("履歴DB内に不正な診断レコードがあります")
@@ -354,13 +354,13 @@ func Analyze(previous []report.Document, current report.Document, window, flapTh
 		}
 		labels := make([]string, len(states))
 		for index, state := range states {
-			labels[index] = map[string]string{"abnormal": "異常", "normal": "正常", "unknown": "unknown"}[state]
+			labels[index] = map[string]string{"abnormal": "異常", "normal": "正常", "unknown": "確認不能"}[state]
 		}
 		resource, code := jsonutil.String(latest["resource"]), jsonutil.String(latest["code"])
 		analysis.Trends = append(analysis.Trends, Trend{
 			Type: "finding_flap", Code: "K8S.HISTORY.FINDING_FLAP", Resource: resource,
 			Confidence: 85, Transitions: transitions, States: states,
-			Message:  fmt.Sprintf("%s: %s が直近%d回で%d回出現・解消を反復", resource, code, len(samples), transitions),
+			Message:  fmt.Sprintf("リソース %s の所見 %s は、直近 %d回の診断で発生と解消を %d回繰り返しています", resource, code, len(samples), transitions),
 			Evidence: []string{"states=" + strings.Join(labels, " → "), "sourceCode=" + code},
 		})
 	}
@@ -407,7 +407,7 @@ func Analyze(previous []report.Document, current report.Document, window, flapTh
 		analysis.Trends = append(analysis.Trends, Trend{
 			Type: "restart_growth", Code: "K8S.HISTORY.RESTART_GROWTH", Resource: resource,
 			Confidence: 95, Growth: growth,
-			Message:  fmt.Sprintf("%s: コンテナ %s のrestartCountが直近%d回で %d→%d に増加", resource, container, len(counts), counts[0], counts[len(counts)-1]),
+			Message:  fmt.Sprintf("リソース %s のコンテナ %s では、再起動回数が直近 %d回の診断で %d回から %d回へ増加しました", resource, container, len(counts), counts[0], counts[len(counts)-1]),
 			Evidence: []string{"restartCounts=" + strings.Join(textCounts, "→"), "podUID=" + jsonutil.String(latest["pod_uid"])},
 		})
 	}
@@ -500,7 +500,7 @@ func expandPath(path string) (string, error) {
 	if path == "~" || strings.HasPrefix(path, "~/") {
 		home, err := os.UserHomeDir()
 		if err != nil {
-			return "", fmt.Errorf("履歴DBの~を展開できません: %w", err)
+			return "", fmt.Errorf("履歴DBのパスに含まれる「~」を展開できません: %w", err)
 		}
 		path = filepath.Join(home, strings.TrimPrefix(path, "~/"))
 	}

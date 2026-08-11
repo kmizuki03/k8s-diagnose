@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -202,6 +203,10 @@ func TestPodSelectionKeysAndAlternateScreenCleanup(t *testing.T) {
 		{"\x1b[6~", podSelectionPageDown},
 		{"\x1b[C", podSelectionChoose},
 		{"\x1b[D", podSelectionNone},
+		{"\x1b[<64;12;8M", podSelectionUp},
+		{"\x1b[<65;12;8M", podSelectionDown},
+		{"\x1b[M" + string([]byte{96, 33, 33}), podSelectionUp},
+		{"\x1b[M" + string([]byte{97, 33, 33}), podSelectionDown},
 		{"\r", podSelectionChoose},
 		{" ", podSelectionToggle},
 		{"n", podSelectionNamespaceSearch},
@@ -231,6 +236,44 @@ func TestPodSelectionKeysAndAlternateScreenCleanup(t *testing.T) {
 	}
 }
 
+func TestPodSelectionViewportLeavesRoomForFooterAndNotice(t *testing.T) {
+	screen := &podSelectionScreen{alternate: true, height: 24}
+	if got := screen.pageSize(20, false); got != 4 {
+		t.Fatalf("通常時のPod表示件数=%d, want 4", got)
+	}
+	if got := screen.pageSize(20, true); got != 3 {
+		t.Fatalf("通知表示時のPod表示件数=%d, want 3", got)
+	}
+}
+
+func TestPodSelectionRowsFitWithinTerminalWidth(t *testing.T) {
+	rows := []console.TableRow{
+		{
+			Cells: []string{
+				"▶",
+				"troubleshooting-with-a-long-namespace",
+				"kube-controller-manager-troubleshooting-control-plane-with-a-long-suffix",
+				"1/1",
+				"CrashLoopBackOff",
+			},
+			Status: "CrashLoopBackOff", Selected: true,
+		},
+	}
+	const terminalWidth = 56
+	fitted := fitSelectionPodRows(rows, terminalWidth)
+	output := &bytes.Buffer{}
+	cfg := config.Defaults()
+	console.New(cfg, output, output).PodTable(podSelectionHeaders, fitted)
+	for _, line := range strings.Split(strings.TrimSpace(output.String()), "\n") {
+		if width := console.DisplayWidth(line); width > terminalWidth {
+			t.Fatalf("Pod選択行が端末幅を超えています: width=%d line=%q", width, line)
+		}
+	}
+	if !strings.Contains(output.String(), "…") || !fitted[0].Selected {
+		t.Fatalf("長い値の省略または選択状態の保持に失敗しました: %#v output=%q", fitted, output.String())
+	}
+}
+
 func TestMenuViewportScrollsBeforeTheFifthItem(t *testing.T) {
 	output := &bytes.Buffer{}
 	cfg := config.Defaults()
@@ -252,6 +295,38 @@ func TestMenuViewportScrollsBeforeTheFifthItem(t *testing.T) {
 	}
 	if strings.Contains(got, "←") || !strings.Contains(got, "b: 1つ戻る  q: 終了") {
 		t.Fatalf("戻る操作がb以外にも割り当てられている: %q", got)
+	}
+}
+
+func TestRootMenuShowsAllEightEntriesOnAStandardTerminal(t *testing.T) {
+	output := &bytes.Buffer{}
+	cfg := config.Defaults()
+	session := newWizardSession(cfg, Streams{In: strings.NewReader(""), Out: output, Err: output})
+	session.screen = &podSelectionScreen{output: output, alternate: true, height: 23}
+	items := []wizardItem{
+		{Label: "クラスタ全体", Description: "全体診断"},
+		{Label: "Podを1つ選んで詳しく", Description: "個別診断"},
+		{Label: "Pod一覧だけ", Description: "一覧"},
+		{Label: "quick", Description: "短時間"},
+		{Label: "ci", Description: "CI"},
+		{Label: "deep", Description: "詳細"},
+		{Label: "設定を変更する", Description: "設定"},
+		{Label: "終了", Description: "終了"},
+	}
+	if err := session.drawMenu(rootWizardTitle, "説明", items, len(items)-1, nil, false); err != nil {
+		t.Fatal(err)
+	}
+	got := output.String()
+	for _, item := range items {
+		if !strings.Contains(got, item.Label) {
+			t.Fatalf("ルートメニューに%qが表示されない: %q", item.Label, got)
+		}
+	}
+	if strings.Contains(got, "表示 ") {
+		t.Fatalf("8件のルートメニューがページ分割された: %q", got)
+	}
+	if lines := strings.Count(got, "\n"); lines > session.screen.height {
+		t.Fatalf("ルートメニューが端末高を超えた: lines=%d height=%d output=%q", lines, session.screen.height, got)
 	}
 }
 
@@ -307,6 +382,11 @@ func TestGuidedPodConnectionPromptsOnlyAfterSelection(t *testing.T) {
 	if !strings.Contains(output.String(), "接続確認の設定") {
 		t.Fatalf("選択した追加機能の詳細が表示されない: %q", output.String())
 	}
+	for _, expected := range []string{"注意: 一時port-forward", "追加確認なしで実行します"} {
+		if !strings.Contains(output.String(), expected) {
+			t.Fatalf("接続確認の選択欄に注意書き%qがない: %q", expected, output.String())
+		}
+	}
 	if !strings.Contains(output.String(), "65535") {
 		t.Fatalf("不正値の理由を示して再入力させていない: %q", output.String())
 	}
@@ -349,7 +429,7 @@ func TestGuidedConfirmationReturnsToLastDetail(t *testing.T) {
 	if cfg.ConnectPort != 18080 || cfg.ConnectPath != "/live" {
 		t.Fatalf("最後の詳細だけを再編集できない: %#v", cfg)
 	}
-	if strings.Count(output.String(), "ローカルポート:") != 1 || strings.Count(output.String(), "HTTPパス:") < 2 {
+	if strings.Count(output.String(), "│ ローカルポート") != 1 || strings.Count(output.String(), "│ HTTPパス") < 2 {
 		t.Fatalf("確認画面から戻る位置が不正: %q", output.String())
 	}
 	if strings.Contains(output.String(), "1つ前の画面へ戻る") {
@@ -379,8 +459,9 @@ func TestQQuitsInsteadOfReturningFromNestedMenu(t *testing.T) {
 func TestSettingsEditorSavesWithTheSharedINIValidation(t *testing.T) {
 	directory := t.TempDir()
 	t.Chdir(directory)
-	// Target category, namespace, value, bでカテゴリへ戻り、末尾の保存を選択。
-	input := strings.NewReader("\r\rproduction\nb\x1b[F\r")
+	// Target category, namespace, value. Enterで値を確定した時点で保存し、
+	// bでカテゴリ、さらにbで設定エディタを閉じる。
+	input := strings.NewReader("\r\rproduction\nbb")
 	output := &bytes.Buffer{}
 	updated, saved, quit, err := EditSettings(config.Defaults(), Streams{In: input, Out: output, Err: output})
 	if err != nil || quit {
@@ -389,14 +470,160 @@ func TestSettingsEditorSavesWithTheSharedINIValidation(t *testing.T) {
 	if updated.Namespace != "production" || saved != filepath.Join(directory, config.DefaultConfigFilename) {
 		t.Fatalf("対話設定が保存結果へ反映されない: cfg=%#v saved=%q", updated, saved)
 	}
-	for _, removed := range []string{"カテゴリ一覧へ戻る", "変更を破棄して戻る"} {
+	for _, removed := range []string{"保存先:", "カテゴリ一覧へ戻る", "変更を破棄して戻る"} {
 		if strings.Contains(output.String(), removed) {
-			t.Fatalf("戻る操作が選択項目として残っている: %q", output.String())
+			t.Fatalf("不要な操作が選択項目として残っている: %q", output.String())
 		}
 	}
 	reloaded, err := config.Parse(nil, "k8s-diagnose")
 	if err != nil || reloaded.Namespace != "production" {
 		t.Fatalf("保存した既定INIを自動再読込できない: cfg=%#v err=%v", reloaded, err)
+	}
+}
+
+func TestSettingsEditorBooleanUsesSelectionAndSavesImmediately(t *testing.T) {
+	directory := t.TempDir()
+	t.Chdir(directory)
+	input := strings.NewReader(
+		strings.Repeat("\x1b[B", 4) + "\r" + // 表示カテゴリ
+			strings.Repeat("\x1b[B", 4) + "\r" + // 実API要求
+			"\x1b[A\r" + // 既定値から「無効」に移動して確定
+			"bb", // 表示カテゴリ、設定エディタの順に戻る
+	)
+	output := &bytes.Buffer{}
+	updated, saved, quit, err := EditSettings(config.Defaults(), Streams{In: input, Out: output, Err: output})
+	if err != nil || quit {
+		t.Fatalf("真偽値を選択して保存できない: quit=%v err=%v output=%q", quit, err, output.String())
+	}
+	if updated.ShowAPIRequests || !updated.SettingExplicit("display.show_api_requests") {
+		t.Fatalf("選択した真偽値が反映されない: %#v", updated)
+	}
+	if saved != filepath.Join(directory, config.DefaultConfigFilename) {
+		t.Fatalf("Enter確定時の保存先=%q", saved)
+	}
+	reloaded, err := config.Parse(nil, "k8s-diagnose")
+	if err != nil || reloaded.ShowAPIRequests || !reloaded.SettingExplicit("display.show_api_requests") {
+		t.Fatalf("自動保存した真偽値を再読込できない: cfg=%#v err=%v", reloaded, err)
+	}
+	for _, expected := range []string{"有効にする (true)", "無効にする (false)", "組み込み既定値に戻す", "設定を保存しました"} {
+		if !strings.Contains(output.String(), expected) {
+			t.Fatalf("真偽値選択画面または保存通知に%qがない: %q", expected, output.String())
+		}
+	}
+	if strings.Contains(output.String(), "末尾に実行したKubernetes API要求を表示 / 空Enter") {
+		t.Fatalf("説明と操作が同じ行へ連結されている: %q", output.String())
+	}
+}
+
+func TestSettingValuePromptRendersAllInformationInOneTable(t *testing.T) {
+	output := &bytes.Buffer{}
+	session := newWizardSession(config.Defaults(), Streams{In: strings.NewReader("\n"), Out: output, Err: output})
+	value, canceled, err := session.promptValue("Namespace", "target.namespace", "default", "空欄なら全Namespace")
+	if err != nil || canceled || value != "" {
+		t.Fatalf("値入力を終了できない: value=%q canceled=%v err=%v", value, canceled, err)
+	}
+	for _, expected := range []string{
+		"│ 設定項目", "│ 説明", "│ 現在値", "│ 入力値", "入力（Enterで確定）\n",
+		"│ 空欄", "│ -", "│ b", "組み込み既定値に戻す", "1つ前へ戻る",
+	} {
+		if !strings.Contains(output.String(), expected) {
+			t.Fatalf("値入力画面に%qがない: %q", expected, output.String())
+		}
+	}
+	for _, separatedHeading := range []string{"  設定項目\n", "  説明\n", "  現在値\n", "  操作（Enterで確定）\n"} {
+		if strings.Contains(output.String(), separatedHeading) {
+			t.Fatalf("設定情報が表外の見出し%qへ分離されています: %q", separatedHeading, output.String())
+		}
+	}
+	for _, old := range []string{"空のまま Enter      :", "- を入力して Enter :", "b を入力して Enter :"} {
+		if strings.Contains(output.String(), old) {
+			t.Fatalf("操作説明に旧コロン区切り%qが残っている: %q", old, output.String())
+		}
+	}
+	tableRows := []string{}
+	for _, line := range strings.Split(output.String(), "\n") {
+		if strings.HasPrefix(line, "  │") {
+			tableRows = append(tableRows, line)
+		}
+	}
+	if len(tableRows) != 7 {
+		t.Fatalf("設定表の行数=%d, want 7: %q", len(tableRows), output.String())
+	}
+	leftWidth, rightWidth := -1, -1
+	for _, line := range tableRows {
+		cells := strings.Split(line, "│")
+		if len(cells) != 4 {
+			t.Fatalf("設定表の罫線が不正です: %q", line)
+		}
+		if leftWidth < 0 {
+			leftWidth, rightWidth = console.DisplayWidth(cells[1]), console.DisplayWidth(cells[2])
+			continue
+		}
+		if console.DisplayWidth(cells[1]) != leftWidth || console.DisplayWidth(cells[2]) != rightWidth {
+			t.Fatalf("全角文字を含む設定表の列幅が揃っていません: %q", tableRows)
+		}
+	}
+}
+
+func TestWrapPromptCellUsesTerminalDisplayWidth(t *testing.T) {
+	lines := wrapPromptCell("HTTPパスは/readyを指定します", 12)
+	if len(lines) < 2 {
+		t.Fatalf("長い説明が折り返されていません: %q", lines)
+	}
+	if strings.Join(lines, "") != "HTTPパスは/readyを指定します" {
+		t.Fatalf("折返しで説明が変化しました: %q", lines)
+	}
+	for _, line := range lines {
+		if width := console.DisplayWidth(line); width > 12 {
+			t.Fatalf("折返し後の表示幅=%d, want <= 12: %q", width, line)
+		}
+	}
+}
+
+func TestDiscardWizardEscapeSequenceConsumesScrollingAndCursorInput(t *testing.T) {
+	tests := []struct {
+		name     string
+		sequence string
+	}{
+		{name: "arrow", sequence: "[A"},
+		{name: "sgr mouse wheel", sequence: "[<64;12;8M"},
+		{name: "ss3 cursor", sequence: "OA"},
+		{name: "osc", sequence: "]0;terminal title\a"},
+		{name: "x10 mouse wheel", sequence: "[Mabc"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			reader := bufio.NewReader(strings.NewReader(test.sequence + "remaining"))
+			if err := discardWizardEscapeSequence(reader); err != nil {
+				t.Fatalf("制御シーケンスを読み捨てられない: %v", err)
+			}
+			remaining, err := io.ReadAll(reader)
+			if err != nil || string(remaining) != "remaining" {
+				t.Fatalf("通常入力まで消費しました: remaining=%q err=%v", remaining, err)
+			}
+		})
+	}
+}
+
+func TestFailedAutomaticSaveDoesNotChangeTheCandidate(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.ConfigFile = t.TempDir() // ファイルではなく既存ディレクトリなのでrenameに失敗する。
+	var spec config.SettingSpec
+	for _, candidate := range settingsForSection("display") {
+		if candidate.Name == "display.show_api_requests" {
+			spec = candidate
+			break
+		}
+	}
+	if spec.Name == "" {
+		t.Fatal("実API要求の設定定義がない")
+	}
+	updated, saved, err := persistPromptedSetting(cfg, spec, "false")
+	if err == nil {
+		t.Fatal("保存できないパスを成功扱いした")
+	}
+	if saved != "" || updated.ShowAPIRequests != cfg.ShowAPIRequests || updated.SettingExplicit(spec.Name) {
+		t.Fatalf("保存失敗した値が候補へ反映された: updated=%#v saved=%q", updated, saved)
 	}
 }
 
@@ -503,6 +730,30 @@ func TestRenderTextKeepsCommandsOutOfThePreambleAndTraceAtTheEnd(t *testing.T) {
 	runner.renderText(snapshot, model.NewState())
 	if !strings.Contains(commandsOnly.String(), "$ kubectl") || strings.Contains(commandsOnly.String(), "実行したKubernetes API要求") || strings.Contains(commandsOnly.String(), "GET /api/v1/pods") {
 		t.Fatalf("確認用kubectlを残したまま実API要求だけを非表示にできない: %q", commandsOnly.String())
+	}
+}
+
+func TestRenderTextIncludesDiagnosticContents(t *testing.T) {
+	output := &bytes.Buffer{}
+	cfg := config.Defaults()
+	cfg.Mode = "triage"
+	cfg.ShowAPIRequests = false
+	runner := &Runner{
+		Config:  cfg,
+		Streams: Streams{Out: output, Err: output},
+		Clients: &kube.Clients{Context: "test-context"},
+		Console: console.New(cfg, output, output),
+	}
+	state := model.NewState()
+	state.AddCheck(model.Check{ID: "pod-health", Section: "Pod", Description: "Podとコンテナの稼働状態", Available: true})
+	runner.renderText(kube.NewSnapshot(), state)
+
+	got := output.String()
+	if !strings.Contains(got, "診断内容（実施状況）") || !strings.Contains(got, "Podとコンテナの稼働状態") {
+		t.Fatalf("テキスト診断結果に診断内容が表示されない: %q", got)
+	}
+	if strings.Index(got, "診断内容（実施状況）") > strings.Index(got, "クラスタ健全性スコア") {
+		t.Fatalf("診断内容が結果末尾のスコアより後に表示された: %q", got)
 	}
 }
 
@@ -662,7 +913,7 @@ func TestNodeMetricRowsCalculateAllocatablePercentages(t *testing.T) {
 
 func TestMetricNotFoundIsReportedAsUnavailableAPI(t *testing.T) {
 	got := fetchStatusText(kube.FetchStatus{Status: kube.StatusNotFound})
-	if got != "Metrics APIが提供されていません (NotFound)" {
+	if got != "Metrics APIが提供されていません（NotFound）" {
 		t.Fatalf("NotFoundをAPI到達不能と誤表示した: %q", got)
 	}
 }

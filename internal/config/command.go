@@ -102,7 +102,7 @@ func validateConfigEditorArgs(args []string) error {
 		switch {
 		case arg == "--config" || arg == "-config":
 			if index+1 >= len(args) {
-				return errors.New("configコマンドの--configにはパスが必要です")
+				return errors.New("config コマンドの --config にはファイルパスが必要です")
 			}
 			index++
 		case strings.HasPrefix(arg, "--config=") || strings.HasPrefix(arg, "-config="):
@@ -110,7 +110,7 @@ func validateConfigEditorArgs(args []string) error {
 			arg == "-h" || arg == "--help" || strings.HasPrefix(arg, "-h=") || strings.HasPrefix(arg, "--help=") ||
 			arg == "--version" || arg == "-version" || strings.HasPrefix(arg, "--version=") || strings.HasPrefix(arg, "-version="):
 		default:
-			return fmt.Errorf("configコマンドでは%sを使用できません（設定値は対話画面で変更してください）", arg)
+			return fmt.Errorf("config コマンドでは %s を使用できません。設定値は対話画面で変更してください", arg)
 		}
 	}
 	return nil
@@ -223,11 +223,11 @@ func clearExplicit(cfg *Config, names ...string) {
 func CommandDescription(command string) string {
 	switch command {
 	case "quick":
-		return "短時間のtriageをtextで実行"
+		return "短時間の初動診断をテキスト形式で実行"
 	case "ci":
-		return "triageをJSON出力し、確定異常で失敗"
+		return "初動診断をJSON形式で出力し、確定異常があれば終了コード1"
 	case "deep":
-		return "全体診断にログ・未使用候補を追加"
+		return "全体診断にログ確認と未使用リソース候補の検出を追加"
 	case "all":
 		return "クラスタ全体を診断"
 	case "pod":
@@ -235,13 +235,13 @@ func CommandDescription(command string) string {
 	case "list":
 		return "Pod一覧のみ表示"
 	case "triage":
-		return "CI/初動向け診断"
+		return "CI・初動調査向けの診断"
 	case "config":
-		return "対話式にINI設定を編集"
+		return "対話形式でINI設定を編集"
 	case "advanced":
 		return "従来の全フラグを使用"
 	default:
-		return fmt.Sprintf("未知のコマンド %q", command)
+		return fmt.Sprintf("未知のコマンドです: %q", command)
 	}
 }
 
@@ -249,7 +249,7 @@ func CommandDescription(command string) string {
 // argv. The guided UI uses the same profiles as the one-word CLI commands.
 func ApplyProfile(cfg Config, command string) (Config, error) {
 	if commandMode(command) == "" {
-		return cfg, fmt.Errorf("診断プロファイルではありません: %s", command)
+		return cfg, fmt.Errorf("診断プロファイルとして使用できないコマンドです: %s", command)
 	}
 	candidate := cfg
 	candidate.explicitSettings = cloneExplicitSettings(cfg.explicitSettings)

@@ -25,7 +25,7 @@ func ExistingDefaultConfig() (string, error) {
 		return "", nil
 	}
 	if err != nil {
-		return "", fmt.Errorf("既定設定ファイルを確認できません: %s (%w)", path, err)
+		return "", fmt.Errorf("既定設定ファイルを確認できません: %s（%w）", path, err)
 	}
 	if !info.Mode().IsRegular() {
 		return "", fmt.Errorf("既定設定ファイルが通常ファイルではありません: %s", path)

@@ -2,9 +2,7 @@ package app
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"io"
 	"strconv"
 	"strings"
 
@@ -16,17 +14,6 @@ import (
 )
 
 func (runner *Runner) runConnect(ctx context.Context, pod *corev1.Pod, services []corev1.Service, state *model.State) ([]connect.Result, bool, error) {
-	runner.Console.Section("接続確認 (client-go port-forward)")
-	runner.Console.Write("注意: トンネルを作成し、Pod直接とService指定Podを単発確認します。")
-	fmt.Fprint(runner.Streams.Out, "実行するにはYESと入力: ")
-	answer, err := runner.reader.ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
-		return nil, false, fmt.Errorf("接続確認の入力を読み取れませんでした: %w", err)
-	}
-	if strings.TrimSpace(answer) != "YES" {
-		runner.Console.Write("接続確認は実行しません")
-		return nil, false, nil
-	}
 	checker := &connect.Checker{Clients: runner.Clients, Config: runner.Config}
 	results, findings := checker.Check(ctx, pod, services)
 	for _, result := range results {
@@ -100,7 +87,7 @@ func (runner *Runner) renderConnectResults(results []connect.Result) {
 			}
 		}
 		if !found {
-			runner.Console.Write("    (対象なし・未実施)")
+			runner.Console.Write("    （対象なし・未実施）")
 		}
 	}
 	pod, service := groups["pod"], groups["service"]
@@ -108,19 +95,19 @@ func (runner *Runner) renderConnectResults(results []connect.Result) {
 	switch {
 	case pod.failed == 0 && pod.unavailable == 0 && pod.succeeded > 0 && service.failed == 0 && service.unavailable == 0 && service.succeeded > 0:
 		if pod.warned+service.warned > 0 {
-			runner.Console.Write("  ▲ Pod直接・Service指定Podとも単発接続成立、HTTP応答または再現条件に注意あり")
+			runner.Console.Write("  ▲ Pod直接・Service指定Podの両方で接続できましたが、HTTP応答または再現条件に注意が必要です")
 		} else {
-			runner.Console.Write("  → Pod直接・Service指定Podとも単発接続確認成功")
+			runner.Console.Write("  → Pod直接・Service指定Podの両方で、単発の接続確認に成功しました")
 		}
 	case pod.failed == 0 && pod.succeeded > 0 && service.tested == 0 && service.unavailable == 0:
-		runner.Console.Write("  → Pod直接は接続成立、Service指定Podは対象なしのため未実施")
+		runner.Console.Write("  → Pod直接の接続確認には成功しました。Service指定Podは対象がないため未実施です")
 	case service.failed == 0 && service.succeeded > 0 && pod.tested == 0 && pod.unavailable == 0:
-		runner.Console.Write("  → Service指定Podは接続成立、Pod直接はポート推定不可のため未実施")
+		runner.Console.Write("  → Service指定Podの接続確認には成功しました。Pod直接はポートを推定できないため未実施です")
 	case pod.failed > 0 || service.failed > 0:
 		runner.Console.Write("  ▲ 失敗した接続確認があります。kubeletの連続判定と現在のPod状態も併せて確認してください")
 	case pod.unavailable+service.unavailable > 0:
 		runner.Console.Write("  ? 接続確認の一部を実施できませんでした")
 	default:
-		runner.Console.Write("  → 接続テストは実施されませんでした")
+		runner.Console.Write("  → 接続確認の対象がないため、テストは実施されませんでした")
 	}
 }

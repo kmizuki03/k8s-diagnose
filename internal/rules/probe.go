@@ -18,7 +18,7 @@ type ProbeConfigRule struct{}
 
 func (ProbeConfigRule) Metadata() Metadata {
 	return Metadata{
-		ID: "probe-config", Section: "Probe", Description: "Probeの名前付きポートの照合",
+		ID: "probe-config", Section: "Probe", Description: "Probeの名前付きポート設定",
 		Required: []string{"pods"}, Permissions: namespaced("", "pods"),
 		Modes: []string{"all", "triage", "select"},
 	}
@@ -45,9 +45,9 @@ func (ProbeConfigRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ co
 			result = append(result, model.NewFinding(
 				model.Issue, "K8S.PROBE.PORT_UNRESOLVED", "Probe", resource, "NamedPortUnresolved",
 				probePortStableKey(container.Name, probeType, port.StrVal),
-				fmt.Sprintf("Pod %s のcontainer %q に設定された%sでは、ポート名 %q が指定されています。しかし、同じcontainerのports[].nameに %q は定義されていません", shortRef(pod.Namespace, pod.Name), container.Name, probeType, port.StrVal, port.StrVal), 100,
+				fmt.Sprintf("Pod %s のコンテナ %q に設定された %s のポート %q を解決できません。同じコンテナの ports[].name には、%q が定義されていません", shortRef(pod.Namespace, pod.Name), container.Name, probeType, port.StrVal, port.StrVal), 100,
 				model.Evidence{Kind: "probe", Key: "portName", Value: fmt.Sprintf("%s.port: %q", probeType, port.StrVal)},
-				model.Evidence{Kind: "container", Key: "ports[].name", Value: fmt.Sprintf("container %q のports[].nameに %q は定義されていません", container.Name, port.StrVal)},
+				model.Evidence{Kind: "container", Key: "ports[].name", Value: fmt.Sprintf("コンテナ %q の ports[].name に %q は定義されていません", container.Name, port.StrVal)},
 			))
 		})
 	}

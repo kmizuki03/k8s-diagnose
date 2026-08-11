@@ -156,7 +156,7 @@ func NewRootCause(cause Finding, confidence int, evidence []Evidence, direct, pr
 	if confidence > 100 {
 		confidence = 100
 	}
-	classification, label := "related_candidate", "関連候補 / 要確認"
+	classification, label := "related_candidate", "関連候補（要確認）"
 	confirmed := cause.Severity == Issue && confidence >= 90
 	if confirmed {
 		classification, label = "root_cause", "根本原因"
@@ -212,12 +212,34 @@ type Check struct {
 	Reason      string `json:"reason,omitempty"`
 }
 
+// ScoreDimension is one independently explainable part of a scoped health
+// score. Cluster diagnostics continue to use the root-cause based Health()
+// calculation; interactive Pod diagnostics set a ScopedScore so a broken Pod
+// is not presented as a nearly healthy cluster merely because it has one root
+// cause.
+type ScoreDimension struct {
+	ID      string `json:"id"`
+	Label   string `json:"label"`
+	Score   int    `json:"score"`
+	Maximum int    `json:"maximum"`
+	Detail  string `json:"detail,omitempty"`
+}
+
+type ScopedScore struct {
+	Kind       string           `json:"kind"`
+	Resource   string           `json:"resource"`
+	Score      int              `json:"score"`
+	Maximum    int              `json:"maximum"`
+	Dimensions []ScoreDimension `json:"dimensions"`
+}
+
 type State struct {
 	mu           sync.Mutex
 	Findings     []Finding                 `json:"findings"`
 	RootCauses   []RootCause               `json:"root_causes"`
 	Checks       []Check                   `json:"checks"`
 	Observations map[string]map[string]any `json:"observations"`
+	ScopedScore  *ScopedScore              `json:"scoped_score,omitempty"`
 	seen         map[string]struct{}
 }
 
@@ -282,6 +304,26 @@ func (s *State) SetRootCauses(values []RootCause) {
 	s.RootCauses = values
 }
 
+func (s *State) SetScopedScore(value ScopedScore) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	copyValue := value
+	copyValue.Score = max(0, min(copyValue.Maximum, copyValue.Score))
+	copyValue.Dimensions = append([]ScoreDimension{}, value.Dimensions...)
+	s.ScopedScore = &copyValue
+}
+
+func (s *State) ScopedScoreValue() *ScopedScore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ScopedScore == nil {
+		return nil
+	}
+	copyValue := *s.ScopedScore
+	copyValue.Dimensions = append([]ScoreDimension{}, s.ScopedScore.Dimensions...)
+	return &copyValue
+}
+
 // Acknowledge keeps findings visible while excluding them from CI policy.
 // It returns true when the ID existed.
 func (s *State) Acknowledge(id string, acknowledgement Acknowledgement) bool {
@@ -323,6 +365,9 @@ func (s *State) Coverage() int {
 func (s *State) Health() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.ScopedScore != nil && s.ScopedScore.Maximum > 0 {
+		return max(0, min(100, s.ScopedScore.Score*100/s.ScopedScore.Maximum))
+	}
 	if len(s.RootCauses) == 0 {
 		issues := 0
 		for _, finding := range s.Findings {

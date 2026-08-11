@@ -23,7 +23,7 @@ type WebhookRule struct{}
 func (WebhookRule) Metadata() Metadata {
 	permissions := cluster("admissionregistration.k8s.io", "validatingwebhookconfigurations,mutatingwebhookconfigurations")
 	permissions = append(permissions, namespaced("", "services")...)
-	return Metadata{ID: "webhooks", Section: "Webhook", Description: "Admission WebhookのService参照", Required: []string{"validatingwebhooks", "mutatingwebhooks", "services"}, Permissions: permissions, Modes: []string{"all", "triage"}}
+	return Metadata{ID: "webhooks", Section: "Webhook", Description: "Admission Webhookが参照するService", Required: []string{"validatingwebhooks", "mutatingwebhooks", "services"}, Permissions: permissions, Modes: []string{"all", "triage"}}
 }
 
 func (WebhookRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Config) []model.Finding {
@@ -50,7 +50,7 @@ func (WebhookRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config
 		}
 		result = append(result, model.NewFinding(
 			severity, "K8S.WEBHOOK.MISSING_SERVICE", "Webhook", ref(kind, "", owner), string(failurePolicy), name,
-			fmt.Sprintf("%s %s / webhook %s: Service %s/%sが存在しません (failurePolicy=%s)", kind, owner, name, client.Service.Namespace, client.Service.Name, failurePolicy), confidence,
+			fmt.Sprintf("%s %s のWebhook %q が参照するService %s/%s は存在しません（failurePolicy: %s）", kind, owner, name, client.Service.Namespace, client.Service.Name, failurePolicy), confidence,
 			model.Evidence{Kind: "reference", Key: "service", Value: shortRef(client.Service.Namespace, client.Service.Name)},
 		))
 	}
@@ -72,7 +72,7 @@ func (WebhookRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config
 type TLSRule struct{}
 
 func (TLSRule) Metadata() Metadata {
-	return Metadata{ID: "tls", Section: "TLS", Description: "TLS Secret内のX.509証明書", Required: []string{"secrets"}, Permissions: namespaced("", "secrets"), Modes: []string{"all", "triage"}}
+	return Metadata{ID: "tls", Section: "TLS", Description: "TLS Secret内のX.509証明書", Required: []string{"secrets"}, Permissions: namespaced("", "secrets"), Modes: []string{"all", "triage", "select"}}
 }
 
 func (TLSRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Config) []model.Finding {
@@ -85,19 +85,19 @@ func (TLSRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Con
 		resource := ref("Secret", secret.Namespace, secret.Name)
 		if secret.Type == corev1.SecretTypeTLS && len(secret.TLSCert) == 0 {
 			result = append(result, model.NewFinding(model.Issue, "K8S.TLS.SECRET_DATA_MISSING", "TLS", resource, "MissingTLSCertificate", corev1.TLSCertKey,
-				fmt.Sprintf("Secret %s: %sが空または存在しません", shortRef(secret.Namespace, secret.Name), corev1.TLSCertKey), 100))
+				fmt.Sprintf("TLS Secret %s では、キー %q が存在しないか、その値が空です", shortRef(secret.Namespace, secret.Name), corev1.TLSCertKey), 100))
 			continue
 		}
 		if secret.Type == corev1.SecretTypeTLS && secret.Keys != nil {
 			if _, exists := secret.Keys[corev1.TLSPrivateKeyKey]; !exists {
 				result = append(result, model.NewFinding(model.Issue, "K8S.TLS.SECRET_DATA_MISSING", "TLS", resource, "MissingTLSPrivateKey", corev1.TLSPrivateKeyKey,
-					fmt.Sprintf("Secret %s: %sが存在しません", shortRef(secret.Namespace, secret.Name), corev1.TLSPrivateKeyKey), 100))
+					fmt.Sprintf("TLS Secret %s には、秘密鍵のキー %q が存在しません", shortRef(secret.Namespace, secret.Name), corev1.TLSPrivateKeyKey), 100))
 			}
 		}
 		if secret.TLSKeyPairError != "" {
 			result = append(result, model.NewFinding(
 				model.Issue, "K8S.TLS.KEY_PAIR_INVALID", "TLS", resource, "InvalidTLSKeyPair", "tls-key-pair",
-				fmt.Sprintf("Secret %s: tls.crtとtls.keyの組み合わせが不正です", shortRef(secret.Namespace, secret.Name)), 100,
+				fmt.Sprintf("TLS Secret %s の tls.crt と tls.key を、有効な証明書と秘密鍵の組み合わせとして検証できません", shortRef(secret.Namespace, secret.Name)), 100,
 				model.Evidence{Kind: "x509", Key: "keyPairError", Value: secret.TLSKeyPairError},
 			))
 		}
@@ -105,7 +105,7 @@ func (TLSRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Con
 		for index, err := range parseErrors {
 			result = append(result, model.NewFinding(
 				model.Issue, "K8S.TLS.CERT_INVALID", "TLS", resource, "InvalidCertificate", fmt.Sprintf("certificate-%d", index+1),
-				fmt.Sprintf("Secret %s: TLS証明書の形式を解析できません", shortRef(secret.Namespace, secret.Name)), 100,
+				fmt.Sprintf("TLS Secret %s に保存された証明書を、X.509証明書として解析できません", shortRef(secret.Namespace, secret.Name)), 100,
 				model.Evidence{Kind: "x509", Key: "error", Value: err.Error()},
 			))
 		}
@@ -124,11 +124,11 @@ func (TLSRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Con
 			}
 			switch {
 			case certificate.NotBefore.After(now):
-				result = append(result, model.NewFinding(model.Issue, "K8S.TLS.CERT_NOT_YET_VALID", "TLS", resource, "NotYetValid", fingerprint, fmt.Sprintf("TLS証明書 %s: 有効開始は%sです", label, certificate.NotBefore.Local().Format("2006-01-02 15:04:05")), 100, evidence...))
+				result = append(result, model.NewFinding(model.Issue, "K8S.TLS.CERT_NOT_YET_VALID", "TLS", resource, "NotYetValid", fingerprint, fmt.Sprintf("TLS証明書 %s は、%s まで有効になりません", label, certificate.NotBefore.Local().Format("2006-01-02 15:04:05")), 100, evidence...))
 			case !certificate.NotAfter.After(now):
-				result = append(result, model.NewFinding(model.Issue, "K8S.TLS.CERT_EXPIRED", "TLS", resource, "Expired", fingerprint, fmt.Sprintf("TLS証明書 %s: %sに期限切れしています", label, certificate.NotAfter.Local().Format("2006-01-02 15:04:05")), 100, evidence...))
+				result = append(result, model.NewFinding(model.Issue, "K8S.TLS.CERT_EXPIRED", "TLS", resource, "Expired", fingerprint, fmt.Sprintf("TLS証明書 %s は、有効期限 %s を過ぎています", label, certificate.NotAfter.Local().Format("2006-01-02 15:04:05")), 100, evidence...))
 			case certificate.NotAfter.Before(now.Add(30 * 24 * time.Hour)):
-				result = append(result, model.NewFinding(model.Warning, "K8S.TLS.CERT_EXPIRING_SOON", "TLS", resource, "ExpiringSoon", fingerprint, fmt.Sprintf("TLS証明書 %s: %sに期限切れ予定です", label, certificate.NotAfter.Local().Format("2006-01-02 15:04:05")), 95, evidence...))
+				result = append(result, model.NewFinding(model.Warning, "K8S.TLS.CERT_EXPIRING_SOON", "TLS", resource, "ExpiringSoon", fingerprint, fmt.Sprintf("TLS証明書 %s の有効期限は %s です（30日以内）", label, certificate.NotAfter.Local().Format("2006-01-02 15:04:05")), 95, evidence...))
 			}
 		}
 	}
@@ -165,10 +165,10 @@ func parseCertificateBundle(data []byte) ([]*x509.Certificate, []error) {
 		}
 	}
 	if foundPEM && len(certificates) == 0 && len(errorsFound) == 0 {
-		errorsFound = append(errorsFound, fmt.Errorf("CERTIFICATE PEM blockがありません"))
+		errorsFound = append(errorsFound, fmt.Errorf("PEMデータにCERTIFICATE形式のブロックがありません"))
 	}
 	if foundPEM && len(bytes.TrimSpace(rest)) > 0 {
-		errorsFound = append(errorsFound, fmt.Errorf("PEM bundle末尾に解析できないデータがあります"))
+		errorsFound = append(errorsFound, fmt.Errorf("PEMバンドルの末尾に解析できないデータがあります"))
 	}
 	return certificates, errorsFound
 }

@@ -36,7 +36,7 @@ func (QuotaRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.C
 			if used.Cmp(hard) >= 0 {
 				severity, confidence = model.Warning, 85
 			}
-			result = append(result, model.NewFinding(severity, "K8S.RESOURCE_QUOTA.HIGH_USAGE", "ResourceQuota", ref("ResourceQuota", quota.Namespace, quota.Name), string(name), string(name), fmt.Sprintf("ResourceQuota %s / %s: %s/%s (%d%%)", shortRef(quota.Namespace, quota.Name), name, used.String(), hard.String(), ratio), confidence))
+			result = append(result, model.NewFinding(severity, "K8S.RESOURCE_QUOTA.HIGH_USAGE", "ResourceQuota", ref("ResourceQuota", quota.Namespace, quota.Name), string(name), string(name), fmt.Sprintf("ResourceQuota %s のリソース %q は、上限 %s のうち %s を使用しています（%d%%）", shortRef(quota.Namespace, quota.Name), name, hard.String(), used.String(), ratio), confidence))
 		}
 	}
 	return result
@@ -53,7 +53,7 @@ func quantityRatio(used, hard resource.Quantity) int {
 type PDBRule struct{}
 
 func (PDBRule) Metadata() Metadata {
-	return Metadata{ID: "pdb", Section: "ワークロード (Deployment等)", Description: "PodDisruptionBudgetの健全数とEviction余力", Required: []string{"pdbs"}, Permissions: namespaced("policy", "poddisruptionbudgets"), Modes: []string{"all", "triage"}}
+	return Metadata{ID: "pdb", Section: "ワークロード（Deploymentなど）", Description: "PodDisruptionBudgetの正常なPod数と退避余力", Required: []string{"pdbs"}, Permissions: namespaced("policy", "poddisruptionbudgets"), Modes: []string{"all", "triage"}}
 }
 
 func (PDBRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Config) []model.Finding {
@@ -65,9 +65,12 @@ func (PDBRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Con
 		}
 		resource := ref("PodDisruptionBudget", pdb.Namespace, pdb.Name)
 		if pdb.Status.CurrentHealthy < pdb.Status.DesiredHealthy {
-			result = append(result, model.NewFinding(model.Warning, "K8S.PDB.HEALTH_BELOW_DESIRED", "ワークロード (Deployment等)", resource, "HealthBelowDesired", "health", fmt.Sprintf("PDB %s: currentHealthy=%d < desiredHealthy=%d", shortRef(pdb.Namespace, pdb.Name), pdb.Status.CurrentHealthy, pdb.Status.DesiredHealthy), 85))
+			result = append(result, model.NewFinding(model.Warning, "K8S.PDB.HEALTH_BELOW_DESIRED", "ワークロード（Deploymentなど）", resource, "HealthBelowDesired", "health", fmt.Sprintf("PDB %s では、正常なPodが %d個しかなく、必要な %d個を下回っています", shortRef(pdb.Namespace, pdb.Name), pdb.Status.CurrentHealthy, pdb.Status.DesiredHealthy), 85,
+				model.Evidence{Kind: "status", Key: "currentHealthy", Value: fmt.Sprint(pdb.Status.CurrentHealthy)},
+				model.Evidence{Kind: "status", Key: "desiredHealthy", Value: fmt.Sprint(pdb.Status.DesiredHealthy)}))
 		} else if pdb.Status.ExpectedPods > 0 && pdb.Status.DisruptionsAllowed == 0 {
-			result = append(result, model.NewFinding(model.Candidate, "K8S.PDB.NO_DISRUPTIONS_ALLOWED", "ワークロード (Deployment等)", resource, "NoDisruptionsAllowed", "disruptions", fmt.Sprintf("PDB %s: disruptionsAllowed=0 (drain時にEviction待ちとなる可能性)", shortRef(pdb.Namespace, pdb.Name)), 50))
+			result = append(result, model.NewFinding(model.Candidate, "K8S.PDB.NO_DISRUPTIONS_ALLOWED", "ワークロード（Deploymentなど）", resource, "NoDisruptionsAllowed", "disruptions", fmt.Sprintf("PDB %s では、現在Podを安全に退避（Eviction）できる余裕がありません。Nodeのdrain処理が待機する可能性があります", shortRef(pdb.Namespace, pdb.Name)), 50,
+				model.Evidence{Kind: "status", Key: "disruptionsAllowed", Value: "0"}))
 		}
 	}
 	return result
@@ -76,7 +79,7 @@ func (PDBRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Con
 type APIServiceRule struct{}
 
 func (APIServiceRule) Metadata() Metadata {
-	return Metadata{ID: "apiservices", Section: "APIService", Description: "aggregated APIServiceのAvailable condition", Required: []string{"apiservices"}, Permissions: cluster("apiregistration.k8s.io", "apiservices"), Modes: []string{"all", "triage"}}
+	return Metadata{ID: "apiservices", Section: "APIService", Description: "集約API（APIService）の利用可否", Required: []string{"apiservices"}, Permissions: cluster("apiregistration.k8s.io", "apiservices"), Modes: []string{"all", "triage"}}
 }
 
 func (APIServiceRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Config) []model.Finding {
@@ -86,11 +89,11 @@ func (APIServiceRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ con
 		conditions, _, _ := unstructured.NestedSlice(item.Object, "status", "conditions")
 		for _, raw := range conditions {
 			condition, ok := raw.(map[string]any)
-			if !ok || fmt.Sprint(condition["type"]) != "Available" || fmt.Sprint(condition["status"]) == "True" {
+			if !ok || objectStringField(condition, "type") != "Available" || objectStringField(condition, "status") == "True" {
 				continue
 			}
-			reason, message := fmt.Sprint(condition["reason"]), fmt.Sprint(condition["message"])
-			result = append(result, model.NewFinding(model.Warning, "K8S.APISERVICE.UNAVAILABLE", "APIService", ref("APIService", "", item.GetName()), reason, "available", fmt.Sprintf("APIService %s: Available=False (%s)", item.GetName(), reason), 90, model.Evidence{Kind: "condition", Key: "Available", Value: message}))
+			reason, message := objectStringField(condition, "reason"), objectStringField(condition, "message")
+			result = append(result, model.NewFinding(model.Warning, "K8S.APISERVICE.UNAVAILABLE", "APIService", ref("APIService", "", item.GetName()), reason, "available", conditionStateMessage("APIService", item.GetName(), "Available", "False", reason), 90, model.Evidence{Kind: "condition", Key: "Available", Value: message}))
 		}
 	}
 	return result
@@ -102,19 +105,19 @@ func (ControlPlaneRule) Metadata() Metadata {
 	// A failed health endpoint normally returns a non-2xx status. Keep each
 	// endpoint optional so the response body can still be evaluated while the
 	// acquisition failure remains visible in Coverage.
-	return Metadata{ID: "control-plane", Section: "コントロールプレーン", Description: "API Server readyz/livez", Optional: []string{"readyz", "livez"}, Modes: []string{"all", "triage"}}
+	return Metadata{ID: "control-plane", Section: "コントロールプレーン", Description: "API Serverのreadyz・livezヘルスチェック", Optional: []string{"readyz", "livez"}, Modes: []string{"all", "triage"}}
 }
 
 type APIDeprecationRule struct{}
 
 func (APIDeprecationRule) Metadata() Metadata {
-	return Metadata{ID: "api-deprecation-warnings", Section: "API", Description: "Kubernetes API warning header", Modes: []string{"all", "triage"}}
+	return Metadata{ID: "api-deprecation-warnings", Section: "API", Description: "Kubernetes APIの非推奨警告", Modes: []string{"all", "triage"}}
 }
 
 func (APIDeprecationRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Config) []model.Finding {
 	result := []model.Finding{}
 	for _, warning := range snapshot.APIWarnings {
-		result = append(result, model.NewFinding(model.Candidate, "K8S.API.DEPRECATION_WARNING", "API", "API/warning", "DeprecationWarning", warning, "Kubernetes APIから警告が返されました: "+warning, 45))
+		result = append(result, model.NewFinding(model.Candidate, "K8S.API.DEPRECATION_WARNING", "API", "API/warning", "DeprecationWarning", warning, "Kubernetes APIから非推奨に関する警告が返されました。内容: "+warning, 45))
 	}
 	return result
 }
@@ -132,14 +135,14 @@ func (ControlPlaneRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ c
 			trimmed := strings.TrimSpace(line)
 			if strings.HasPrefix(trimmed, "[-]") {
 				foundFailureLine = true
-				result = append(result, model.NewFinding(model.Issue, check.code, "コントロールプレーン", "ControlPlane/"+check.name, reason, trimmed, "API Server "+check.name+" checkに失敗項目があります: "+trimmed, 98))
+				result = append(result, model.NewFinding(model.Issue, check.code, "コントロールプレーン", "ControlPlane/"+check.name, reason, trimmed, fmt.Sprintf("API Serverの %s ヘルスチェックで失敗が報告されました。内容: %s", check.name, trimmed), 98))
 			}
 		}
 		status := snapshot.Status(check.name)
 		if !foundFailureLine && status.HTTPCode >= 500 && status.HTTPCode <= 599 {
 			result = append(result, model.NewFinding(
 				model.Issue, check.code, "コントロールプレーン", "ControlPlane/"+check.name, reason, fmt.Sprintf("http-%d", status.HTTPCode),
-				fmt.Sprintf("API Server %sがHTTP %dを返しました", check.name, status.HTTPCode), 98,
+				fmt.Sprintf("API Serverの %s ヘルスチェックがHTTP %dを返しました", check.name, status.HTTPCode), 98,
 				model.Evidence{Kind: "http", Key: "statusCode", Value: fmt.Sprint(status.HTTPCode)},
 			))
 		}

@@ -314,7 +314,7 @@ func degradedResourceMessage(snapshot *kube.Snapshot, resource string) (string, 
 			}
 			ready := condition(pod.Status.Conditions, corev1.PodReady)
 			if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodPending || pod.Status.Phase == corev1.PodRunning && ready != nil && ready.Status != corev1.ConditionTrue {
-				return fmt.Sprintf("Pod %s: phase=%s / Ready未達", shortRef(namespace, name), pod.Status.Phase), true
+				return fmt.Sprintf("Pod %s の状態（phase）は %s で、Ready条件を満たしていません", shortRef(namespace, name), pod.Status.Phase), true
 			}
 		}
 	case "ReplicaSet":
@@ -323,7 +323,7 @@ func degradedResourceMessage(snapshot *kube.Snapshot, resource string) (string, 
 			if item.Namespace == namespace && item.Name == name && statusGenerationCurrent(item.Generation, item.Status.ObservedGeneration) {
 				desired := int32Value(item.Spec.Replicas, 1)
 				if desired > 0 && item.Status.ReadyReplicas < desired {
-					return fmt.Sprintf("ReplicaSet %s: Ready %d/%d", shortRef(namespace, name), item.Status.ReadyReplicas, desired), true
+					return readyCountMessage("ReplicaSet", shortRef(namespace, name), item.Status.ReadyReplicas, desired), true
 				}
 			}
 		}
@@ -333,7 +333,7 @@ func degradedResourceMessage(snapshot *kube.Snapshot, resource string) (string, 
 			if item.Namespace == namespace && item.Name == name && statusGenerationCurrent(item.Generation, item.Status.ObservedGeneration) {
 				desired := int32Value(item.Spec.Replicas, 1)
 				if desired > 0 && item.Status.ReadyReplicas < desired {
-					return fmt.Sprintf("Deployment %s: Ready %d/%d", shortRef(namespace, name), item.Status.ReadyReplicas, desired), true
+					return readyCountMessage("Deployment", shortRef(namespace, name), item.Status.ReadyReplicas, desired), true
 				}
 			}
 		}
@@ -343,7 +343,7 @@ func degradedResourceMessage(snapshot *kube.Snapshot, resource string) (string, 
 			if item.Namespace == namespace && item.Name == name && statusGenerationCurrent(item.Generation, item.Status.ObservedGeneration) {
 				desired := int32Value(item.Spec.Replicas, 1)
 				if desired > 0 && item.Status.ReadyReplicas < desired {
-					return fmt.Sprintf("StatefulSet %s: Ready %d/%d", shortRef(namespace, name), item.Status.ReadyReplicas, desired), true
+					return readyCountMessage("StatefulSet", shortRef(namespace, name), item.Status.ReadyReplicas, desired), true
 				}
 			}
 		}
@@ -351,7 +351,7 @@ func degradedResourceMessage(snapshot *kube.Snapshot, resource string) (string, 
 		for i := range snapshot.DaemonSets {
 			item := &snapshot.DaemonSets[i]
 			if item.Namespace == namespace && item.Name == name && statusGenerationCurrent(item.Generation, item.Status.ObservedGeneration) && item.Status.DesiredNumberScheduled > 0 && item.Status.NumberReady < item.Status.DesiredNumberScheduled {
-				return fmt.Sprintf("DaemonSet %s: Ready %d/%d", shortRef(namespace, name), item.Status.NumberReady, item.Status.DesiredNumberScheduled), true
+				return readyCountMessage("DaemonSet", shortRef(namespace, name), item.Status.NumberReady, item.Status.DesiredNumberScheduled), true
 			}
 		}
 	case "EndpointSlice":
@@ -368,7 +368,7 @@ func degradedResourceMessage(snapshot *kube.Snapshot, resource string) (string, 
 				}
 			}
 			if ready < len(item.Endpoints) || len(item.Endpoints) == 0 {
-				return fmt.Sprintf("EndpointSlice %s: Ready Endpoint %d/%d", shortRef(namespace, name), ready, len(item.Endpoints)), true
+				return fmt.Sprintf("EndpointSlice %s のReady状態のEndpoint数は %d/%d です", shortRef(namespace, name), ready, len(item.Endpoints)), true
 			}
 		}
 	case "Service":
@@ -377,10 +377,10 @@ func degradedResourceMessage(snapshot *kube.Snapshot, resource string) (string, 
 			if item.Namespace == namespace && item.Name == name && item.Spec.Type != corev1.ServiceTypeExternalName && len(item.Spec.Selector) > 0 {
 				ready, fallback := serviceEndpointCounts(item, snapshot)
 				if ready == 0 && fallback == 0 && len(selectedPods(item, snapshot.Pods)) > 0 {
-					return fmt.Sprintf("Service %s: Ready Endpoint 0件", shortRef(namespace, name)), true
+					return fmt.Sprintf("Service %s には、Ready状態のEndpointがありません", shortRef(namespace, name)), true
 				}
 				if ready == 0 && fallback > 0 {
-					return fmt.Sprintf("Service %s: 終了中serving Endpoint %d件だけ", shortRef(namespace, name), fallback), true
+					return fmt.Sprintf("Service %s にはReady状態のEndpointがなく、終了処理中で serving=true のEndpointが %d件だけあります", shortRef(namespace, name), fallback), true
 				}
 			}
 		}
@@ -562,43 +562,43 @@ func remediations(finding model.Finding) []string {
 	if strings.HasPrefix(finding.Code, "K8S.PROBE.") {
 		switch finding.Reason {
 		case "readinessProbe":
-			return []string{"readinessProbeのpath、port、scheme、timeoutSecondsと認証headerを確認する", "アプリのReady条件が満たされる時刻とinitialDelaySecondsを比較する"}
+			return []string{"readinessProbeの path、port、scheme、timeoutSeconds、HTTPヘッダーを確認する", "アプリがReadyになるまでの時間と initialDelaySeconds を比較する"}
 		case "livenessProbe":
-			return []string{"livenessProbeのpath、port、timeoutSecondsを確認し、正常起動に必要な時間より厳しすぎないか見直す"}
+			return []string{"livenessProbeの path、port、timeoutSeconds を確認し、アプリの応答時間に対して厳しすぎないか見直す"}
 		case "startupProbe":
-			return []string{"startupProbeのfailureThreshold×periodSecondsが最大起動時間を十分に覆うか確認する"}
+			return []string{"startupProbeの failureThreshold × periodSeconds が、アプリの最大起動時間を十分にカバーしているか確認する"}
 		case "NamedPortUnresolved":
-			return []string{"Probeのport名を同じcontainerのports[].nameに合わせるか、有効な数値portへ修正する"}
+			return []string{"Probeのポート名を同じコンテナの ports[].name に合わせるか、有効な数値ポートへ修正する"}
 		}
-		return []string{"Probeのhandler、port、pathと閾値をPod定義およびアプリの待受設定に合わせる"}
+		return []string{"Probeの handler、port、path、判定しきい値を、Pod定義とアプリの待受設定に合わせる"}
 	}
 	switch finding.Code {
 	case "K8S.DEPENDENCY.MISSING_OBJECT":
-		return []string{"必須参照先を作成するか、Pod/Workloadの参照名を修正する"}
+		return []string{"必須の参照先リソースを作成するか、Podまたはワークロードの参照名を修正する"}
 	case "K8S.DEPENDENCY.MISSING_KEY":
-		return []string{"Secret/ConfigMapに必要なキーを追加するか、keyRefを修正する"}
+		return []string{"SecretまたはConfigMapに必要なキーを追加するか、keyRefを修正する"}
 	case "K8S.SERVICE.TARGET_PORT_UNRESOLVED":
-		return []string{"Serviceのspec.ports[].targetPortを、selectorで選ばれるPodのports[].nameに合わせる"}
+		return []string{"Serviceの spec.ports[].targetPort を、selectorに一致するPodの ports[].name に合わせる"}
 	case "K8S.WORKLOAD.PROGRESS_DEADLINE_EXCEEDED":
-		return []string{"Deployment conditionとReplicaSet Eventを確認し、停滞したrolloutの設定またはimageを修正する"}
+		return []string{"Deploymentの状態条件（condition）とReplicaSetのEventを確認し、ロールアウトを妨げている設定またはコンテナイメージを修正する"}
 	case "K8S.WORKLOAD.REPLICA_FAILURE":
-		return []string{"ReplicaFailure messageにあるQuota、Admission、PVCの拒否原因を修正する"}
+		return []string{"ReplicaFailureのメッセージを確認し、ResourceQuota、Admission、PVCなどによる拒否原因を修正する"}
 	case "K8S.SCHEDULING.INSUFFICIENT_RESOURCES":
-		return []string{"Pod requestsの見直し、Node容量の追加、または不要Podの整理を検討する"}
+		return []string{"Podの resources.requests を見直すか、Node容量の追加または不要なPodの整理を検討する"}
 	case "K8S.SCHEDULING.UNTOLERATED_TAINT":
-		return []string{"Node taintとPod tolerationの意図を確認し、必要な場合だけtolerationを追加する"}
+		return []string{"NodeのtaintとPodのtolerationの意図を確認し、必要な場合に限ってtolerationを追加する"}
 	case "K8S.POD.ABNORMAL_STATE":
-		return []string{"containerの現在/前回ログとEventを確認する", "Probe失敗がある場合はpath、port、timeoutSecondsを確認する"}
+		return []string{"コンテナの現在のログ、前回終了時のログ、Eventを確認する", "Probe失敗がある場合は path、port、timeoutSeconds を確認する"}
 	case "K8S.TLS.CERT_EXPIRED":
-		return []string{"TLS Secretの証明書を更新し、Ingress/consumerが新しいSecretを読み込んだことを確認する"}
+		return []string{"TLS Secretの証明書を更新し、Ingressなどの利用側が新しいSecretを読み込んだことを確認する"}
 	case "K8S.TLS.CERT_INVALID":
-		return []string{"TLS Secretのtls.crtを有効なPEM形式のX.509証明書へ置き換える"}
+		return []string{"TLS Secretの tls.crt を、有効なPEM形式のX.509証明書へ置き換える"}
 	case "K8S.TLS.KEY_PAIR_INVALID":
-		return []string{"TLS Secretのtls.crtに対応するPEM秘密鍵をtls.keyへ設定する"}
+		return []string{"TLS Secretの tls.crt に対応するPEM形式の秘密鍵を tls.key に設定する"}
 	case "K8S.PVC.STORAGE_CLASS_NOT_FOUND":
-		return []string{"PVCのstorageClassNameを既存のStorageClassへ修正するか、必要なStorageClassを作成する"}
+		return []string{"PVCの storageClassName を既存のStorageClass名へ修正するか、必要なStorageClassを作成する"}
 	case "K8S.PV.FAILED":
-		return []string{"PVのstatus.message、CSI/volume pluginのEventとストレージ基盤を確認する"}
+		return []string{"PVの status.message、CSIまたはボリュームプラグインのEvent、ストレージ基盤を確認する"}
 	default:
 		return nil
 	}

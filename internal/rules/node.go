@@ -14,7 +14,7 @@ import (
 type NodeRule struct{}
 
 func (NodeRule) Metadata() Metadata {
-	return Metadata{ID: "nodes", Section: "Node", Description: "Node condition・volume・version", Required: []string{"nodes"}, Permissions: cluster("", "nodes"), Modes: []string{"all", "triage"}}
+	return Metadata{ID: "nodes", Section: "Node", Description: "Nodeの状態・ボリューム・kubeletバージョン", Required: []string{"nodes"}, Permissions: cluster("", "nodes"), Modes: []string{"all", "triage"}}
 }
 
 func (NodeRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Config) []model.Finding {
@@ -32,7 +32,7 @@ func (NodeRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Co
 			if bad {
 				result = append(result, model.NewFinding(
 					model.Warning, "K8S.NODE.CONDITION", "Node", ref("Node", "", node.Name), string(c.Type), string(c.Type),
-					fmt.Sprintf("Node %s: %s=%s (%s)", node.Name, c.Type, c.Status, c.Reason), 85,
+					conditionStateMessage("Node", node.Name, string(c.Type), string(c.Status), c.Reason), 85,
 					model.Evidence{Kind: "condition", Key: string(c.Type), Value: c.Message},
 				))
 				continue
@@ -40,7 +40,7 @@ func (NodeRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Co
 			if c.Type != corev1.NodeReady && !problemConditions[c.Type] && c.Status == corev1.ConditionTrue {
 				result = append(result, model.NewFinding(
 					model.Candidate, "K8S.NODE.UNKNOWN_CONDITION", "Node", ref("Node", "", node.Name), string(c.Type), string(c.Type),
-					fmt.Sprintf("Node %s: 独自condition %s=Trueです (意味は環境依存)", node.Name, c.Type), 35,
+					fmt.Sprintf("Node %s では、このツールが意味を判定できない独自の状態条件（condition）%q が True になっています", node.Name, c.Type), 35,
 					model.Evidence{Kind: "condition", Key: string(c.Type), Value: c.Message},
 				))
 			}
@@ -51,12 +51,12 @@ func (NodeRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Co
 		}
 		for _, volume := range node.Status.VolumesInUse {
 			if _, ok := attached[string(volume)]; !ok {
-				result = append(result, model.NewFinding(model.Warning, "K8S.NODE.VOLUME_STATE_MISMATCH", "Node", ref("Node", "", node.Name), "VolumeInUseNotAttached", string(volume), fmt.Sprintf("Node %s: volumesInUse %sがvolumesAttachedに存在しません", node.Name, volume), 75))
+				result = append(result, model.NewFinding(model.Warning, "K8S.NODE.VOLUME_STATE_MISMATCH", "Node", ref("Node", "", node.Name), "VolumeInUseNotAttached", string(volume), fmt.Sprintf("Node %s では、使用中と報告されたボリューム %q が接続済みボリュームの一覧にありません", node.Name, volume), 75))
 			}
 		}
 	}
 	if len(versions) > 1 {
-		result = append(result, model.NewFinding(model.Candidate, "K8S.NODE.KUBELET_VERSION_SKEW", "Node", "Cluster/kubelets", "VersionSkew", "kubelet-versions", fmt.Sprintf("kubeletVersionが%d種類存在します", len(versions)), 45))
+		result = append(result, model.NewFinding(model.Candidate, "K8S.NODE.KUBELET_VERSION_SKEW", "Node", "Cluster/kubelets", "VersionSkew", "kubelet-versions", fmt.Sprintf("クラスタ内のNodeでは、%d種類のkubeletバージョンが使われています", len(versions)), 45))
 	}
 	return result
 }
@@ -65,7 +65,7 @@ type NodeHeartbeatRule struct{}
 
 func (NodeHeartbeatRule) Metadata() Metadata {
 	return Metadata{
-		ID: "node-heartbeats", Section: "Node", Description: "kube-node-leaseのNode heartbeat鮮度",
+		ID: "node-heartbeats", Section: "Node", Description: "Node Leaseによるハートビートの鮮度",
 		Required: []string{"nodes", "node_leases"}, Permissions: cluster("coordination.k8s.io", "leases"),
 		Modes: []string{"all", "triage"},
 	}
@@ -94,7 +94,7 @@ func (NodeHeartbeatRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, cf
 			}
 			result = append(result, model.NewFinding(
 				model.Warning, "K8S.NODE.LEASE_MISSING", "Node", ref("Node", "", node.Name), "NodeLeaseMissing", "node-lease",
-				fmt.Sprintf("Node %s: kube-node-leaseに対応するLeaseがありません", node.Name), 80,
+				fmt.Sprintf("Node %s に対応するLeaseが、Namespace kube-node-lease に見つかりません", node.Name), 80,
 			))
 			continue
 		}
@@ -102,7 +102,7 @@ func (NodeHeartbeatRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, cf
 		if age < -30*time.Second {
 			result = append(result, model.NewFinding(
 				model.Candidate, "K8S.NODE.HEARTBEAT_CLOCK_UNCERTAIN", "Node", ref("Node", "", node.Name), "LeaseTimeInFuture", "node-lease-clock",
-				fmt.Sprintf("Node %s: Lease時刻がAPI Server基準より未来のため鮮度を確定できません", node.Name), 35,
+				fmt.Sprintf("Node %s のLease更新時刻がAPI Serverの時刻より未来になっているため、ハートビートの鮮度を判定できません", node.Name), 35,
 				model.Evidence{Kind: "lease", Key: "renewTime", Value: renewed.UTC().Format(time.RFC3339)},
 			))
 			continue
@@ -112,7 +112,7 @@ func (NodeHeartbeatRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, cf
 		}
 		result = append(result, model.NewFinding(
 			model.Warning, "K8S.NODE.HEARTBEAT_STALE", "Node", ref("Node", "", node.Name), "HeartbeatStale", "node-lease-renew-time",
-			fmt.Sprintf("Node %s: Lease heartbeatが%d秒更新されていません", node.Name, int(age.Seconds())), 85,
+			fmt.Sprintf("Node %s のLeaseによるハートビートは、%d秒間更新されていません", node.Name, int(age.Seconds())), 85,
 			model.Evidence{Kind: "lease", Key: "renewTime", Value: renewed.UTC().Format(time.RFC3339)},
 		))
 	}

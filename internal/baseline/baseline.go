@@ -33,7 +33,7 @@ func Load(path string) (Baseline, error) {
 	}
 	absolute, err := filepath.Abs(path)
 	if err != nil {
-		return Baseline{}, err
+		return Baseline{}, fmt.Errorf("ベースラインのパスを解決できません: %w", err)
 	}
 	info, err := os.Stat(absolute)
 	if err != nil {
@@ -44,7 +44,7 @@ func Load(path string) (Baseline, error) {
 	}
 	file, err := os.Open(absolute) // #nosec G304 -- --baseline explicitly selects a validated regular file.
 	if err != nil {
-		return Baseline{}, err
+		return Baseline{}, fmt.Errorf("ベースラインを開けません: %w", err)
 	}
 	defer file.Close()
 	values := map[string]map[string]string{}
@@ -55,7 +55,7 @@ func Load(path string) (Baseline, error) {
 	for lineNumber := 1; scanner.Scan(); lineNumber++ {
 		rawLine := scanner.Text()
 		if !utf8.ValidString(rawLine) {
-			return Baseline{}, fmt.Errorf("ベースラインがUTF-8ではありません (%d行目)", lineNumber)
+			return Baseline{}, fmt.Errorf("ベースラインがUTF-8ではありません（%d行目）", lineNumber)
 		}
 		line := strings.TrimSpace(rawLine)
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
@@ -80,45 +80,45 @@ func Load(path string) (Baseline, error) {
 			continue
 		}
 		if section == "" {
-			return Baseline{}, fmt.Errorf("設定値は[acknowledgement.ID]内に記述してください (%d行目)", lineNumber)
+			return Baseline{}, fmt.Errorf("設定値は [acknowledgement.ID] セクション内に記述してください（%d行目）", lineNumber)
 		}
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) != 2 {
-			return Baseline{}, fmt.Errorf("形式が不正です (%d行目)", lineNumber)
+			return Baseline{}, fmt.Errorf("ベースラインの形式が不正です（%d行目）", lineNumber)
 		}
 		key, value := strings.ToLower(strings.TrimSpace(parts[0])), strings.TrimSpace(parts[1])
 		if !allowedKey(key) {
-			return Baseline{}, fmt.Errorf("[%s]の未知のキーです: %s", section, key)
+			return Baseline{}, fmt.Errorf("[%s] に未対応のキーがあります: %s", section, key)
 		}
 		if _, exists := values[section][key]; exists {
-			return Baseline{}, fmt.Errorf("[%s]のキーが重複しています: %s", section, key)
+			return Baseline{}, fmt.Errorf("[%s] でキーが重複しています: %s", section, key)
 		}
 		values[section][key] = value
 	}
 	if err := scanner.Err(); err != nil {
-		return Baseline{}, err
+		return Baseline{}, fmt.Errorf("ベースラインを読み込めません: %w", err)
 	}
 	rules := []Rule{}
 	for id, value := range values {
 		rule := Rule{ID: id, Code: value["code"], Namespace: value["namespace"], Workload: value["workload"], Resource: value["resource"], Reason: strings.Join(strings.Fields(value["reason"]), " "), Expires: value["expires"], Source: absolute}
 		if rule.Code == "" || rule.Reason == "" || rule.Expires == "" {
-			return Baseline{}, fmt.Errorf("[acknowledgement.%s]にはcode、reason、expiresが必要です", id)
+			return Baseline{}, fmt.Errorf("[acknowledgement.%s] には code、reason、expires が必要です", id)
 		}
 		if rule.Namespace == "" && rule.Workload == "" && rule.Resource == "" {
-			return Baseline{}, fmt.Errorf("[acknowledgement.%s]はnamespace、workload、resourceのいずれかで範囲を限定してください", id)
+			return Baseline{}, fmt.Errorf("[acknowledgement.%s] では、namespace、workload、resource のいずれかを指定して対象範囲を限定してください", id)
 		}
 		if utf8.RuneCountInString(rule.Reason) > 500 {
-			return Baseline{}, fmt.Errorf("[acknowledgement.%s] reasonは500文字以下です", id)
+			return Baseline{}, fmt.Errorf("[acknowledgement.%s] の reason は500文字以下で指定してください", id)
 		}
 		for _, matcher := range []struct{ label, value string }{
 			{"code", rule.Code}, {"namespace", rule.Namespace}, {"workload", rule.Workload}, {"resource", rule.Resource},
 		} {
 			if strings.IndexFunc(matcher.value, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }) >= 0 {
-				return Baseline{}, fmt.Errorf("[acknowledgement.%s] %sに空白・制御文字は使用できません", id, matcher.label)
+				return Baseline{}, fmt.Errorf("[acknowledgement.%s] の %s には空白や制御文字を使用できません", id, matcher.label)
 			}
 		}
 		if _, err := time.Parse("2006-01-02", rule.Expires); err != nil {
-			return Baseline{}, fmt.Errorf("[acknowledgement.%s] expiresはYYYY-MM-DDで指定してください", id)
+			return Baseline{}, fmt.Errorf("[acknowledgement.%s] の expires は YYYY-MM-DD 形式で指定してください", id)
 		}
 		rules = append(rules, rule)
 	}
@@ -171,7 +171,7 @@ func Apply(state *model.State, baseline Baseline, resolvers ...WorkloadResolver)
 		if rule.Expires < today {
 			state.Add(model.NewFinding(
 				model.Warning, "K8S.BASELINE.EXPIRED", "ベースライン", "Baseline/"+rule.ID, "Expired", rule.ID,
-				fmt.Sprintf("ベースライン承認 %s は%sに期限切れです", rule.ID, rule.Expires), 100,
+				fmt.Sprintf("ベースライン承認 %s は、有効期限 %s を過ぎています", rule.ID, rule.Expires), 100,
 				model.Evidence{Kind: "baseline", Key: "reason", Value: rule.Reason},
 			))
 			continue

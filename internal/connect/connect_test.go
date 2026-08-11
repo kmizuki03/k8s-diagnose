@@ -173,7 +173,7 @@ func TestProbeInitialDelayUsesClusterReferenceTime(t *testing.T) {
 		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{Name: "api", Started: &started, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(serverTime.Add(-20 * time.Second))}}}}},
 	}
 	targets := targetsAt(&pod, nil, "", serverTime)
-	if len(targets) != 1 || targets[0].Active || targets[0].Inactive != "initialDelaySeconds内" {
+	if len(targets) != 1 || targets[0].Active || targets[0].Inactive != "initialDelaySecondsで指定された待機時間内です" {
 		t.Fatalf("API Server基準のinitialDelay判定が不正: %#v", targets)
 	}
 	targets = targetsAt(&pod, nil, "", serverTime.Add(11*time.Second))
@@ -202,7 +202,7 @@ func TestProbeDestinationHostIsUnavailableInsteadOfHostHeader(t *testing.T) {
 		t.Fatalf("probe数=%d, want 2: %#v", len(targets), targets)
 	}
 	for _, target := range targets {
-		if target.Active || !target.Unavailable || !strings.Contains(target.Inactive, ".host=") {
+		if target.Active || !target.Unavailable || !strings.Contains(target.Inactive, ".host") || !strings.Contains(target.Inactive, "port-forwardでは再現できません") {
 			t.Fatalf("接続先host指定を実行対象にした: %#v", target)
 		}
 	}
@@ -297,9 +297,9 @@ func TestUnresolvedNamedProbePortIsExplicitIssue(t *testing.T) {
 		t.Fatalf("解決不能Probeの結果またはFindingが不正: results=%#v findings=%#v", results, findings)
 	}
 	for _, want := range []string{
-		"container \"api\" に設定されたreadinessProbe",
-		"ポート名 \"missing\" が指定されています",
-		"同じcontainerのports[].nameに \"missing\" は定義されていません",
+		"コンテナ \"api\" に設定された readinessProbe",
+		"ポート \"missing\" を解決できません",
+		"同じコンテナの ports[].name には、\"missing\" が定義されていません",
 	} {
 		if !strings.Contains(findings[0].Message, want) {
 			t.Fatalf("Probeポート不一致の説明に%qがない: %q", want, findings[0].Message)
@@ -308,11 +308,25 @@ func TestUnresolvedNamedProbePortIsExplicitIssue(t *testing.T) {
 	evidence := fmt.Sprint(findings[0].Evidence)
 	for _, want := range []string{
 		"readinessProbe.port: \"missing\"",
-		"container \"api\" の定義済みports[].name: なし",
-		"ポート名 \"missing\" に対応するcontainerPort: 0件",
+		"コンテナ \"api\" の ports[].name に定義された名前: なし",
+		"ポート名 \"missing\" に対応する containerPort は見つかりませんでした（0件）",
 	} {
 		if !strings.Contains(evidence, want) {
 			t.Fatalf("Probeポート不一致の根拠に%qがない: %#v", want, findings[0].Evidence)
 		}
+	}
+}
+
+func TestConnectionTargetDescriptionIsReadable(t *testing.T) {
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "ns"}}
+	target := Target{Group: "pod", ProbeType: "readinessProbe", Protocol: "http", RemotePort: 8080, Path: "/ready"}
+	got := connectionTargetDescription(target, pod)
+	for _, want := range []string{"Pod ns/api のreadinessProbe", "HTTP :8080/ready", "確認経路: Pod直接"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("接続先の説明に%qがありません: %q", want, got)
+		}
+	}
+	if strings.Contains(got, ": :") {
+		t.Fatalf("接続先の説明に二重のコロンが残っています: %q", got)
 	}
 }

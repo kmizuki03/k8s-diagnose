@@ -111,10 +111,10 @@ func (r *Registry) Run(ctx context.Context, snapshot *kube.Snapshot, cfg config.
 			reason := strings.Join(reasons, "; ")
 			state.AddCheck(model.Check{ID: meta.ID, Section: meta.Section, Description: meta.Description, Available: false, Reason: reason})
 			code, resource, message := "K8S.API.RULE_UNAVAILABLE", "Rule/"+meta.ID,
-				fmt.Sprintf("%sを実施できません (取得不能: %s)", meta.Description, strings.Join(missing, ", "))
+				fmt.Sprintf("「%s」の診断を実施できません。必要なKubernetes API情報を取得できませんでした（対象: %s）", meta.Description, strings.Join(missing, "、"))
 			if meta.UnavailableCode != "" && len(missing) == 1 {
 				code, resource = meta.UnavailableCode, meta.UnavailableResource
-				message = fmt.Sprintf("%sを取得できません (%s)", meta.Description, fetchStatusLabel(snapshot.Status(missing[0])))
+				message = fmt.Sprintf("「%s」を取得できません。原因: %s", meta.Description, fetchStatusLabel(snapshot.Status(missing[0])))
 			}
 			finding := model.NewFinding(model.Unavailable, code, meta.Section, resource, "FetchUnavailable", meta.ID,
 				message, 100,
@@ -133,12 +133,12 @@ func (r *Registry) Run(ctx context.Context, snapshot *kube.Snapshot, cfg config.
 			status := snapshot.Status(key)
 			checkID := meta.ID + "/optional/" + key
 			if status.Available {
-				state.AddCheck(model.Check{ID: checkID, Section: meta.Section, Description: meta.Description + " (任意取得: " + key + ")", Available: true})
+				state.AddCheck(model.Check{ID: checkID, Section: meta.Section, Description: meta.Description + "（任意取得: " + key + "）", Available: true})
 				continue
 			}
-			state.AddCheck(model.Check{ID: checkID, Section: meta.Section, Description: meta.Description + " (任意取得: " + key + ")", Available: false, Reason: status.Reason})
+			state.AddCheck(model.Check{ID: checkID, Section: meta.Section, Description: meta.Description + "（任意取得: " + key + "）", Available: false, Reason: status.Reason})
 			finding := model.NewFinding(model.Unavailable, "K8S.API.PARTIAL_UNAVAILABLE", meta.Section, "Rule/"+meta.ID, "OptionalFetchUnavailable", "optional/"+key,
-				fmt.Sprintf("%sの一部を評価できません (取得不能: %s)", meta.Description, key), 100,
+				fmt.Sprintf("「%s」の一部を評価できません。追加確認に必要なKubernetes API情報 %q を取得できませんでした", meta.Description, key), 100,
 				model.Evidence{Kind: "api", Key: key, Value: status.Reason})
 			finding.RuleID = meta.ID
 			state.Add(finding)
@@ -240,22 +240,22 @@ func Builtins() *Registry {
 func fetchStatusLabel(status kube.FetchStatus) string {
 	switch status.Status {
 	case kube.StatusNotFound:
-		return "API未提供 (NotFound)"
+		return "対象のAPIが提供されていません（API未提供 / NotFound）"
 	case kube.StatusUnavailable:
-		return "API到達不能"
+		return "Kubernetes APIに到達できません"
 	case kube.StatusForbidden:
-		return "RBAC Forbidden"
+		return "アクセス権限がありません（RBAC）"
 	case kube.StatusUnauthorized:
-		return "Unauthorized"
+		return "認証が必要です"
 	case kube.StatusTimeout:
-		return "タイムアウト"
+		return "API要求がタイムアウトしました"
 	case kube.StatusInvalid:
-		return "API要求不正"
+		return "API要求が不正です"
 	default:
 		if status.Reason != "" {
 			return status.Reason
 		}
-		return "APIエラー"
+		return "Kubernetes APIでエラーが発生しました"
 	}
 }
 

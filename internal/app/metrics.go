@@ -19,14 +19,14 @@ func (runner *Runner) renderMetrics(snapshot *kube.Snapshot, state *model.State)
 		return
 	}
 
-	runner.Console.Chapter("リソース使用量 (上位)")
+	runner.Console.Chapter("リソース使用量（上位）")
 	if nodeTracked {
 		runner.Console.Section("Node")
 		runner.renderCommandsForKeys(snapshot, "node_metrics")
 		if snapshot.Available("node_metrics") {
 			rows := nodeMetricRows(snapshot)
 			if len(rows) == 0 {
-				runner.Console.Write("(Nodeメトリクスなし)")
+				runner.Console.Write("（Nodeメトリクスなし）")
 			} else {
 				runner.Console.Table([]string{"NAME", "CPU(cores)", "CPU%", "MEMORY(bytes)", "MEMORY%"}, rows, true)
 			}
@@ -35,12 +35,12 @@ func (runner *Runner) renderMetrics(snapshot *kube.Snapshot, state *model.State)
 		}
 	}
 	if podTracked {
-		runner.Console.Section("Pod (CPU上位10)")
+		runner.Console.Section("Pod（CPU上位10件）")
 		runner.renderCommandsForKeys(snapshot, "pod_metrics")
 		if snapshot.Available("pod_metrics") {
 			rows := podMetricRows(snapshot.PodMetrics, 10)
 			if len(rows) == 0 {
-				runner.Console.Write("(Podメトリクスなし)")
+				runner.Console.Write("（Podメトリクスなし）")
 			} else {
 				runner.Console.Table([]string{"NAMESPACE", "NAME", "CPU(cores)", "MEMORY(bytes)"}, rows, true)
 			}
@@ -63,11 +63,11 @@ func renderMetricUnavailable(runner *Runner, state *model.State, code, descripti
 func fetchStatusText(status kube.FetchStatus) string {
 	switch status.Status {
 	case kube.StatusNotFound:
-		return "Metrics APIが提供されていません (NotFound)"
+		return "Metrics APIが提供されていません（NotFound）"
 	case kube.StatusUnavailable:
 		return "Kubernetes APIに到達できません"
 	case kube.StatusForbidden:
-		return "アクセス権限がありません (RBAC)"
+		return "アクセス権限がありません（RBAC）"
 	case kube.StatusUnauthorized:
 		return "認証が必要です"
 	case kube.StatusTimeout:

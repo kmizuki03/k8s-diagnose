@@ -65,6 +65,90 @@ func TestTruncateDisplayHonoursWideCharacters(t *testing.T) {
 	}
 }
 
+func TestDiagnosticContentsShowsEveryCheckAndUnavailableReason(t *testing.T) {
+	buffer := &bytes.Buffer{}
+	c := New(config.Defaults(), buffer, buffer)
+	c.width = 56
+	serviceFinding := model.NewFinding(model.Issue, "K8S.SERVICE.TEST", "Service", "Service/ns/api", "Invalid", "port", "Service ns/api のtargetPortを解決できません", 100)
+	items := []DiagnosticItem{
+		{Check: model.Check{ID: "tls", Section: "TLS", Description: "TLS Secret内のX.509証明書", Available: false, Reason: "アクセス権限がありません authorization=Basic dXNlcjpwYXNz"}},
+		{Check: model.Check{ID: "service", Section: "Service", Description: "ServiceのPod選択条件・Endpoint・targetPort", Available: true}, Findings: []model.Finding{serviceFinding}, Commands: []string{"kubectl get services -A -o json"}},
+		{Check: model.Check{ID: "service/optional/endpoint_slices", Section: "Service", Description: "追加情報としてEndpointSlice一覧を取得", Available: true}, Commands: []string{"kubectl get endpointslices.discovery.k8s.io -A -o json"}, Supplemental: true},
+		{Check: model.Check{ID: "pod", Section: "Pod", Description: "Podとコンテナの稼働状態", Available: true}},
+	}
+
+	c.DiagnosticContents(items)
+	got := buffer.String()
+	for _, want := range []string{
+		"診断内容（実施状況）",
+		"✔ 実施済み 3件",
+		"? 確認不能 1件",
+		"各項目の確認コマンドを結果の前に表示します",
+		"は正常という意味ではなく",
+		"検査: Podとコンテナの稼働状態",
+		"結果: ✔ 所見なし",
+		"Podとコンテナの稼働状態",
+		"ServiceのPod選択条件・Endpoint",
+		"・targetPort",
+		"$ kubectl get services",
+		"結果: ✘ 確定異常 1件",
+		"Service ns/api のtargetPortを解決",
+		"できません",
+		"追加情報としてEndpointSlice一覧を取得",
+		"結果: ✔ 追加情報を取得済み",
+		"TLS Secret内のX.509証明書",
+		"結果: ? 確認不能",
+		"理由: アクセス権限がありません",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("診断内容に%qがない: %q", want, got)
+		}
+	}
+	if strings.Contains(got, "dXNlcjpwYXNz") {
+		t.Fatalf("確認不能理由から資格情報が漏れた: %q", got)
+	}
+	if !(strings.Index(got, "  Pod\n") < strings.Index(got, "  Service\n") && strings.Index(got, "  Service\n") < strings.Index(got, "  TLS\n")) {
+		t.Fatalf("診断分類が安定した順序で表示されていない: %q", got)
+	}
+	if items[0].Check.ID != "tls" || items[1].Check.ID != "service" || items[2].Check.ID != "service/optional/endpoint_slices" || items[3].Check.ID != "pod" {
+		t.Fatalf("表示のために入力sliceを並べ替えた: %#v", items)
+	}
+}
+
+func TestWrapDisplayKeepsAllWideTextWithinLimit(t *testing.T) {
+	input := "NamespaceとPod名を対象にした診断内容"
+	lines := wrapDisplay(input, 12)
+	if strings.Join(lines, "") != input {
+		t.Fatalf("折り返しで文字が欠落した: %#v", lines)
+	}
+	for _, line := range lines {
+		if width := DisplayWidth(line); width > 12 {
+			t.Fatalf("折り返し後の表示幅=%d, want <= 12: %q", width, line)
+		}
+	}
+}
+
+func TestDiagnosticContentsHonoursNoCmdAndStillShowsResult(t *testing.T) {
+	buffer := &bytes.Buffer{}
+	cfg := config.Defaults()
+	cfg.ShowCmd = false
+	c := New(cfg, buffer, buffer)
+	c.DiagnosticContents([]DiagnosticItem{{
+		Check:    model.Check{ID: "pod", Section: "Pod", Description: "Podの状態", Available: true},
+		Commands: []string{"kubectl get pods -A -o json"},
+		Findings: []model.Finding{model.NewFinding(model.Warning, "K8S.POD.TEST", "Pod", "Pod/ns/api", "NotReady", "ready", "PodがReadyではありません", 80)},
+	}})
+	got := buffer.String()
+	if strings.Contains(got, "kubectl get pods") {
+		t.Fatalf("コマンド非表示設定でも診断内容にkubectlが表示された: %q", got)
+	}
+	for _, want := range []string{"結果: ▲ 警告 1件", "[警告] PodがReadyではありません"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("コマンド非表示時に結果%qまで消えた: %q", want, got)
+		}
+	}
+}
+
 func TestFindingTableAndRootCauseApplyConfiguredMask(t *testing.T) {
 	buffer := &bytes.Buffer{}
 	cfg := config.Defaults()
@@ -99,6 +183,61 @@ func TestSummaryRendersVisualHealthAndCoverageBars(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("健全性表示に%qがない: %q", want, got)
 		}
+	}
+}
+
+func TestSummaryUsesPodScopeLabelInSelectMode(t *testing.T) {
+	buffer := &bytes.Buffer{}
+	cfg := config.Defaults()
+	cfg.Mode = "select"
+	c := New(cfg, buffer, buffer)
+	state := model.NewState()
+	state.AddCheck(model.Check{ID: "pod", Available: true})
+	state.SetScopedScore(model.ScopedScore{
+		Kind: "Pod", Resource: "Pod/ns/api", Score: 84, Maximum: 100,
+		Dimensions: []model.ScoreDimension{
+			{ID: "lifecycle", Label: "ライフサイクル", Score: 15, Maximum: 15, Detail: "phase=Running"},
+			{ID: "readiness", Label: "Ready・Condition", Score: 15, Maximum: 15, Detail: "Ready=True"},
+			{ID: "containers", Label: "コンテナ稼働", Score: 15, Maximum: 20, Detail: "Ready 1/1"},
+			{ID: "restart-log", Label: "再起動・ログ", Score: 6, Maximum: 10, Detail: "再起動・OOM1"},
+			{ID: "resources", Label: "Resources・構成", Score: 4, Maximum: 5, Detail: "候補1"},
+			{ID: "scheduling", Label: "Scheduling・Node", Score: 8, Maximum: 8, Detail: "Node=node-a"},
+			{ID: "dependencies", Label: "依存リソース", Score: 7, Maximum: 7, Detail: "異常所見なし"},
+			{ID: "storage", Label: "Storage", Score: 4, Maximum: 4, Detail: "関連PVC 0"},
+			{ID: "probe", Label: "Probe・接続", Score: 3, Maximum: 6, Detail: "警告1"},
+			{ID: "service", Label: "Service・Endpoint", Score: 3, Maximum: 4, Detail: "候補1"},
+			{ID: "network-policy", Label: "NetworkPolicy", Score: 2, Maximum: 2, Detail: "Policy 1"},
+			{ID: "ingress-tls", Label: "Ingress・TLS", Score: 2, Maximum: 4, Detail: "警告1"},
+		},
+	})
+
+	c.Summary(state)
+	got := buffer.String()
+	for _, want := range []string{
+		"Pod総合スコア",
+		"総合:",
+		"84/100",
+		"内訳:",
+		"ライフサイクル",
+		"Ready・Condition",
+		"コンテナ稼働",
+		"再起動・ログ",
+		"Resources・構成",
+		"Scheduling・Node",
+		"依存リソース",
+		"Storage",
+		"Probe・接続",
+		"Service・Endpoint",
+		"NetworkPolicy",
+		"Ingress・TLS",
+		"総合＝選択Podの12診断項目（状態・依存・通信・TLS等）",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("Pod個別診断のスコア表示に%qがない: %q", want, got)
+		}
+	}
+	if strings.Contains(got, "クラスタ健全性スコア") || strings.Contains(got, "Health＝クラスタ状態") || strings.Contains(got, "Pod健全性スコア") {
+		t.Fatalf("Pod個別診断にクラスタ全体の表記が残っています: %q", got)
 	}
 }
 
@@ -143,5 +282,23 @@ func TestRootCauseExplainsDetectionRuleAndEvidence(t *testing.T) {
 	}
 	if strings.Contains(got, "根本原因:") {
 		t.Fatalf("概要に不自然なコロン連結が残っている: %q", got)
+	}
+}
+
+func TestRootCauseEvidenceLabelsAreReadable(t *testing.T) {
+	cases := []struct {
+		evidence model.Evidence
+		want     string
+	}{
+		{model.Evidence{Kind: "container", Key: "state"}, "コンテナの状態"},
+		{model.Evidence{Kind: "pod", Key: "phase"}, "Podの状態（phase）"},
+		{model.Evidence{Kind: "condition", Key: "Ready"}, "状態条件（condition） Ready"},
+		{model.Evidence{Kind: "node", Key: "node-a"}, "Node node-a の配置不可理由"},
+		{model.Evidence{Kind: "x509", Key: "notAfter"}, "証明書情報（notAfter）"},
+	}
+	for _, test := range cases {
+		if got := rootCauseEvidenceLabel(test.evidence); got != test.want {
+			t.Fatalf("根拠ラベル=%q, want %q", got, test.want)
+		}
 	}
 }

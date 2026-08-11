@@ -53,6 +53,15 @@ func TestRootCauseAvoidsDuplicateHealthPenalty(t *testing.T) {
 	}
 }
 
+func TestScopedScoreOverridesClusterPenaltyHealth(t *testing.T) {
+	state := NewState()
+	state.Add(NewFinding(Issue, "K8S.POD.ABNORMAL_STATE", "Pod", "Pod/ns/api", "CrashLoopBackOff", "app", "broken", 100))
+	state.SetScopedScore(ScopedScore{Kind: "Pod", Resource: "Pod/ns/api", Score: 58, Maximum: 100})
+	if got := state.Health(); got != 58 {
+		t.Fatalf("Pod総合スコアがHealthへ反映されない: %d", got)
+	}
+}
+
 func TestStateDeduplicatesSameFindingIDEvenWhenMessageChanges(t *testing.T) {
 	state := NewState()
 	state.Add(NewFinding(Warning, "K8S.TEST", "Test", "Pod/ns/app", "State", "stable", "1分継続", 70))

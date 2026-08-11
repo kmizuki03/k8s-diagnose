@@ -95,7 +95,7 @@ func Render(value any) ([]byte, error) {
 
 func Documents(namespace string) (map[string][]byte, error) {
 	if problems := validation.IsDNS1123Label(namespace); len(problems) > 0 {
-		return nil, fmt.Errorf("namespaceが不正です: %s", problems[0])
+		return nil, fmt.Errorf("Namespace名が不正です: %s", problems[0])
 	}
 	values := map[string]any{
 		"k8s-diagnose-role.yaml":                Reader(false, namespace),

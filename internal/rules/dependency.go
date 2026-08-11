@@ -16,7 +16,7 @@ type DependencyRule struct{}
 
 func (DependencyRule) Metadata() Metadata {
 	return Metadata{
-		ID: "dependencies", Section: "関連リソース", Description: "Podの必須Secret/ConfigMap/PVC/ServiceAccount参照",
+		ID: "dependencies", Section: "関連リソース", Description: "Podが必須参照するSecret・ConfigMap・PVC・ServiceAccount",
 		Required:    []string{"pods", "configmaps", "secrets", "pvcs", "serviceaccounts"},
 		Permissions: namespaced("", "pods,configmaps,secrets,persistentvolumeclaims,serviceaccounts"),
 		Modes:       []string{"all", "triage", "select"},
@@ -29,7 +29,7 @@ type PriorityClassDependencyRule struct{}
 
 func (PriorityClassDependencyRule) Metadata() Metadata {
 	return Metadata{
-		ID: "priority-class-dependencies", Section: "関連リソース", Description: "PodのPriorityClass参照",
+		ID: "priority-class-dependencies", Section: "関連リソース", Description: "Podが参照するPriorityClass",
 		Required: []string{"pods", "priorityclasses"}, Permissions: cluster("scheduling.k8s.io", "priorityclasses"),
 		Modes: []string{"all", "triage", "select"},
 	}
@@ -40,7 +40,7 @@ type RuntimeClassDependencyRule struct{}
 
 func (RuntimeClassDependencyRule) Metadata() Metadata {
 	return Metadata{
-		ID: "runtime-class-dependencies", Section: "関連リソース", Description: "PodのRuntimeClass参照",
+		ID: "runtime-class-dependencies", Section: "関連リソース", Description: "Podが参照するRuntimeClass",
 		Required: []string{"pods", "runtimeclasses"}, Permissions: cluster("node.k8s.io", "runtimeclasses"),
 		Modes: []string{"all", "triage", "select"},
 	}
@@ -99,7 +99,7 @@ func evaluateDependencies(snapshot *kube.Snapshot, allowed map[string]bool) []mo
 					findings = append(findings, model.NewFinding(
 						model.Warning, "K8S.DEPENDENCY.MISSING_IMAGE_PULL_SECRET", "関連リソース",
 						ref(dependency.Kind, dependency.Namespace, dependency.Name), "MissingImagePullSecret", dependency.Name,
-						fmt.Sprintf("Pod %s: imagePullSecret %sが存在しません (Node資格情報等でpullできる場合があるため警告扱い)", shortRef(pod.Namespace, pod.Name), dependency.Name), 85,
+						fmt.Sprintf("Pod %s が使用するimagePullSecret %q は存在しません。ただし、Node側の資格情報などでイメージを取得できる可能性があるため、警告として扱います", shortRef(pod.Namespace, pod.Name), dependency.Name), 85,
 						model.Evidence{Kind: "reference", Key: "source", Value: dependency.Source},
 						model.Evidence{Kind: "reference", Key: "pod", Value: ref("Pod", pod.Namespace, pod.Name)},
 					))
@@ -109,7 +109,7 @@ func evaluateDependencies(snapshot *kube.Snapshot, allowed map[string]bool) []mo
 					findings = append(findings, model.NewFinding(
 						model.Warning, "K8S.DEPENDENCY.EPHEMERAL_MISSING_OBJECT", "関連リソース",
 						ref(dependency.Kind, dependency.Namespace, dependency.Name), "EphemeralDependencyNotFound", dependency.Kind+"/"+dependency.Name,
-						fmt.Sprintf("Pod %s: Ephemeral Containerが参照する%s %sが存在しません (既存Podの稼働には影響しません)", shortRef(pod.Namespace, pod.Name), dependency.Kind, dependency.Name), 85,
+						fmt.Sprintf("Pod %s の一時デバッグ用コンテナ（Ephemeral Container）が参照する %s %q は存在しません。既存コンテナの稼働には影響しません", shortRef(pod.Namespace, pod.Name), dependency.Kind, dependency.Name), 85,
 						model.Evidence{Kind: "reference", Key: "source", Value: dependency.Source},
 						model.Evidence{Kind: "reference", Key: "pod", Value: ref("Pod", pod.Namespace, pod.Name)},
 					))
@@ -118,7 +118,7 @@ func evaluateDependencies(snapshot *kube.Snapshot, allowed map[string]bool) []mo
 				findings = append(findings, model.NewFinding(
 					model.Issue, "K8S.DEPENDENCY.MISSING_OBJECT", "関連リソース",
 					ref(dependency.Kind, dependency.Namespace, dependency.Name), "NotFound", dependency.Kind+"/"+dependency.Name,
-					fmt.Sprintf("Pod %s: 必須%s %sが存在しません", shortRef(pod.Namespace, pod.Name), dependency.Kind, dependency.Name), 100,
+					fmt.Sprintf("Pod %s が必須として参照している %s %q は存在しません", shortRef(pod.Namespace, pod.Name), dependency.Kind, dependency.Name), 100,
 					model.Evidence{Kind: "reference", Key: "source", Value: dependency.Source},
 					model.Evidence{Kind: "reference", Key: "pod", Value: ref("Pod", pod.Namespace, pod.Name)},
 				))
@@ -129,7 +129,7 @@ func evaluateDependencies(snapshot *kube.Snapshot, allowed map[string]bool) []mo
 					findings = append(findings, model.NewFinding(
 						model.Warning, "K8S.DEPENDENCY.EPHEMERAL_MISSING_KEY", "関連リソース",
 						ref(dependency.Kind, dependency.Namespace, dependency.Name), "EphemeralMissingKey", dependency.Name+"/"+dependency.Key,
-						fmt.Sprintf("Pod %s: Ephemeral Containerが参照する%s %sにキー %q が存在しません (既存Podの稼働には影響しません)", shortRef(pod.Namespace, pod.Name), dependency.Kind, dependency.Name, dependency.Key), 85,
+						fmt.Sprintf("Pod %s の一時デバッグ用コンテナ（Ephemeral Container）が参照する %s %q には、キー %q が存在しません。既存コンテナの稼働には影響しません", shortRef(pod.Namespace, pod.Name), dependency.Kind, dependency.Name, dependency.Key), 85,
 						model.Evidence{Kind: "reference", Key: "source", Value: dependency.Source},
 						model.Evidence{Kind: "reference", Key: "pod", Value: ref("Pod", pod.Namespace, pod.Name)},
 					))
@@ -138,7 +138,7 @@ func evaluateDependencies(snapshot *kube.Snapshot, allowed map[string]bool) []mo
 				findings = append(findings, model.NewFinding(
 					model.Issue, "K8S.DEPENDENCY.MISSING_KEY", "関連リソース",
 					ref(dependency.Kind, dependency.Namespace, dependency.Name), "MissingKey", dependency.Name+"/"+dependency.Key,
-					fmt.Sprintf("Pod %s: 必須%s %sにキー %q が存在しません", shortRef(pod.Namespace, pod.Name), dependency.Kind, dependency.Name, dependency.Key), 100,
+					fmt.Sprintf("Pod %s が必須として参照している %s %q には、キー %q が存在しません", shortRef(pod.Namespace, pod.Name), dependency.Kind, dependency.Name, dependency.Key), 100,
 					model.Evidence{Kind: "reference", Key: "source", Value: dependency.Source},
 					model.Evidence{Kind: "reference", Key: "pod", Value: ref("Pod", pod.Namespace, pod.Name)},
 				))
