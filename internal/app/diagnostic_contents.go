@@ -171,7 +171,11 @@ func diagnosticInputLabel(key string) string {
 	return "Kubernetes API情報「" + key + "」"
 }
 
-var diagnosticInputLabels = map[string]string{
+// diagnosticInputLabels maps collector input keys to their display labels. The
+// keys are Kubernetes resource names that must stay identical to the collector
+// keys, so "secrets" refers to the Secret resource kind and the value is a
+// screen label. No credential is stored here.
+var diagnosticInputLabels = map[string]string{ // #nosec G101 -- Kubernetes resource names and display labels, not credentials.
 	"pods":               "Pod一覧",
 	"all_pods":           "クラスタ内のPod一覧",
 	"nodes":              "Node一覧",
