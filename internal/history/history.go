@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/kmizuki03/k8s-diagnose/internal/jsonutil"
 	"github.com/kmizuki03/k8s-diagnose/internal/model"
 	"github.com/kmizuki03/k8s-diagnose/internal/report"
 	_ "modernc.org/sqlite"
@@ -260,7 +261,7 @@ func Append(ctx context.Context, path string, document report.Document, retain i
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO diagnostic_runs(
         generated_at, context_name, namespace_name, mode_name, document_json
-    ) VALUES(?,?,?,?,?)`, stringValue(document["generated_at"]), contextName, namespace, mode, string(payload)); err != nil {
+    ) VALUES(?,?,?,?,?)`, jsonutil.String(document["generated_at"]), contextName, namespace, mode, string(payload)); err != nil {
 		return false, fmt.Errorf("履歴DBへ保存できません: %w", err)
 	}
 	if retain < 1 {
@@ -335,7 +336,7 @@ func Analyze(previous []report.Document, current report.Document, window, flapTh
 			switch {
 			case findingSamples[index][key] != nil:
 				states[index] = "abnormal"
-			case evaluationUnavailable(samples[index], latest):
+			case jsonutil.EvaluationUnavailable(samples[index], latest):
 				states[index] = "unknown"
 				analysis.UnknownEvaluations++
 			default:
@@ -355,7 +356,7 @@ func Analyze(previous []report.Document, current report.Document, window, flapTh
 		for index, state := range states {
 			labels[index] = map[string]string{"abnormal": "異常", "normal": "正常", "unknown": "unknown"}[state]
 		}
-		resource, code := stringValue(latest["resource"]), stringValue(latest["code"])
+		resource, code := jsonutil.String(latest["resource"]), jsonutil.String(latest["code"])
 		analysis.Trends = append(analysis.Trends, Trend{
 			Type: "finding_flap", Code: "K8S.HISTORY.FINDING_FLAP", Resource: resource,
 			Confidence: 85, Transitions: transitions, States: states,
@@ -398,7 +399,7 @@ func Analyze(previous []report.Document, current report.Document, window, flapTh
 			continue
 		}
 		latest := records[len(records)-1]
-		resource, container := stringValue(latest["resource"]), stringValue(latest["container"])
+		resource, container := jsonutil.String(latest["resource"]), jsonutil.String(latest["container"])
 		textCounts := make([]string, len(counts))
 		for index, count := range counts {
 			textCounts[index] = strconv.Itoa(count)
@@ -407,7 +408,7 @@ func Analyze(previous []report.Document, current report.Document, window, flapTh
 			Type: "restart_growth", Code: "K8S.HISTORY.RESTART_GROWTH", Resource: resource,
 			Confidence: 95, Growth: growth,
 			Message:  fmt.Sprintf("%s: コンテナ %s のrestartCountが直近%d回で %d→%d に増加", resource, container, len(counts), counts[0], counts[len(counts)-1]),
-			Evidence: []string{"restartCounts=" + strings.Join(textCounts, "→"), "podUID=" + stringValue(latest["pod_uid"])},
+			Evidence: []string{"restartCounts=" + strings.Join(textCounts, "→"), "podUID=" + jsonutil.String(latest["pod_uid"])},
 		})
 	}
 	sort.Slice(analysis.Trends, func(i, j int) bool {
@@ -432,20 +433,20 @@ func AddFindings(state *model.State, analysis Analysis) {
 
 func targetKey(document report.Document) (string, string, string) {
 	target, _ := document["target"].(map[string]any)
-	return stringValue(target["context"]), stringValue(target["namespace"]), stringValue(target["mode"])
+	return jsonutil.String(target["context"]), jsonutil.String(target["namespace"]), jsonutil.String(target["mode"])
 }
 
 func stateKey(document report.Document) string {
 	stable := map[string]any{"summary": document["summary"], "observations": document["observations"]}
 	findings := []map[string]any{}
-	for _, finding := range objects(document["findings"]) {
+	for _, finding := range jsonutil.Objects(document["findings"]) {
 		findings = append(findings, map[string]any{
 			"id": finding["id"], "severity": finding["severity"], "confidence": finding["confidence"], "acknowledged": finding["acknowledged"],
 		})
 	}
 	stable["findings"] = findings
 	roots := []map[string]any{}
-	for _, root := range objects(document["root_causes"]) {
+	for _, root := range jsonutil.Objects(document["root_causes"]) {
 		cause, _ := root["cause"].(map[string]any)
 		value := map[string]any{
 			"id": root["id"], "confirmed": root["confirmed"], "classification": root["classification"],
@@ -455,7 +456,7 @@ func stateKey(document report.Document) string {
 		}
 		compactImpacts := func(raw any) []map[string]any {
 			result := []map[string]any{}
-			for _, impact := range objects(raw) {
+			for _, impact := range jsonutil.Objects(raw) {
 				result = append(result, map[string]any{
 					"resource": impact["resource"], "kind": impact["kind"], "relation": impact["relation"], "depth": impact["depth"],
 					"finding_ids": impact["finding_ids"], "path": impact["path"], "path_relations": impact["path_relations"],
@@ -474,9 +475,9 @@ func stateKey(document report.Document) string {
 
 func activeFindingMap(document report.Document) map[string]map[string]any {
 	result := map[string]map[string]any{}
-	for _, finding := range objects(document["findings"]) {
-		code, resource := stringValue(finding["code"]), stringValue(finding["resource"])
-		if code == "" || resource == "" || strings.HasPrefix(code, "K8S.HISTORY.") || stringValue(finding["severity"]) == "unavailable" || boolValue(finding["acknowledged"]) {
+	for _, finding := range jsonutil.Objects(document["findings"]) {
+		code, resource := jsonutil.String(finding["code"]), jsonutil.String(finding["resource"])
+		if code == "" || resource == "" || strings.HasPrefix(code, "K8S.HISTORY.") || jsonutil.String(finding["severity"]) == "unavailable" || jsonutil.Bool(finding["acknowledged"]) {
 			continue
 		}
 		result[code+"\x00"+resource] = finding
@@ -484,61 +485,13 @@ func activeFindingMap(document report.Document) map[string]map[string]any {
 	return result
 }
 
-func unavailableFindings(document report.Document) map[string][]map[string]any {
-	result := map[string][]map[string]any{}
-	for _, finding := range objects(document["findings"]) {
-		if stringValue(finding["severity"]) == "unavailable" && stringValue(finding["section"]) != "" {
-			section := stringValue(finding["section"])
-			result[section] = append(result[section], finding)
-		}
-	}
-	return result
-}
-
-func evaluationUnavailable(document report.Document, finding map[string]any) bool {
-	section := stringValue(finding["section"])
-	if section == "" {
-		return false
-	}
-	blockers := unavailableFindings(document)[section]
-	ruleID := stringValue(finding["rule_id"])
-	if ruleID == "" {
-		return len(blockers) > 0 // 旧snapshotとの互換フォールバック
-	}
-	for _, blocker := range blockers {
-		blockerRule := stringValue(blocker["rule_id"])
-		if blockerRule == "" {
-			blockerRule = strings.TrimPrefix(stringValue(blocker["resource"]), "Rule/")
-		}
-		if blockerRule == ruleID {
-			return true
-		}
-	}
-	return false
-}
-
 func restartMap(document report.Document) map[string]map[string]any {
 	observations, _ := document["observations"].(map[string]any)
 	result := map[string]map[string]any{}
-	for _, value := range objects(observations["pod_restarts"]) {
-		if id := stringValue(value["id"]); id != "" {
+	for _, value := range jsonutil.Objects(observations["pod_restarts"]) {
+		if id := jsonutil.String(value["id"]); id != "" {
 			result[id] = value
 		}
-	}
-	return result
-}
-
-func objects(value any) []map[string]any {
-	result := []map[string]any{}
-	switch values := value.(type) {
-	case []any:
-		for _, item := range values {
-			if object, ok := item.(map[string]any); ok {
-				result = append(result, object)
-			}
-		}
-	case []map[string]any:
-		return values
 	}
 	return result
 }
@@ -552,18 +505,6 @@ func expandPath(path string) (string, error) {
 		path = filepath.Join(home, strings.TrimPrefix(path, "~/"))
 	}
 	return filepath.Abs(path)
-}
-
-func stringValue(value any) string {
-	if value == nil {
-		return ""
-	}
-	return fmt.Sprint(value)
-}
-
-func boolValue(value any) bool {
-	result, _ := value.(bool)
-	return result
 }
 
 func intValue(value any) int {

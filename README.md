@@ -21,51 +21,130 @@ Kubeconfigの`exec` credential pluginを使っている場合は、そのplugin�
 ## 2. ビルドと起動
 
 ```bash
-go build -trimpath -o k8s-diagnose .
+make build
 ./k8s-diagnose --version
 ./k8s-diagnose --help
 ```
 
-Makeを使う場合:
+`make build`はGit tag（tagがなければcommit hash、変更中は`-dirty`付き）をバイナリへ注入します。直接ビルドする場合は次のように同じ値を渡せます。
 
 ```bash
-make build
+VERSION=$(./scripts/version.sh)
+go build -trimpath \
+  -ldflags "-s -w -X github.com/kmizuki03/k8s-diagnose/internal/config.Version=$VERSION" \
+  -o k8s-diagnose .
+
 make test
+make clean   # ルートのk8s-diagnoseだけを削除
+make fclean  # 上記に加えdist、ルート直下のDB・coverage・*.outを削除
+make re      # fclean後にバイナリを再ビルド
 ```
 
-## 3. 最初に試すコマンド
+`make` / `make build`は、Goソース、`go.mod`、`go.sum`、バージョンスクリプト、Makefileのいずれにも変更がなければ再リンクしません。既存バイナリを必ず作り直す場合は`make re`を使用します。
+
+CIや配布工程で明示的なバージョンを使う場合は、クリーンな環境で`K8S_DIAGNOSE_VERSION=v3.0.0 make build`を実行します。既存バイナリがある環境でバージョンだけを変えて作り直す場合は、`K8S_DIAGNOSE_VERSION=v3.0.0 make re`を使用してください。
+
+### 実運用向けの配布物を作る
 
 ```bash
-# 全namespaceの通常診断
-./k8s-diagnose -a
+make package
 
-# prod namespaceのみ
+# Linux AMD64向けを明示して作る例
+GOOS=linux GOARCH=amd64 K8S_DIAGNOSE_VERSION=v3.0.0 make package
+```
+
+生成物はGit管理外の`dist/releases/`へまとめられます。
+
+```text
+dist/releases/k8s-diagnose_VERSION_OS_ARCH/
+├── k8s-diagnose              # Windowsではk8s-diagnose.exe
+├── README.md
+├── VERSION
+├── CONTENTS.txt
+├── k8s-diagnose.ini
+├── baseline.example.ini
+├── log-signatures.example.ini
+└── rbac/
+```
+
+同じ内容の`tar.gz`とSHA-256ファイルも生成します。配布ディレクトリにはGoソース、`*_test.go`、CI定義、レビュー資料、開発スクリプトを含めません。`*_test.go`は配布バイナリには元々組み込まれませんが、ソースリポジトリでは回帰検査に必要で、Goでは対象パッケージと同じ場所に置くため追跡を継続します。
+
+個人用の設計メモやレビュー原稿は`.local/notes/`へ置きます。`.local/`全体はGit管理外です。生成済み配布物を作り直す場合は、`make fclean`の後に`make package`を実行してください。
+
+## 3. 説明書を読まずに始める
+
+使う人に合わせて、同じ診断エンジンへ3つの入口を用意しています。
+
+### 初めて・久しぶり: 引数なしの対話メニュー
+
+```bash
+./k8s-diagnose
+```
+
+引数なしで対話端末から実行すると、まず診断対象を選ぶ画面が開きます。`↑` / `↓`とEnterまたは`→`で操作でき、選んだモードで利用できる追加機能だけを次に表示します。戻る操作は`b`だけに統一しています。値入力画面では`b`と入力してEnterを押すと直前の項目へ戻り、`q`はメニューを終了します。
+
+```text
+何を診断しますか？
+  クラスタ全体
+  Podを1つ選んで詳しく
+  Pod一覧だけ
+  quick / ci / deep
+  設定を変更する
+```
+
+例えばPod個別を選んだ場合だけ接続確認とdebugを提示し、接続確認を有効にした場合だけローカルポートとHTTPパスを尋ねます。全体診断ではPod個別専用の接続確認を表示しません。したがって、無効な組み合わせを覚えて避ける必要がありません。パイプ入力など対話端末でない引数なし実行は、後方互換のため従来どおり`all`として実行します。
+
+### 慣れた人: 1語のプリセット
+
+```bash
+./k8s-diagnose quick   # 短時間のtriage、text、一度だけ
+./k8s-diagnose ci      # triage、JSON、確定異常でexit 1
+./k8s-diagnose deep    # 全体診断＋失敗Podログ＋未使用候補
+```
+
+対象などは通常のフラグで上書きできます。
+
+```bash
+./k8s-diagnose quick -n prod
+./k8s-diagnose ci --output-file result.json
+./k8s-diagnose deep --no-cmd
+```
+
+### 上級者・CI: モード別コマンドまたは従来フラグ
+
+```bash
+# モード名を直接指定
+./k8s-diagnose all --logs --unused
+./k8s-diagnose pod --connect --connect-path /ready
+./k8s-diagnose list -n prod
+./k8s-diagnose triage --output sarif --output-file result.sarif
+
+# 従来形式もそのまま利用可能
 ./k8s-diagnose -a -n prod
-
-# CI向けの短時間診断とJSON保存
 ./k8s-diagnose --triage --output json --output-file result.json
-
-# Pod名の一部を入力して個別診断
-./k8s-diagnose -s -n prod
-
-# Probeと非HTTP TCPポートを単発確認
+./k8s-diagnose -s
 ./k8s-diagnose -s -n prod --connect
+```
 
-# 前回結果と比較
-./k8s-diagnose -a --save-snapshot before.json --exit-zero
-./k8s-diagnose -a --diff before.json
+ヘルプも段階化されています。ルートの`--help`は入口だけを短く表示し、各コマンドのhelpは関係するオプションだけを表示します。全フラグのリファレンスは`advanced`にあります。
+
+```bash
+./k8s-diagnose --help
+./k8s-diagnose pod --help
+./k8s-diagnose all --help
+./k8s-diagnose advanced --help
 ```
 
 ## 4. 診断モード
 
-| モード | 指定 | 用途 |
-|---|---|---|
-| 全体診断 | `-a`, `--all` | Pod一覧、全ルール、Root Cause、Health/Coverage |
-| Pod選択 | `-s`, `--select` | namespace/Pod名の部分検索、番号選択、ログ、任意の接続確認/debug |
-| Pod一覧 | `-p`, `--list`, `--pods` | Pod表と件数だけを取得。Pod API以外は要求しない |
-| トリアージ | `--triage` | CIや初動向けのコンパクトな診断 |
+| モード | 分かりやすい指定 | 従来指定 | 用途 |
+|---|---|---|---|
+| 全体診断 | `all` | `-a`, `--all` | Pod一覧、全ルール、Root Cause、Health/Coverage |
+| Pod選択 | `pod` | `-s`, `--select` | 一覧上でNamespace検索とPod名検索を個別編集し、上下矢印＋Enterで選択。ログ、任意の接続確認/debug |
+| Pod一覧 | `list` | `-p`, `--list`, `--pods` | Pod表と件数だけを取得。Pod API以外は要求しない |
+| トリアージ | `triage` | `--triage` | CIや初動向けのコンパクトな診断 |
 
-モードは同時に1つだけ指定できます。未指定時は`-a`です。
+モードは同時に1つだけ指定できます。引数なしの対話端末ではガイドを表示し、非対話環境での未指定時は`all`です。`quick` / `ci` / `deep`は上表のモードへ安全な設定一式を重ねるプリセットです。
 
 ## 5. オプション一覧
 
@@ -106,7 +185,8 @@ make test
 |---|---:|---|
 | `--tail N` | `30` | text表示ログ行数。明示指定は`-s`または`-a --logs` |
 | `--no-mask` | mask有効 | 対話端末のtext出力だけマスクを無効化。pipe/redirectおよび永続出力との組み合わせはエラー |
-| `--cmd`, `--no-cmd` | 表示 | text出力で実行したKubernetes API method/pathの表示切替 |
+| `--cmd`, `--no-cmd` | 表示 | text出力で、各診断項目の見出し直後・結果本文の前に等価kubectlコマンドを表示／非表示 |
+| `--api-requests`, `--no-api-requests` | 表示 | text出力末尾の「実行したKubernetes API要求」を表示／非表示。INIでは`[display] show_api_requests = false` |
 | `-w, --watch SEC` | 無効 | `-a` / `--triage`の定期実行。1以上 |
 | `--exit-zero` | 無効 | 所見があってもexit 0。引数/API/保存/通知エラーは1。`--list`では使用不可 |
 | `--output FORMAT` | `text` | `text`, `json`, `sarif`, `junit`, `mermaid`, `dot` |
@@ -116,7 +196,8 @@ make test
 | `--baseline FILE` | 無し | 期限・理由付き承認所見INI。`-a` / `-s` / `--triage` |
 | `--fail-on LEVEL` | `issue` | `issue`, `warning`, `unavailable`, `any`, `none`。明示指定は`-a` / `--triage` |
 | `--max-issues N` | 無し | fail-on対象所見の許容件数。`-a` / `--triage` |
-| `--config FILE` | 無し | INI設定ファイル |
+| `--config FILE` | `./k8s-diagnose.ini`（存在時） | 別のINI設定ファイルを指定。Go標準`flag`互換の`-config FILE` / `-config=FILE`も受理 |
+| `--no-config` | 無効 | カレントディレクトリの`k8s-diagnose.ini`を自動読込しない |
 | `--version` |  | バージョン表示 |
 
 `--output-file`、`--save-snapshot`、`--history-db`は互いに別ファイルへ保存してください。また、設定・差分・baseline・ログシグネチャ・明示指定したkubeconfigと同じ実体（symlink / hard linkを含む）は、入力ファイルの上書きを防ぐため拒否します。
@@ -144,7 +225,9 @@ Webhook URLはHTTPS必須、userinfo/fragment/制御文字禁止です。HTTP 3x
 
 ### 端末表示と色
 
-対話端末では`--help`と診断結果をANSIカラーで表示します。Pod一覧は正常Podを緑2色のゼブラ、待機・要注意を黄色、確定異常を赤で表示します。Root Causeは確定を赤、原因候補を黄色、関連候補を紫、修正候補を明るい緑で強調します。
+対話端末では`--help`と診断結果をANSIカラーで表示します。Pod一覧は正常Podを緑2色のゼブラ、待機・要注意を黄色、確定異常を赤で表示します。Root Causeは確定を赤、原因候補を黄色、要確認を紫、修正候補を明るい緑で強調します。
+
+引数なしのガイド、設定エディタ、`-s`のPod選択はすべて`↑` / `↓`とEnterまたは`→`で操作します。複数選択ではSpaceまたはEnterでチェックを切り替えます。戻るキーは`b`、終了キーは`q`です。戻るための選択行は表示しません。Pod選択では、一覧を表示したまま`n`でNamespace、`/`または`f`でPod名を検索でき、`r`で両方を続けて編集、`c`で条件消去できます。対話端末では選択UI全体を代替スクリーンへ描画するため、決定・終了後は一覧と操作案内を消して元の画面へ戻してから診断結果を表示します。Pod数やメニュー項目が端末高を超える場合は、選択行を中心に表示範囲を自動スクロールします。
 
 パイプ、ファイルredirect、構造化出力ではANSIコードを自動的に出しません。端末でも色を止める場合は標準の`NO_COLOR`を設定してください。
 
@@ -172,7 +255,7 @@ Kubernetes timestampを使う経過時間判定（Pod/Pending/Namespace/LoadBala
 
 ResourceQuotaは90%以上100%未満をcandidate、hard到達時をwarningとして扱います。CPU/Memoryの実使用量は`metrics.k8s.io`から取得し、`kubectl top`相当のNode一覧とCPU上位10 Podを表示します。metrics-server未導入、RBAC拒否、API障害はクラスタ異常ではなく診断不能として扱い、Node/PodそれぞれのCoverageだけを下げます。これはrequests/allocatableを使うScheduling診断とは別機能です。
 
-Service endpoint判定はEndpointSliceを主経路にします。core/v1 EndpointsはKubernetes v1.33以降deprecatedですが、EndpointSlice取得不能時や旧環境との互換性のためread-only fallbackとしてのみ保持しています。名前付き`targetPort`はKubernetes本体と同様に通常コンテナとrestartable init sidecarだけを対象とし、Serviceと`containerPort`のprotocol一致も確認します。UDP/SCTP ServiceをTCP接続確認へ流用しません。
+Service endpoint判定はEndpointSliceを主経路にします。core/v1 EndpointsはKubernetes v1.33以降deprecatedですが、EndpointSlice取得不能時や旧環境との互換性のためread-only fallbackとしてのみ保持しています。名前付き`targetPort`はKubernetes本体と同様に通常コンテナとrestartable init sidecarだけを対象とし、Serviceと`containerPort`のprotocol一致も確認します。名前解決に失敗した場合は、Serviceポート、selector、一致したPod、Pod側に存在する同protocolのcontainerPort名、EndpointSliceでの確認結果を検出根拠として表示します。UDP/SCTP ServiceをTCP接続確認へ流用しません。
 
 ## 7. Root Causeとスコア
 
@@ -191,7 +274,7 @@ Job → CronJob
 Service → Admission Webhook
 ```
 
-確信度90%以上を「根本原因」、60〜89%を「原因候補」、60%未満を「関連候補 / 要確認」と表示します。Healthは同一根本原因の波及症状を重複減点しません。Coverageはクラスタの健全性ではなく、実施できた診断ルールの割合です。
+確信度90%以上を「根本原因」、60〜89%を「原因候補」、60%未満を「関連候補 / 要確認」と表示します。各Root Causeの詳細には、判定ルール、対象リソース、照合に使用した設定値や状態を「検出理由・根拠」として表示します。Healthは同一根本原因の波及症状を重複減点しません。Coverageはクラスタの健全性ではなく、実施できた診断ルールの割合です。text出力ではHealthとCoverageを別々の横棒ゲージとして表示し、HealthのA〜D評価、Coverageの確認済み件数、重大度別の所見件数を同じスコアカード内で確認できます。
 
 ## 8. 接続確認の仕様
 
@@ -223,13 +306,39 @@ Service → Admission Webhook
 
 ## 10. 設定ファイル
 
-[`k8s-diagnose.ini`](./k8s-diagnose.ini)に全設定例があります。
+[`k8s-diagnose.ini`](./k8s-diagnose.ini)に全設定例があります。カレントディレクトリにこの名前の通常ファイルがあれば、`--config`を書かなくても自動で読み込みます。
 
 ```bash
+# 対話で現在値を確認し、同じINIへ保存
+./k8s-diagnose config
+
+# 指定したINIを対話編集（存在しなければ新規作成）
+./k8s-diagnose config --config ./team.ini
+
+# 組み込み既定値から新規作成
+./k8s-diagnose config --no-config
+
+# ファイルを手編集して明示使用する方法も継続
 ./k8s-diagnose --config ./k8s-diagnose.ini
+
+# 一時的に自動読込を無効化
+./k8s-diagnose quick --no-config
 ```
 
-INIの設定後にCLI引数を解析するため、同一項目はCLIが優先します。未知のsection/keyは無視せずエラーにします。
+設定エディタでは、最初に「対象・API」「診断」「接続確認」「表示」「レポート・CI」「履歴」「通知」へ分類し、選んだカテゴリの値だけを表示します。空Enterは変更なし、`-`はその項目を組み込み既定値へ戻します。保存は一時ファイルへの書込み・同期後にrenameするatomic方式で、権限は`0600`です。
+
+対話編集とファイル直編集はどちらも同じ設定カタログ・値パーサ・組み合わせ検証を通ります。未知のsection/key、壊れた引用符、モード上意味を持たない組み合わせは無視せずエラーにします。対話保存では空白、`#`、`;`、引用符を含む値を安全に再読込できるよう引用して記録します。
+
+設定の優先順位は次のとおりです。後ろほど優先されます。
+
+```text
+組み込み既定値
+  → ./k8s-diagnose.ini（または--config FILE）
+    → quick / ci / deepなどのプリセット
+      → 明示したCLIフラグ
+```
+
+このため、一度INIへ保存したnamespaceやAPI設定は次回から自動で効きつつ、`quick -n staging`のような一時上書きもできます。
 
 ## 11. Baselineとログシグネチャ
 
@@ -242,7 +351,17 @@ Baselineは所見を削除しません。`acknowledged=true`、理由、期限�
 
 ## 12. 実際に使用するAPIと対応kubectlコマンド
 
-Go版の通常診断は`kubectl`コマンドを起動しません。下表の「対応kubectl」は、client-goが行うAPI要求と同等の内容を人が手動確認するためのコマンドです。`--cmd`の表示はコマンドを作り直さず、実際に送ったHTTP method/path/queryを示します。
+Go版の通常診断は`kubectl`コマンドを起動しません。下表の「対応kubectl」は、client-goが行うAPI要求と同等の内容を人が手動確認するためのコマンドです。既定の`--cmd`表示では、冒頭へ一括表示せず、Pod一覧、メトリクス、Warning Event、ログ、個別所見、接続確認など、対応する診断項目の見出し直後・結果本文の前に必要なコマンドだけを表示します。説明ラベルは挟まず、`$ kubectl ...`をそのまま表示します。個別所見が具体的なリソースを示す場合は、例えば`kubectl get pod NAME -n NAMESPACE -o json`のように対象を絞ります。
+
+client-goが実際に送ったHTTP method/path/queryは、診断結果を読み終えた後の技術情報「実行したKubernetes API要求」として末尾に表示します。この項目だけを消す場合は`--no-api-requests`、常時消す場合は設定ファイルへ次を記述します。確認用kubectlの表示は`show_commands`で独立して制御できます。従来の設定との互換性のため、`show_api_requests`を省略した古いINIでは`show_commands`の値を実API要求にも引き継ぎます。
+
+```ini
+[display]
+show_commands = true
+show_api_requests = false
+```
+
+`--context`、`--kubeconfig`、`--timeout`、namespace、Listの`--chunk-size`は確認用コマンドへ反映されます。いずれも表示するだけで自動実行はしません。
 
 namespace指定時は`-A`を`-n NAMESPACE`に置き換えてください。Listは全て`--chunk-size`/継続token相当のページングを使います。
 
@@ -250,9 +369,9 @@ namespace指定時は`-A`を`-n NAMESPACE`に置き換えてください。List�
 |---|---|---|
 | 接続・Pod権限のpreflight | `GET /api/v1/pods?fieldSelector=metadata.name%3D__k8s_diagnose_preflight__&limit=1` | `kubectl get pods -A --field-selector=metadata.name=__k8s_diagnose_preflight__ -o name` |
 | Pod | core/v1 `pods` | `kubectl get pods -A -o json` |
-| Pod実使用量 | metrics.k8s.io/v1beta1 `pods` | `kubectl top pods -A` |
+| Pod実使用量 | metrics.k8s.io/v1beta1 `pods` | `kubectl get --raw='/apis/metrics.k8s.io/v1beta1/pods'`（namespace指定時は`.../namespaces/NAMESPACE/pods`） |
 | Node | core/v1 `nodes` | `kubectl get nodes -o json` |
-| Node実使用量 | metrics.k8s.io/v1beta1 `nodes` | `kubectl top nodes` |
+| Node実使用量 | metrics.k8s.io/v1beta1 `nodes` | `kubectl get --raw='/apis/metrics.k8s.io/v1beta1/nodes'` |
 | Node heartbeat | coordination.k8s.io/v1 `leases` (`kube-node-lease`) | `kubectl get leases.coordination.k8s.io -n kube-node-lease -o json` |
 | Service | core/v1 `services` | `kubectl get services -A -o json` |
 | legacy Endpoint fallback | core/v1 `endpoints` | `kubectl get endpoints -A -o json` |
@@ -285,10 +404,12 @@ namespace指定時は`-A`を`-n NAMESPACE`に置き換えてください。List�
 | aggregated API | apiregistration.k8s.io/v1 `apiservices` | `kubectl get apiservices.apiregistration.k8s.io -o json` |
 | CRD | apiextensions.k8s.io/v1 `customresourcedefinitions` | `kubectl get customresourcedefinitions.apiextensions.k8s.io -o json` |
 | API Server health | `GET /readyz?verbose`, `GET /livez?verbose` | `kubectl get --raw='/readyz?verbose'`, `kubectl get --raw='/livez?verbose'` |
-| current/previous log | Pod log subresource | `kubectl logs POD -n NS -c CONTAINER --tail=N` / `--previous` |
+| current/previous log | Pod log subresource | `kubectl logs POD -n NS -c CONTAINER --tail=N` / `--previous`（全コンテナを個別表示） |
 | port-forward | `POST .../pods/POD/portforward` (SPDY) | `kubectl port-forward pod/POD LOCAL:REMOTE -n NS` |
 
 Secret APIは値も返しますが、Go版は取得直後に通常Secretをキー名集合へ射影します。TLS Secretは`tls.crt`のみ証明書解析用に保持し、レポートへ証明書バイトを出力しません。
+
+ログはコンテナごとに末尾最大512KiBを保持して解析・表示します。Pod全体を1つの512KiBへ切り詰めないため、マルチコンテナPodでも後方のコンテナによって先頭コンテナのログが消えません。
 
 `--debug`のみ、次の外部コマンドをargv配列で実行します。shellは介しません。
 
@@ -332,6 +453,15 @@ Secretのオブジェクト/キー確認とTLS診断には`get/list secrets`が�
 ```bash
 # unit / regression
 go test ./...
+
+# fuzz corpusの通常回帰実行（go test ./...にも含まれる）
+go test ./internal/config ./internal/redact ./internal/report ./internal/rules
+
+# 任意: 各fuzz targetを実際に探索
+go test ./internal/redact -run=^$ -fuzz=FuzzMaskSecrets -fuzztime=30s
+go test ./internal/config -run=^$ -fuzz=FuzzLoadINI -fuzztime=30s
+go test ./internal/report -run=^$ -fuzz=FuzzDecodeDocument -fuzztime=30s
+go test ./internal/rules -run=^$ -fuzz=FuzzLoadLogAnalyzer -fuzztime=30s
 
 # data race
 go test -race ./...
@@ -402,12 +532,13 @@ k8s-diagnose/
 ├─ main.go                    CLI entrypoint / signal handling
 ├─ cmd/rbac/                  RBAC manifest generator
 ├─ internal/
-│  ├─ app/                  mode orchestration
+│  ├─ app/                  mode orchestration + guided menu/settings UI
 │  ├─ baseline/             acknowledgement rules
 │  ├─ config/               CLI + INI + validation + help
 │  ├─ connect/              typed port-forward + HTTP/TCP probes
 │  ├─ console/              color, display width, zebra, masking
 │  ├─ history/              Python-compatible SQLite + trends
+│  ├─ jsonutil/             report/history共通のJSON accessor・unknown判定
 │  ├─ kube/                  client-go, paging, collection, errors
 │  ├─ model/                 Finding / State / RootCause
 │  ├─ notify/                no-redirect HTTPS webhook

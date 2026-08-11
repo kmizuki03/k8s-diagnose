@@ -22,6 +22,7 @@ func (runner *Runner) renderMetrics(snapshot *kube.Snapshot, state *model.State)
 	runner.Console.Chapter("リソース使用量 (上位)")
 	if nodeTracked {
 		runner.Console.Section("Node")
+		runner.renderCommandsForKeys(snapshot, "node_metrics")
 		if snapshot.Available("node_metrics") {
 			rows := nodeMetricRows(snapshot)
 			if len(rows) == 0 {
@@ -35,6 +36,7 @@ func (runner *Runner) renderMetrics(snapshot *kube.Snapshot, state *model.State)
 	}
 	if podTracked {
 		runner.Console.Section("Pod (CPU上位10)")
+		runner.renderCommandsForKeys(snapshot, "pod_metrics")
 		if snapshot.Available("pod_metrics") {
 			rows := podMetricRows(snapshot.PodMetrics, 10)
 			if len(rows) == 0 {
@@ -55,28 +57,28 @@ func renderMetricUnavailable(runner *Runner, state *model.State, code, descripti
 			return
 		}
 	}
-	runner.Console.Write(fmt.Sprintf("  ? [メトリクス] %sを取得できません (%s)", description, fetchStatusText(status)))
+	runner.Console.Write(fmt.Sprintf("  ? [メトリクス] %sを取得できませんでした。原因: %s", description, fetchStatusText(status)))
 }
 
 func fetchStatusText(status kube.FetchStatus) string {
 	switch status.Status {
 	case kube.StatusNotFound:
-		return "API未提供 (NotFound)"
+		return "Metrics APIが提供されていません (NotFound)"
 	case kube.StatusUnavailable:
-		return "API到達不能"
+		return "Kubernetes APIに到達できません"
 	case kube.StatusForbidden:
-		return "RBAC Forbidden"
+		return "アクセス権限がありません (RBAC)"
 	case kube.StatusUnauthorized:
-		return "Unauthorized"
+		return "認証が必要です"
 	case kube.StatusTimeout:
-		return "タイムアウト"
+		return "要求がタイムアウトしました"
 	case kube.StatusInvalid:
-		return "API要求不正"
+		return "API要求が不正です"
 	default:
 		if status.Reason != "" {
 			return status.Reason
 		}
-		return "APIエラー"
+		return "Kubernetes APIでエラーが発生しました"
 	}
 }
 

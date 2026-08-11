@@ -83,6 +83,7 @@ func TestHelpListsEverySpecializedOptionAndSupportsColor(t *testing.T) {
 	for _, option := range []string{
 		"--config", "--log-signature-lines", "--debug-image", "--debug-profile",
 		"--webhook-url-env", "--version", "--connect-port/path", "--node-heartbeat-timeout",
+		"--no-api-requests",
 	} {
 		if !strings.Contains(plain, option) {
 			t.Fatalf("helpに%sがない", option)
@@ -116,6 +117,7 @@ func TestModeAndStructuredOutputCombinations(t *testing.T) {
 		{"-a", "--events-limit", "10", "--output", "json"},
 		{"-a", "--no-mask", "--output", "json"},
 		{"-a", "--no-cmd", "--output", "json"},
+		{"-a", "--no-api-requests", "--output", "json"},
 	} {
 		if _, err := Parse(args, "k8s-diagnose"); err == nil {
 			t.Fatalf("構造化出力で意味を持たない指定が受理された: %v", args)
@@ -123,6 +125,57 @@ func TestModeAndStructuredOutputCombinations(t *testing.T) {
 	}
 	if _, err := Parse([]string{"--help"}, "k8s-diagnose"); !errors.Is(err, ErrHelp) {
 		t.Fatalf("--helpの結果=%v", err)
+	}
+}
+
+func TestAPIRequestDisplayCanBeControlledIndependently(t *testing.T) {
+	cfg, err := Parse([]string{"-a", "--no-api-requests"}, "k8s-diagnose")
+	if err != nil || !cfg.ShowCmd || cfg.ShowAPIRequests {
+		t.Fatalf("実API要求だけを非表示にできない: cfg=%#v err=%v", cfg, err)
+	}
+
+	cfg, err = Parse([]string{"-a", "--no-cmd"}, "k8s-diagnose")
+	if err != nil || cfg.ShowCmd || cfg.ShowAPIRequests {
+		t.Fatalf("従来の--no-cmd互換で両方を非表示にできない: cfg=%#v err=%v", cfg, err)
+	}
+
+	cfg, err = Parse([]string{"-a", "--no-cmd", "--api-requests"}, "k8s-diagnose")
+	if err != nil || cfg.ShowCmd || !cfg.ShowAPIRequests {
+		t.Fatalf("実API要求を明示指定で独立表示できない: cfg=%#v err=%v", cfg, err)
+	}
+
+	if _, err := Parse([]string{"-a", "--api-requests", "--no-api-requests"}, "k8s-diagnose"); err == nil {
+		t.Fatal("実API要求の相反する表示指定を受理した")
+	}
+}
+
+func TestAPIRequestINISettingIsOrderIndependentAndBackwardCompatible(t *testing.T) {
+	for _, body := range []string{
+		"[display]\nshow_commands = false\nshow_api_requests = true\n",
+		"[display]\nshow_api_requests = true\nshow_commands = false\n",
+	} {
+		path := filepath.Join(t.TempDir(), "settings.ini")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Parse([]string{"--config", path}, "k8s-diagnose")
+		if err != nil || cfg.ShowCmd || !cfg.ShowAPIRequests {
+			t.Fatalf("INI設定順で表示設定が変化した: body=%q cfg=%#v err=%v", body, cfg, err)
+		}
+	}
+
+	legacyPath := filepath.Join(t.TempDir(), "legacy.ini")
+	if err := os.WriteFile(legacyPath, []byte("[display]\nshow_commands = false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := Parse([]string{"--config", legacyPath}, "k8s-diagnose")
+	if err != nil || legacy.ShowCmd || legacy.ShowAPIRequests {
+		t.Fatalf("旧INIのshow_commands互換を維持できない: cfg=%#v err=%v", legacy, err)
+	}
+
+	edited, err := Defaults().WithSetting("display.show_api_requests", "false")
+	if err != nil || !edited.ShowCmd || edited.ShowAPIRequests || !edited.SettingExplicit("display.show_api_requests") {
+		t.Fatalf("対話設定と共通の設定経路で実API要求を消せない: cfg=%#v err=%v", edited, err)
 	}
 }
 
@@ -220,6 +273,25 @@ func TestConfigCanOnlyBeSpecifiedOnce(t *testing.T) {
 	}
 }
 
+func TestSingleDashConfigLoadsINI(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.ini")
+	if err := os.WriteFile(path, []byte("[target]\nnamespace = production\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{{"-config", path}, {"-config=" + path}} {
+		cfg, err := Parse(args, "k8s-diagnose")
+		if err != nil {
+			t.Fatalf("flagパッケージが受理する-config形式を読み込めない: %v", err)
+		}
+		if cfg.Namespace != "production" || !filepath.IsAbs(cfg.ConfigFile) {
+			t.Fatalf("-configのINIが反映されていない: %#v", cfg)
+		}
+	}
+	if _, err := Parse([]string{"-config", path, "--config", path}, "k8s-diagnose"); err == nil || !strings.Contains(err.Error(), "1回だけ") {
+		t.Fatalf("異なる表記によるconfig重複を拒否しない: %v", err)
+	}
+}
+
 func TestQPSRejectsNonFiniteAndFloat32Overflow(t *testing.T) {
 	for _, value := range []string{"NaN", "+Inf", "1e100"} {
 		if _, err := Parse([]string{"-a", "--qps", value}, "k8s-diagnose"); err == nil {
@@ -305,5 +377,202 @@ func TestConfigPathInReportRemainsAbsolute(t *testing.T) {
 	}
 	if !filepath.IsAbs(cfg.ConfigFile) || cfg.ConfigFile != path {
 		t.Fatalf("設定ファイルの絶対パスが失われた: got=%q want=%q", cfg.ConfigFile, path)
+	}
+}
+
+func TestFriendlyCommandsApplyProfilesAndAllowRelevantOverrides(t *testing.T) {
+	tests := []struct {
+		name  string
+		args  []string
+		check func(Config) bool
+	}{
+		{"quick", []string{"quick"}, func(c Config) bool {
+			return c.Mode == "triage" && c.Output == "text" && c.Mask && !c.ShowCmd && !c.ShowAPIRequests && !c.ExitZero && c.FailOn == "issue" && c.MaxIssues == nil
+		}},
+		{"ci", []string{"ci"}, func(c Config) bool {
+			return c.Mode == "triage" && c.Output == "json" && c.Mask && !c.ShowCmd && !c.ShowAPIRequests && c.FailOn == "issue"
+		}},
+		{"deep", []string{"deep"}, func(c Config) bool {
+			return c.Mode == "all" && c.Output == "text" && c.ShowLogs && c.ShowUnused
+		}},
+		{"pod", []string{"pod", "--connect", "--connect-path", "/ready"}, func(c Config) bool {
+			return c.Mode == "select" && c.Connect && c.ConnectPath == "/ready"
+		}},
+		{"ci override", []string{"ci", "--output", "sarif", "--output-file", "result.sarif"}, func(c Config) bool {
+			return c.Output == "sarif" && c.OutputFile == "result.sarif"
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg, err := Parse(test.args, "k8s-diagnose")
+			if err != nil {
+				t.Fatalf("コマンドを解析できない: %v", err)
+			}
+			if !test.check(cfg) {
+				t.Fatalf("プロファイルまたは上書きが反映されない: %#v", cfg)
+			}
+		})
+	}
+	if _, err := Parse([]string{"pod", "--logs"}, "k8s-diagnose"); err == nil {
+		t.Fatal("podコマンドでall専用オプションを受理した")
+	}
+	if _, err := Parse([]string{"all", "-s"}, "k8s-diagnose"); err == nil {
+		t.Fatal("固定モードのコマンドへ別モードを追加できた")
+	}
+}
+
+func TestDeepProfileRetainsLogDetailsThatBecomeRelevant(t *testing.T) {
+	cfg, err := ApplyProfile(Defaults(), "pod")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = cfg.WithSetting("display.tail", "77")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = ApplyProfile(cfg, "deep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.ShowLogs || cfg.Tail != 77 {
+		t.Fatalf("deepで有効になるログ詳細を失った: %#v", cfg)
+	}
+}
+
+func TestConfigurationPrecedenceIsINIThenProfileThenCLI(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.ini")
+	body := "[target]\nnamespace = production\n[diagnosis]\nmode = all\nwatch = 30\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Parse([]string{"quick", "--config", path, "-n", "staging", "--cmd"}, "k8s-diagnose")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Namespace != "staging" || cfg.Mode != "triage" || cfg.Watch != 0 || !cfg.ShowCmd {
+		t.Fatalf("INI → profile → CLIの優先順位が不正: %#v", cfg)
+	}
+}
+
+func TestConfigCommandOnlyAcceptsEditorBootstrapOptions(t *testing.T) {
+	if _, err := Parse([]string{"config", "--namespace", "prod"}, "k8s-diagnose"); err == nil || !strings.Contains(err.Error(), "対話画面") {
+		t.Fatalf("設定エディタ外の値指定を黙って受理した: %v", err)
+	}
+	if _, err := Parse([]string{"config", "--no-config"}, "k8s-diagnose"); err != nil {
+		t.Fatalf("新規設定編集を拒否した: %v", err)
+	}
+	newPath := filepath.Join(t.TempDir(), "new-settings.ini")
+	cfg, err := Parse([]string{"config", "--config", newPath}, "k8s-diagnose")
+	if err != nil || cfg.ConfigFile != newPath {
+		t.Fatalf("存在しない保存先を指定した新規設定編集を拒否した: cfg=%#v err=%v", cfg, err)
+	}
+}
+
+func TestDefaultConfigIsAutomaticallyLoadedAndCanBeDisabled(t *testing.T) {
+	directory := t.TempDir()
+	path := filepath.Join(directory, DefaultConfigFilename)
+	if err := os.WriteFile(path, []byte("[target]\nnamespace = production\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(directory)
+	cfg, err := Parse(nil, "k8s-diagnose")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Namespace != "production" || cfg.ConfigFile != path {
+		t.Fatalf("既定INIを自動読込していない: %#v", cfg)
+	}
+	cfg, err = Parse([]string{"--no-config"}, "k8s-diagnose")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Namespace != "" || cfg.ConfigFile != "" {
+		t.Fatalf("--no-configで既定INIを無効化できない: %#v", cfg)
+	}
+	cfg, err = Parse([]string{"--no-config=false"}, "k8s-diagnose")
+	if err != nil || cfg.Namespace != "production" {
+		t.Fatalf("false指定で既定INIまで無効化した: cfg=%#v err=%v", cfg, err)
+	}
+	if _, err := Parse([]string{"--config", path, "--no-config"}, "k8s-diagnose"); err == nil {
+		t.Fatal("--configと--no-configを同時に受理した")
+	}
+}
+
+func TestInteractiveINIRoundTripPreservesQuotedValues(t *testing.T) {
+	cfg := Defaults()
+	var err error
+	cfg, err = cfg.WithSetting("target.context", `team # blue; "primary"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := t.TempDir()
+	path, err := SaveINI(filepath.Join(directory, "saved.ini"), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("設定ファイルの権限=%#o, want 0600", info.Mode().Perm())
+	}
+	loaded, err := Parse([]string{"--config", path}, "k8s-diagnose")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Context != cfg.Context {
+		t.Fatalf("引用符付き値が往復で変化した: got=%q want=%q", loaded.Context, cfg.Context)
+	}
+	malformed := filepath.Join(directory, "malformed.ini")
+	if err := os.WriteFile(malformed, []byte("[target]\ncontext = \"unterminated\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Parse([]string{"--config", malformed}, "k8s-diagnose"); err == nil {
+		t.Fatal("閉じていない引用符を受理した")
+	}
+}
+
+func TestSaveINIRejectsAConfiguredOutputAtTheSettingsPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "k8s-diagnose.ini")
+	cfg := Defaults()
+	var err error
+	cfg, err = cfg.WithSetting("report.format", "json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = cfg.WithSetting("report.file", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SaveINI(path, cfg); err == nil || !strings.Contains(err.Error(), "入力ファイル") {
+		t.Fatalf("設定自身をレポート出力先にする内容を保存した: %v", err)
+	}
+}
+
+func TestINIUnquotedLeadingCommentCharactersRemainBackwardCompatible(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.ini")
+	if err := os.WriteFile(path, []byte("[target]\ncontext = #local-context\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Parse([]string{"--config", path}, "k8s-diagnose")
+	if err != nil || cfg.Context != "#local-context" {
+		t.Fatalf("従来受理していた先頭#値を変えた: context=%q err=%v", cfg.Context, err)
+	}
+}
+
+func TestFocusedHelpShowsOnlyTheSelectedEntryPoint(t *testing.T) {
+	root := HelpStyledFor("k8s-diagnose", "", false)
+	for _, value := range []string{"対話メニュー", "quick", "config", "advanced --help"} {
+		if !strings.Contains(root, value) {
+			t.Fatalf("入口helpに%qがない: %s", value, root)
+		}
+	}
+	pod := HelpStyledFor("k8s-diagnose", "pod", false)
+	if !strings.Contains(pod, "--connect") || strings.Contains(pod, "\n      --unused") {
+		t.Fatalf("Pod用helpの段階表示が不正: %s", pod)
+	}
+	if topic := HelpTopic([]string{"-s", "--help"}); topic != "pod" {
+		t.Fatalf("従来モードからhelp topicを解決できない: %q", topic)
 	}
 }

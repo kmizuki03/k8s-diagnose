@@ -3,6 +3,7 @@ package rules
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -45,9 +46,8 @@ func AnalyzeLogs(namespace, pod, source, text string, lastLines int) []model.Fin
 }
 
 func NewLogAnalyzer(path string, lastLines int) (*LogAnalyzer, error) {
-	signatures := append([]logSignature{}, builtInLogSignatures...)
 	if path == "" {
-		return &LogAnalyzer{signatures: signatures, lastLines: lastLines}, nil
+		return loadLogAnalyzer(strings.NewReader(""), lastLines)
 	}
 	absolute, err := filepath.Abs(path)
 	if err != nil {
@@ -65,9 +65,14 @@ func NewLogAnalyzer(path string, lastLines int) (*LogAnalyzer, error) {
 		return nil, err
 	}
 	defer file.Close()
+	return loadLogAnalyzer(file, lastLines)
+}
+
+func loadLogAnalyzer(reader io.Reader, lastLines int) (*LogAnalyzer, error) {
+	signatures := append([]logSignature{}, builtInLogSignatures...)
 	sections := map[string]map[string]string{}
 	section := ""
-	scanner := bufio.NewScanner(file)
+	scanner := bufio.NewScanner(reader)
 	for lineNo := 1; scanner.Scan(); lineNo++ {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {

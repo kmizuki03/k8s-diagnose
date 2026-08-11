@@ -29,7 +29,13 @@ elif [[ ${K8S_DIAGNOSE_REQUIRE_SECURITY_TOOLS:-0} == 1 ]]; then
   exit 1
 fi
 go run -mod=readonly ./cmd/rbac --namespace default --output-dir rbac --check
-go build -mod=readonly -trimpath -o "$ci_binary" .
+version=$("$script_dir/version.sh")
+version_symbol=github.com/kmizuki03/k8s-diagnose/internal/config.Version
+go build -mod=readonly -trimpath -ldflags "-X $version_symbol=$version" -o "$ci_binary" .
+if [[ $("$ci_binary" --version) != "k8s-diagnose $version (Go)" ]]; then
+  printf '%s\n' 'ビルドへバージョンを注入できませんでした' >&2
+  exit 1
+fi
 
 if command -v govulncheck >/dev/null 2>&1; then
   govulncheck ./...

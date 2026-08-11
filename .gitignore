@@ -33,9 +33,11 @@ go.work.sum
 # k8s-diagnose local artifacts
 /k8s-diagnose
 /dist/
+/.local/
 /*.db
 /*.db-shm
 /*.db-wal
+/*.db-journal
 __pycache__/
 *.py[cod]
 .pytest_cache/

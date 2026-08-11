@@ -16,7 +16,9 @@ import (
 	"github.com/kmizuki03/k8s-diagnose/internal/redact"
 )
 
-const Version = "3.0.0-dev"
+// Version is a variable so release builds can inject the Git tag with
+// -ldflags "-X github.com/kmizuki03/k8s-diagnose/internal/config.Version=...".
+var Version = "3.0.0-dev"
 
 type Config struct {
 	ConfigFile           string
@@ -41,6 +43,7 @@ type Config struct {
 	Mask                 bool
 	ExitZero             bool
 	ShowCmd              bool
+	ShowAPIRequests      bool
 	Output               string
 	OutputFile           string
 	SaveSnapshot         string
@@ -70,7 +73,7 @@ func Defaults() Config {
 	return Config{
 		Mode: "all", DebugImage: "busybox:1.36", DebugProfile: "general",
 		EventsLimit: 20, Tail: 30, RestartThreshold: 5, NodeHeartbeatTimeout: 180, RequestTimeout: 15,
-		Mask: true, ShowCmd: true, Output: "text", FailOn: "issue", Workers: 4,
+		Mask: true, ShowCmd: true, ShowAPIRequests: true, Output: "text", FailOn: "issue", Workers: 4,
 		QPS: 10, Burst: 20, PageSize: 500,
 		HistoryWindow: 12, FlapThreshold: 3, RestartGrowth: 3, HistoryRetain: 1000,
 		WebhookFormat: "generic", WebhookTimeout: 5, LogSignatureLines: 200,
@@ -86,14 +89,43 @@ func (c Config) ScopeLabel() string {
 }
 
 func Parse(args []string, prog string) (Config, error) {
+	command, args := splitCommand(args)
 	cfg := Defaults()
+	if command == "config" {
+		if err := validateConfigEditorArgs(args); err != nil {
+			return cfg, err
+		}
+	}
 	configPath, err := findConfigPath(args)
 	if err != nil {
 		return cfg, err
 	}
+	noConfig, err := booleanOptionEnabled(args, "--no-config", "-no-config")
+	if err != nil {
+		return cfg, err
+	}
+	if noConfig && configPath != "" {
+		return cfg, errors.New("--configと--no-configは同時に指定できません")
+	}
+	helpRequested, err := booleanOptionEnabled(args, "-h", "--help")
+	if err != nil {
+		return cfg, err
+	}
+	versionRequested, err := booleanOptionEnabled(args, "--version", "-version")
+	if err != nil {
+		return cfg, err
+	}
+	if configPath == "" && !noConfig && !helpRequested && !versionRequested {
+		configPath, err = ExistingDefaultConfig()
+		if err != nil {
+			return cfg, err
+		}
+	}
 	if configPath != "" {
 		if err := LoadINI(configPath, &cfg); err != nil {
-			return cfg, err
+			if command != "config" || !errors.Is(err, os.ErrNotExist) {
+				return cfg, err
+			}
 		}
 		absolute, err := filepath.Abs(configPath)
 		if err != nil {
@@ -101,11 +133,13 @@ func Parse(args []string, prog string) (Config, error) {
 		}
 		cfg.ConfigFile = absolute
 	}
+	applyCommandProfile(&cfg, command)
 
 	fs := flag.NewFlagSet(prog, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	var all, selectMode, list, triage bool
 	var noMask, noCmd, showCmd bool
+	var noAPIRequests, showAPIRequests bool
 	var maxIssues optionalInt
 	if cfg.MaxIssues != nil {
 		maxIssues.set, maxIssues.value = true, *cfg.MaxIssues
@@ -123,6 +157,7 @@ func Parse(args []string, prog string) (Config, error) {
 	// path retained for reports with the original relative spelling.
 	parsedConfigPath := cfg.ConfigFile
 	fs.StringVar(&parsedConfigPath, "config", parsedConfigPath, "")
+	fs.BoolVar(&noConfig, "no-config", noConfig, "")
 	fs.StringVar(&cfg.Namespace, "n", cfg.Namespace, "")
 	fs.StringVar(&cfg.Namespace, "namespace", cfg.Namespace, "")
 	fs.StringVar(&cfg.Context, "context", cfg.Context, "")
@@ -148,6 +183,8 @@ func Parse(args []string, prog string) (Config, error) {
 	fs.BoolVar(&cfg.ExitZero, "exit-zero", cfg.ExitZero, "")
 	fs.BoolVar(&showCmd, "cmd", false, "")
 	fs.BoolVar(&noCmd, "no-cmd", false, "")
+	fs.BoolVar(&showAPIRequests, "api-requests", false, "")
+	fs.BoolVar(&noAPIRequests, "no-api-requests", false, "")
 	fs.StringVar(&cfg.Output, "output", cfg.Output, "")
 	fs.StringVar(&cfg.OutputFile, "output-file", cfg.OutputFile, "")
 	fs.StringVar(&cfg.SaveSnapshot, "save-snapshot", cfg.SaveSnapshot, "")
@@ -189,6 +226,9 @@ func Parse(args []string, prog string) (Config, error) {
 	if selected > 1 {
 		return cfg, errors.New("診断モードは -a / -s / --list / --triage のいずれか1つだけ指定してください")
 	}
+	if commandMode(command) != "" && selected > 0 {
+		return cfg, fmt.Errorf("%sコマンドでは診断モードを追加指定できません", command)
+	}
 	if all {
 		cfg.Mode = "all"
 	} else if selectMode {
@@ -209,6 +249,21 @@ func Parse(args []string, prog string) (Config, error) {
 	}
 	if noCmd {
 		cfg.ShowCmd = false
+	}
+	if (showCmd || noCmd) && !showAPIRequests && !noAPIRequests && !cfg.SettingExplicit("display.show_api_requests") {
+		// Before show_api_requests existed, --cmd/--no-cmd controlled both
+		// kubectl hints and the API trace. Preserve that behaviour unless the
+		// new setting is explicitly configured.
+		cfg.ShowAPIRequests = cfg.ShowCmd
+	}
+	if showAPIRequests && noAPIRequests {
+		return cfg, errors.New("--api-requestsと--no-api-requestsは同時に指定できません")
+	}
+	if showAPIRequests {
+		cfg.ShowAPIRequests = true
+	}
+	if noAPIRequests {
+		cfg.ShowAPIRequests = false
 	}
 	if maxIssues.set {
 		value := maxIssues.value
@@ -349,6 +404,9 @@ func (c Config) Validate(raw []string) error {
 	}
 	if structured && c.explicitlyConfigured(raw, "display.show_commands", "--cmd", "--no-cmd") {
 		return errors.New("--cmd/--no-cmdはtext出力専用です")
+	}
+	if structured && c.explicitlyConfigured(raw, "display.show_api_requests", "--api-requests", "--no-api-requests") {
+		return errors.New("--api-requests/--no-api-requestsはtext出力専用です")
 	}
 	if structured && c.explicitlyConfigured(raw, "display.tail", "--tail") {
 		return errors.New("--tailはtext出力専用です")
@@ -527,6 +585,37 @@ func optionPresent(args []string, names ...string) bool {
 	return false
 }
 
+func booleanOptionEnabled(args []string, names ...string) (bool, error) {
+	value := false
+	for _, arg := range args {
+		name, raw, hasValue := arg, "", false
+		if strings.Contains(arg, "=") {
+			parts := strings.SplitN(arg, "=", 2)
+			name, raw, hasValue = parts[0], parts[1], true
+		}
+		matched := false
+		for _, candidate := range names {
+			if name == candidate {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		if !hasValue {
+			value = true
+			continue
+		}
+		parsed, err := strconv.ParseBool(raw)
+		if err != nil {
+			return false, fmt.Errorf("%sの真偽値が不正です: %q", name, raw)
+		}
+		value = parsed
+	}
+	return value, nil
+}
+
 func (c Config) explicitlyConfigured(args []string, setting string, names ...string) bool {
 	return optionPresent(args, names...) || c.explicitSettings[setting]
 }
@@ -545,9 +634,9 @@ func findConfigPath(args []string) (string, error) {
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
 		value := ""
-		if strings.HasPrefix(arg, "--config=") {
-			value = strings.TrimSpace(strings.TrimPrefix(arg, "--config="))
-		} else if arg == "--config" {
+		if strings.HasPrefix(arg, "--config=") || strings.HasPrefix(arg, "-config=") {
+			value = strings.TrimSpace(strings.SplitN(arg, "=", 2)[1])
+		} else if arg == "--config" || arg == "-config" {
 			if index+1 >= len(args) || strings.TrimSpace(args[index+1]) == "" {
 				return "", errors.New("--configには空でないパスを指定してください")
 			}
@@ -582,12 +671,24 @@ func HelpStyled(prog string, color bool) string {
 
 診断モード (同時に1つ、未指定時は-a):
   -a, --all                 クラスタ全体を診断
-  -s, --select              Podを名前検索・選択して個別診断
+  -s, --select              Namespace/Pod名で絞り、上下矢印＋Enterで個別診断
   -p, --list, --pods        Pod一覧とヘルスサマリのみ
       --triage              確定異常を短時間で集約
 
+Pod選択操作 (-s / -a --debug):
+  ↑ / ↓                    Podを移動
+  Enter / →                 選択したPodを決定
+  n                         一覧を表示したままNamespace検索を編集
+  / または f                一覧を表示したままPod名検索を編集
+  r                         Namespace・Pod名検索を続けて編集
+  c                         検索条件を消去
+  b                         1つ前へ戻る
+  q                         選択画面を終了
+  選択画面は決定・終了時に消去し、元の端末画面へ戻ります。
+
 対象・API設定:
-      --config FILE         INI設定ファイル (CLI指定が優先)
+      --config FILE         INI設定ファイル (CLI指定が優先、-configも受理)
+      --no-config           ./k8s-diagnose.iniの自動読込を無効化
   -n, --namespace NAME      対象namespace (省略時は全namespace)
       --context NAME        kubeconfig context
       --kubeconfig FILE     kubeconfigファイル
@@ -616,7 +717,9 @@ func HelpStyled(prog string, color bool) string {
       --tail N              ログ表示行数 (既定30)
       --no-mask             対話端末のtext表示だけ秘匿情報マスクを無効化
   -w, --watch SEC           1秒以上の間隔で再診断 (-a / --triage)
-      --cmd / --no-cmd      実際に送信したAPI method/pathの表示切替
+      --cmd / --no-cmd      各診断項目の確認用kubectlの表示切替
+      --api-requests / --no-api-requests
+                            末尾の「実行したKubernetes API要求」の表示切替
       --exit-zero           所見があってもexit 0
       --output FORMAT       text/json/sarif/junit/mermaid/dot
       --output-file FILE    構造化出力の保存先
@@ -673,6 +776,10 @@ func HelpStyled(prog string, color bool) string {
   %s -a --diff before.json --fail-on warning
   %s --config ./k8s-diagnose.ini
 `, prog, prog, prog, prog, prog, prog, prog, prog)
+	return colorizeHelp(plain, prog, color)
+}
+
+func colorizeHelp(plain, prog string, color bool) string {
 	if !color {
 		return plain
 	}
@@ -684,21 +791,16 @@ func HelpStyled(prog string, color bool) string {
 		reset  = "\x1b[0m"
 	)
 	lines := strings.Split(plain, "\n")
-	sections := map[string]bool{
-		"使い方:": true, "診断モード (同時に1つ、未指定時は-a):": true,
-		"対象・API設定:": true, "追加診断:": true, "表示・CI:": true,
-		"履歴・通知:": true, "組み合わせの要点:": true,
-		"終了コード:": true, "例:": true,
-	}
 	for index, line := range lines {
+		trimmed := strings.TrimSpace(line)
 		switch {
 		case index == 0:
 			lines[index] = cyan + line + reset
-		case sections[line]:
+		case line == trimmed && strings.HasSuffix(line, ":"):
 			lines[index] = blue + line + reset
 		case strings.HasPrefix(line, "  "+prog):
 			lines[index] = green + line + reset
-		case strings.HasPrefix(strings.TrimSpace(line), "--") || strings.HasPrefix(strings.TrimSpace(line), "-a,") || strings.HasPrefix(strings.TrimSpace(line), "-s,") || strings.HasPrefix(strings.TrimSpace(line), "-p,") || strings.HasPrefix(strings.TrimSpace(line), "-n,") || strings.HasPrefix(strings.TrimSpace(line), "-w,") || strings.HasPrefix(strings.TrimSpace(line), "-h,"):
+		case strings.HasPrefix(trimmed, "--") || strings.HasPrefix(trimmed, "-"):
 			lines[index] = yellow + line + reset
 		}
 	}
@@ -708,7 +810,7 @@ func HelpStyled(prog string, color bool) string {
 func PrintError(stream io.Writer, prog string, err error) {
 	message := redact.MaskSecrets(err.Error())
 	program := redact.SanitizeText(prog)
-	fmt.Fprintf(stream, "エラー: %s\n詳しい組み合わせは '%s --help' を確認してください。\n", message, program)
+	fmt.Fprintf(stream, "エラー: %s\n使い方は '%s --help'、全フラグと組み合わせは '%s advanced --help' で確認できます。\n", message, program, program)
 }
 
 func EnsureReadableFile(path string) error {

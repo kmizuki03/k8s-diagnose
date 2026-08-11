@@ -65,6 +65,18 @@ func TestErrorReasonMasksCredentials(t *testing.T) {
 	}
 }
 
+func TestErrorReasonUsesNaturalUserFacingLabels(t *testing.T) {
+	resource := schema.GroupResource{Resource: "pods"}
+	reason := ErrorReason(apierrors.NewForbidden(resource, "api", errors.New("denied")))
+	if !strings.Contains(reason, "アクセス権限がありません") || strings.Contains(reason, "RBAC Forbidden") {
+		t.Fatalf("権限エラーの案内が不自然: %q", reason)
+	}
+	reason = ErrorReason(context.DeadlineExceeded)
+	if !strings.Contains(reason, "タイムアウトしました") {
+		t.Fatalf("タイムアウトの案内が不自然: %q", reason)
+	}
+}
+
 func TestErrorReasonTruncatesWithoutBreakingUTF8(t *testing.T) {
 	reason := ErrorReason(errors.New(strings.Repeat("障", 400)))
 	if !utf8.ValidString(reason) || !strings.HasSuffix(reason, "…") {

@@ -81,7 +81,7 @@ func targetsAt(pod *corev1.Pod, services []corev1.Service, pathOverride string, 
 						Container: container.Name, ProbeType: value.name, Group: "pod", Label: value.name,
 						Protocol: "http", PortName: get.Port.StrVal, Path: get.Path, Scheme: strings.ToLower(string(get.Scheme)),
 						Headers: append([]corev1.HTTPHeader{}, get.HTTPHeaders...), Probe: value.probe, Source: "probe",
-						Strict: true, Invalid: true, Inactive: fmt.Sprintf("名前付きport %qをcontainerPortへ解決できません", get.Port.StrVal),
+						Strict: true, Invalid: true, Inactive: fmt.Sprintf("container %q のports[].nameにポート名 %q がありません", container.Name, get.Port.StrVal),
 					})
 					continue
 				}
@@ -115,7 +115,7 @@ func targetsAt(pod *corev1.Pod, services []corev1.Service, pathOverride string, 
 			if tcp := value.probe.TCPSocket; tcp != nil {
 				port, ok := resolvePort(tcp.Port, container)
 				if !ok {
-					result = append(result, Target{Container: container.Name, ProbeType: value.name, Group: "pod", Label: value.name, Protocol: "tcp", PortName: tcp.Port.StrVal, Probe: value.probe, Source: "probe", Strict: true, Invalid: true, Inactive: fmt.Sprintf("名前付きport %qをcontainerPortへ解決できません", tcp.Port.StrVal)})
+					result = append(result, Target{Container: container.Name, ProbeType: value.name, Group: "pod", Label: value.name, Protocol: "tcp", PortName: tcp.Port.StrVal, Probe: value.probe, Source: "probe", Strict: true, Invalid: true, Inactive: fmt.Sprintf("container %q のports[].nameにポート名 %q がありません", container.Name, tcp.Port.StrVal)})
 				} else {
 					active, inactive := probeActive(pod, container.Name, value.name, value.probe, now)
 					unavailable := false
@@ -308,6 +308,37 @@ func resolvePort(port intstr.IntOrString, container corev1.Container) (int, bool
 	return 0, false
 }
 
+func namedContainerPortSummary(pod *corev1.Pod, containerName string) string {
+	var names []string
+	collect := func(container corev1.Container) bool {
+		if container.Name != containerName {
+			return false
+		}
+		for _, port := range container.Ports {
+			if port.Name != "" {
+				names = append(names, port.Name)
+			}
+		}
+		return true
+	}
+	for _, container := range pod.Spec.Containers {
+		if collect(container) {
+			break
+		}
+	}
+	if len(names) == 0 {
+		for _, container := range pod.Spec.InitContainers {
+			if collect(container) {
+				break
+			}
+		}
+	}
+	if len(names) == 0 {
+		return fmt.Sprintf("container %q の定義済みports[].name: なし", containerName)
+	}
+	return fmt.Sprintf("container %q の定義済みports[].name: %s", containerName, strings.Join(names, ", "))
+}
+
 func selectorMatches(selector, labels map[string]string) bool {
 	if len(selector) == 0 {
 		return false
@@ -341,8 +372,10 @@ func (checker *Checker) Check(ctx context.Context, pod *corev1.Pod, services []c
 		if !target.Active {
 			results = append(results, Result{Target: target, Detail: "未実施: " + target.Inactive})
 			if target.Invalid {
-				findings = append(findings, model.NewFinding(model.Issue, "K8S.PROBE.PORT_UNRESOLVED", "Probe", targetResource(target, pod), "NamedPortUnresolved", probePortStableKey(target), fmt.Sprintf("Pod %s/%s / container %s: %sの名前付きport %qをcontainerPortへ解決できません", pod.Namespace, pod.Name, target.Container, targetName(target), target.PortName), 100,
-					model.Evidence{Kind: "probe", Key: "portName", Value: target.PortName},
+				findings = append(findings, model.NewFinding(model.Issue, "K8S.PROBE.PORT_UNRESOLVED", "Probe", targetResource(target, pod), "NamedPortUnresolved", probePortStableKey(target), fmt.Sprintf("Pod %s/%s のcontainer %q に設定された%sでは、ポート名 %q が指定されています。しかし、同じcontainerのports[].nameに %q は定義されていません", pod.Namespace, pod.Name, target.Container, targetName(target), target.PortName, target.PortName), 100,
+					model.Evidence{Kind: "probe", Key: "portName", Value: fmt.Sprintf("%s.port: %q", targetName(target), target.PortName)},
+					model.Evidence{Kind: "container", Key: "ports[].name", Value: namedContainerPortSummary(pod, target.Container)},
+					model.Evidence{Kind: "decision", Key: "unresolved", Value: fmt.Sprintf("ポート名 %q に対応するcontainerPort: 0件", target.PortName)},
 				))
 			} else if target.Unavailable {
 				findings = append(findings, model.NewFinding(model.Unavailable, "K8S.CONNECT.PROBE_HOST_UNSUPPORTED", "Probe確認", targetResource(target, pod), "ProbeHostNotReproduced", target.Group+"/"+targetName(target)+"/host", fmt.Sprintf("%s %s/%s: %s は接続先host指定をport-forwardで再現できないため未実施です (%s)", groupLabel(target.Group), pod.Namespace, pod.Name, targetName(target), target.Inactive), 100,

@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kmizuki03/k8s-diagnose/internal/jsonutil"
 	"github.com/kmizuki03/k8s-diagnose/internal/report"
 )
 
@@ -54,15 +55,15 @@ func ResolveURL(environmentName string) (string, error) {
 
 func BuildPayload(difference map[string]any, current report.Document) map[string]any {
 	newIssues := []any{}
-	for _, finding := range objects(difference["new"]) {
-		if stringValue(finding["severity"]) == "issue" && !boolValue(finding["acknowledged"]) {
+	for _, finding := range jsonutil.Objects(difference["new"]) {
+		if jsonutil.String(finding["severity"]) == "issue" && !jsonutil.Bool(finding["acknowledged"]) {
 			newIssues = append(newIssues, finding)
 		}
 	}
 	worsened := []any{}
-	for _, pair := range objects(difference["worsened"]) {
+	for _, pair := range jsonutil.Objects(difference["worsened"]) {
 		after, _ := pair["after"].(map[string]any)
-		if stringValue(after["severity"]) == "issue" && !boolValue(after["acknowledged"]) {
+		if jsonutil.String(after["severity"]) == "issue" && !jsonutil.Bool(after["acknowledged"]) {
 			worsened = append(worsened, pair)
 		}
 	}
@@ -71,27 +72,27 @@ func BuildPayload(difference map[string]any, current report.Document) map[string
 	}
 	newRoots := []any{}
 	rootDifference, _ := difference["root_causes"].(map[string]any)
-	for _, root := range objects(rootDifference["new"]) {
+	for _, root := range jsonutil.Objects(rootDifference["new"]) {
 		cause, _ := root["cause"].(map[string]any)
-		if stringValue(root["classification"]) == "root_cause" && !boolValue(cause["acknowledged"]) {
+		if jsonutil.String(root["classification"]) == "root_cause" && !jsonutil.Bool(cause["acknowledged"]) {
 			newRoots = append(newRoots, root)
 		}
 	}
 	target, _ := current["target"].(map[string]any)
 	lines := []string{
 		"[k8s-diagnose] 新規または悪化した確定異常を検出",
-		fmt.Sprintf("context=%s namespace=%s", fallback(stringValue(target["context"]), "-"), fallback(stringValue(target["scope"]), "-")),
+		fmt.Sprintf("context=%s namespace=%s", fallback(jsonutil.String(target["context"]), "-"), fallback(jsonutil.String(target["scope"]), "-")),
 		fmt.Sprintf("新規異常=%d 悪化=%d 新規根本原因=%d", len(newIssues), len(worsened), len(newRoots)),
 	}
 	messages := []string{}
 	for _, item := range newIssues {
 		finding, _ := item.(map[string]any)
-		messages = append(messages, stringValue(finding["message"]))
+		messages = append(messages, jsonutil.String(finding["message"]))
 	}
 	for _, item := range worsened {
 		pair, _ := item.(map[string]any)
 		after, _ := pair["after"].(map[string]any)
-		messages = append(messages, stringValue(after["message"]))
+		messages = append(messages, jsonutil.String(after["message"]))
 	}
 	for index, message := range messages {
 		if index >= 8 {
@@ -123,7 +124,7 @@ func Send(ctx context.Context, webhookURL string, payload map[string]any, timeou
 	var outgoing any = payload
 	switch format {
 	case "slack":
-		outgoing = map[string]any{"text": stringValue(payload["text"])}
+		outgoing = map[string]any{"text": jsonutil.String(payload["text"])}
 	case "generic":
 	default:
 		return fmt.Errorf("未対応のWebhook形式です: %s", format)
@@ -157,30 +158,6 @@ func Send(ctx context.Context, webhookURL string, payload map[string]any, timeou
 		return fmt.Errorf("WebhookがHTTP %dを返しました", response.StatusCode)
 	}
 	return nil
-}
-
-func objects(value any) []map[string]any {
-	result := []map[string]any{}
-	if values, ok := value.([]any); ok {
-		for _, item := range values {
-			if object, ok := item.(map[string]any); ok {
-				result = append(result, object)
-			}
-		}
-	}
-	return result
-}
-
-func stringValue(value any) string {
-	if value == nil {
-		return ""
-	}
-	return fmt.Sprint(value)
-}
-
-func boolValue(value any) bool {
-	result, _ := value.(bool)
-	return result
 }
 
 func fallback(value, defaultValue string) string {

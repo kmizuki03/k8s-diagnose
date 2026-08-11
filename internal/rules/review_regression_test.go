@@ -617,6 +617,57 @@ func TestEndpointSliceCanConfirmNamedTargetPort(t *testing.T) {
 	}
 }
 
+func TestNamedTargetPortFindingExplainsTheComparedConfiguration(t *testing.T) {
+	pod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "api-abc", Namespace: "ns", Labels: map[string]string{"app": "api", "tier": "backend"}},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "api", Ports: []corev1.ContainerPort{
+			{Name: "http", ContainerPort: 8080, Protocol: corev1.ProtocolTCP},
+			{Name: "admin", ContainerPort: 9090, Protocol: corev1.ProtocolUDP},
+		}}}},
+	}
+	service := corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "ns"},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{"tier": "backend", "app": "api"},
+			Ports:    []corev1.ServicePort{{Name: "web", Port: 80, Protocol: corev1.ProtocolTCP, TargetPort: intstr.FromString("admin")}},
+		},
+	}
+	slice := discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "ns", Labels: map[string]string{"kubernetes.io/service-name": "api"}},
+		Endpoints:  []discoveryv1.Endpoint{{}},
+	}
+	findings := (ServiceRule{}).Evaluate(context.Background(), &kube.Snapshot{
+		Pods: []corev1.Pod{pod}, Services: []corev1.Service{service}, EndpointSlices: []discoveryv1.EndpointSlice{slice},
+	}, config.Defaults())
+	var finding model.Finding
+	for _, value := range findings {
+		if value.Code == "K8S.SERVICE.TARGET_PORT_UNRESOLVED" {
+			finding = value
+			break
+		}
+	}
+	if finding.Code == "" {
+		t.Fatalf("名前付きtargetPort不一致を検出できない: %#v", findings)
+	}
+	for _, want := range []string{"ポート \"web\"（80/TCP）", "targetPortに \"admin\" が指定されています", "\"admin\" という名前のTCP containerPortがありません"} {
+		if !strings.Contains(finding.Message, want) {
+			t.Fatalf("所見に比較内容%qがない: %q", want, finding.Message)
+		}
+	}
+	for _, want := range []string{
+		"Serviceポート \"web\"（80/TCP） → targetPort \"admin\"",
+		"Serviceのselector: app=api, tier=backend",
+		"selectorに一致したPod: 1件 (ns/api-abc)",
+		"TCP containerPort名: http",
+		"targetPort \"admin\" と同名のTCP containerPortは見つかりませんでした（0件）",
+		"EndpointSliceからも転送先ポートを確認できませんでした",
+	} {
+		if !evidenceContains(finding, want) {
+			t.Fatalf("targetPort判定の根拠%qがない: %#v", want, finding.Evidence)
+		}
+	}
+}
+
 func TestNormalDeploymentRolloutDoesNotWarnReplicaShortage(t *testing.T) {
 	replicas := int32(3)
 	deployment := appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "ns"}, Spec: appsv1.DeploymentSpec{Replicas: &replicas}, Status: appsv1.DeploymentStatus{ReadyReplicas: 2, Conditions: []appsv1.DeploymentCondition{{Type: appsv1.DeploymentProgressing, Status: corev1.ConditionTrue, Reason: "ReplicaSetUpdated"}}}}

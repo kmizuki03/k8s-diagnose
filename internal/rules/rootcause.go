@@ -578,7 +578,7 @@ func remediations(finding model.Finding) []string {
 	case "K8S.DEPENDENCY.MISSING_KEY":
 		return []string{"Secret/ConfigMapに必要なキーを追加するか、keyRefを修正する"}
 	case "K8S.SERVICE.TARGET_PORT_UNRESOLVED":
-		return []string{"Service.spec.ports[].targetPortをPodのcontainerPort名に合わせる"}
+		return []string{"Serviceのspec.ports[].targetPortを、selectorで選ばれるPodのports[].nameに合わせる"}
 	case "K8S.WORKLOAD.PROGRESS_DEADLINE_EXCEEDED":
 		return []string{"Deployment conditionとReplicaSet Eventを確認し、停滞したrolloutの設定またはimageを修正する"}
 	case "K8S.WORKLOAD.REPLICA_FAILURE":

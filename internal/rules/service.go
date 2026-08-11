@@ -3,6 +3,8 @@ package rules
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/kmizuki03/k8s-diagnose/internal/config"
@@ -37,7 +39,8 @@ func (ServiceRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config
 		if snapshot.AvailableOrUntracked("pods") && len(pods) == 0 {
 			result = append(result, model.NewFinding(
 				model.Warning, "K8S.SERVICE.SELECTOR_NO_MATCH", "Service", resource, "SelectorNoMatch", "selector-no-match",
-				fmt.Sprintf("Service %s: selectorに一致するPodが0件です", shortRef(service.Namespace, service.Name)), 75,
+				fmt.Sprintf("Service %s のselectorに一致するPodがありません", shortRef(service.Namespace, service.Name)), 75,
+				model.Evidence{Kind: "service", Key: "spec.selector", Value: "Serviceのselector: " + serviceSelectorText(service.Spec.Selector)},
 			))
 		}
 		ready, fallback := serviceEndpointCounts(service, snapshot)
@@ -45,13 +48,15 @@ func (ServiceRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config
 		if snapshot.AvailableOrUntracked("pods") && endpointDataAvailable && len(pods) > 0 && ready == 0 && fallback == 0 {
 			result = append(result, model.NewFinding(
 				model.Warning, "K8S.SERVICE.NO_READY_ENDPOINT", "Service", resource, "NoReadyEndpoint", "ready-endpoint-zero",
-				fmt.Sprintf("Service %s: Ready Endpointが0件です", shortRef(service.Namespace, service.Name)), 85,
+				fmt.Sprintf("Service %s にReady状態のEndpointがありません", shortRef(service.Namespace, service.Name)), 85,
+				model.Evidence{Kind: "service", Key: "selectorMatches", Value: selectedPodSummary(pods)},
+				model.Evidence{Kind: "endpoint", Key: "ready", Value: "Ready状態のEndpoint: 0件"},
 			))
 		} else if snapshot.AvailableOrUntracked("pods") && endpointDataAvailable && len(pods) > 0 && ready == 0 && fallback > 0 {
 			result = append(result, model.NewFinding(
 				model.Warning, "K8S.SERVICE.TERMINATING_ENDPOINTS_ONLY", "Service", resource, "TerminatingEndpointsOnly", "terminating-serving-endpoints",
-				fmt.Sprintf("Service %s: 通常のReady Endpointがなく、終了中かつservingのEndpoint %d件だけがfallback候補です", shortRef(service.Namespace, service.Name), fallback), 88,
-				model.Evidence{Kind: "endpoint", Key: "terminatingServing", Value: fmt.Sprint(fallback)},
+				fmt.Sprintf("Service %s に通常のReady Endpointがありません。終了処理中でserving=trueのEndpoint %d件だけがfallback候補です", shortRef(service.Namespace, service.Name), fallback), 88,
+				model.Evidence{Kind: "endpoint", Key: "terminatingServing", Value: fmt.Sprintf("終了処理中かつserving=trueのEndpoint: %d件", fallback)},
 			))
 		}
 		for _, port := range service.Spec.Ports {
@@ -62,12 +67,16 @@ func (ServiceRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config
 			if target.Type != intstrutil.String || target.StrVal == "" {
 				continue // numeric targetPort need not be declared as containerPort
 			}
+			protocol := string(port.Protocol)
+			if protocol == "" {
+				protocol = string(corev1.ProtocolTCP)
+			}
 			resolved := false
+			namedPorts := map[string]struct{}{}
 			for _, pod := range pods {
 				_, named := containerPorts(pod)
-				protocol := string(port.Protocol)
-				if protocol == "" {
-					protocol = string(corev1.ProtocolTCP)
+				for name := range named[protocol] {
+					namedPorts[name] = struct{}{}
 				}
 				if _, ok := named[protocol][target.StrVal]; ok {
 					resolved = true
@@ -78,18 +87,86 @@ func (ServiceRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config
 				resolved = endpointSliceResolvesPort(service, port, snapshot)
 			}
 			if !resolved && len(pods) > 0 {
+				availableNames := sortedStringSet(namedPorts)
+				portNamesEvidence := fmt.Sprintf("selectorに一致したPodで定義されている%s containerPort名: なし", protocol)
+				if len(availableNames) > 0 {
+					portNamesEvidence = fmt.Sprintf("selectorに一致したPodで定義されている%s containerPort名: %s", protocol, summarizeStrings(availableNames, 10))
+				}
+				evidence := []model.Evidence{
+					{Kind: "service", Key: "spec.ports", Value: fmt.Sprintf("Serviceポート %s → targetPort %q", servicePortText(port), target.StrVal)},
+					{Kind: "service", Key: "spec.selector", Value: "Serviceのselector: " + serviceSelectorText(service.Spec.Selector)},
+					{Kind: "pod", Key: "selectorMatches", Value: selectedPodSummary(pods)},
+					{Kind: "pod", Key: "containerPortNames", Value: portNamesEvidence},
+					{Kind: "decision", Key: "unresolved", Value: fmt.Sprintf("selectorに一致したPodを確認しましたが、targetPort %q と同名の%s containerPortは見つかりませんでした（0件）", target.StrVal, protocol)},
+				}
+				if snapshot.AvailableOrUntracked("endpoint_slices") {
+					evidence = append(evidence, model.Evidence{Kind: "endpointSlice", Key: "resolvedPort", Value: "EndpointSliceからも転送先ポートを確認できませんでした"})
+				}
 				result = append(result, model.NewFinding(
 					model.Issue, "K8S.SERVICE.TARGET_PORT_UNRESOLVED", "Service", resource, "TargetPortUnresolved", port.Name+"/"+target.StrVal,
-					fmt.Sprintf("Service %s: targetPort %qをselector一致PodのcontainerPort名に解決できません", shortRef(service.Namespace, service.Name), target.StrVal), 98,
-					model.Evidence{Kind: "service", Key: "targetPort", Value: target.StrVal},
+					fmt.Sprintf("Service %s のポート %s では、targetPortに %q が指定されています。しかし、selectorに一致したPodには %q という名前の%s containerPortがありません", shortRef(service.Namespace, service.Name), servicePortText(port), target.StrVal, target.StrVal, protocol), 98,
+					evidence...,
 				))
 			}
 		}
 		if service.Spec.Type == corev1.ServiceTypeLoadBalancer && len(service.Status.LoadBalancer.Ingress) == 0 && elapsedSince(snapshot, service.CreationTimestamp.Time) >= 5*time.Minute {
-			result = append(result, model.NewFinding(model.Candidate, "K8S.SERVICE.LOAD_BALANCER_PENDING", "Service", resource, "LoadBalancerPending", "load-balancer", fmt.Sprintf("Service %s: LoadBalancer ingressがまだ割り当てられていません", shortRef(service.Namespace, service.Name)), 50))
+			result = append(result, model.NewFinding(model.Candidate, "K8S.SERVICE.LOAD_BALANCER_PENDING", "Service", resource, "LoadBalancerPending", "load-balancer", fmt.Sprintf("Service %s のLoadBalancerアドレスはまだ割り当てられていません", shortRef(service.Namespace, service.Name)), 50))
 		}
 	}
 	return result
+}
+
+func servicePortText(port corev1.ServicePort) string {
+	protocol := port.Protocol
+	if protocol == "" {
+		protocol = corev1.ProtocolTCP
+	}
+	value := fmt.Sprintf("%d/%s", port.Port, protocol)
+	if port.Name != "" {
+		return fmt.Sprintf("%q（%s）", port.Name, value)
+	}
+	return value
+}
+
+func serviceSelectorText(selector map[string]string) string {
+	keys := make([]string, 0, len(selector))
+	for key := range selector {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	values := make([]string, 0, len(keys))
+	for _, key := range keys {
+		values = append(values, key+"="+selector[key])
+	}
+	return strings.Join(values, ", ")
+}
+
+func selectedPodSummary(pods []*corev1.Pod) string {
+	refs := make([]string, 0, len(pods))
+	for _, pod := range pods {
+		refs = append(refs, shortRef(pod.Namespace, pod.Name))
+	}
+	sort.Strings(refs)
+	return fmt.Sprintf("selectorに一致したPod: %d件 (%s)", len(refs), summarizeStrings(refs, 5))
+}
+
+func sortedStringSet(values map[string]struct{}) []string {
+	result := make([]string, 0, len(values))
+	for value := range values {
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func summarizeStrings(values []string, limit int) string {
+	if len(values) == 0 {
+		return "なし"
+	}
+	if limit <= 0 || len(values) <= limit {
+		return strings.Join(values, ", ")
+	}
+	return fmt.Sprintf("%s, …（ほか%d件）", strings.Join(values[:limit], ", "), len(values)-limit)
 }
 
 func endpointSliceResolvesPort(service *corev1.Service, servicePort corev1.ServicePort, snapshot *kube.Snapshot) bool {

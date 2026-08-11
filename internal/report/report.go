@@ -21,6 +21,7 @@ import (
 
 	"github.com/kmizuki03/k8s-diagnose/internal/config"
 	"github.com/kmizuki03/k8s-diagnose/internal/console"
+	"github.com/kmizuki03/k8s-diagnose/internal/jsonutil"
 	"github.com/kmizuki03/k8s-diagnose/internal/model"
 	"github.com/kmizuki03/k8s-diagnose/internal/redact"
 )
@@ -256,7 +257,7 @@ func SARIF(document Document) ([]byte, error) {
 	roots := rootObjects(document)
 	rootsByFinding := map[string][]string{}
 	for _, root := range roots {
-		rootID := stringField(root, "id")
+		rootID := jsonutil.StringField(root, "id")
 		for _, findingID := range stringSlice(root["related_finding_ids"]) {
 			rootsByFinding[findingID] = append(rootsByFinding[findingID], rootID)
 		}
@@ -264,15 +265,15 @@ func SARIF(document Document) ([]byte, error) {
 	rules := map[string]any{}
 	results := []any{}
 	for _, finding := range findings {
-		code := stringField(finding, "code")
+		code := jsonutil.StringField(finding, "code")
 		if code == "" {
 			code = "K8S.UNKNOWN"
 		}
-		section := stringField(finding, "section")
+		section := jsonutil.StringField(finding, "section")
 		if section == "" {
 			section = "Kubernetes diagnosis"
 		}
-		level := sarifLevel(stringField(finding, "severity"))
+		level := sarifLevel(jsonutil.StringField(finding, "severity"))
 		if _, exists := rules[code]; !exists {
 			rules[code] = map[string]any{
 				"id": code, "name": strings.ReplaceAll(code, ".", "_"),
@@ -282,16 +283,16 @@ func SARIF(document Document) ([]byte, error) {
 		}
 		result := map[string]any{
 			"ruleId": code, "level": level,
-			"message":             map[string]any{"text": stringField(finding, "message")},
+			"message":             map[string]any{"text": jsonutil.StringField(finding, "message")},
 			"partialFingerprints": map[string]any{"k8sDiagnoseFingerprint": finding["id"]},
 			"properties": map[string]any{
 				"severity": finding["severity"], "section": section,
 				"confidence": finding["confidence"], "evidence": finding["evidence"],
-				"rootCauseIds": rootsByFinding[stringField(finding, "id")],
+				"rootCauseIds": rootsByFinding[jsonutil.StringField(finding, "id")],
 				"acknowledged": finding["acknowledged"], "acknowledgement": finding["acknowledgement"],
 			},
 		}
-		if resource := stringField(finding, "resource"); resource != "" {
+		if resource := jsonutil.StringField(finding, "resource"); resource != "" {
 			result["locations"] = []any{map[string]any{"logicalLocations": []any{map[string]any{"fullyQualifiedName": resource, "kind": "Kubernetes resource"}}}}
 		}
 		if acknowledged, _ := finding["acknowledged"].(bool); acknowledged {
@@ -343,7 +344,7 @@ func sarifLevel(severity string) string {
 
 func documentToolVersion(document Document) string {
 	if tool, ok := document["tool"].(map[string]any); ok {
-		if version := stringField(tool, "version"); version != "" {
+		if version := jsonutil.StringField(tool, "version"); version != "" {
 			return version
 		}
 	}
@@ -393,7 +394,7 @@ func JUnit(document Document) ([]byte, error) {
 	rootsByFinding := map[string][]string{}
 	for _, root := range roots {
 		for _, findingID := range stringSlice(root["related_finding_ids"]) {
-			rootsByFinding[findingID] = append(rootsByFinding[findingID], stringField(root, "id"))
+			rootsByFinding[findingID] = append(rootsByFinding[findingID], jsonutil.StringField(root, "id"))
 		}
 	}
 	summary, _ := document["summary"].(map[string]any)
@@ -416,22 +417,22 @@ func JUnit(document Document) ([]byte, error) {
 		}
 	}
 	for _, finding := range findings {
-		severity := stringField(finding, "severity")
-		code := stringField(finding, "code")
+		severity := jsonutil.StringField(finding, "severity")
+		code := jsonutil.StringField(finding, "code")
 		if code == "" {
 			code = "K8S.UNKNOWN"
 		}
-		resource := stringField(finding, "resource")
+		resource := jsonutil.StringField(finding, "resource")
 		if resource == "" {
 			resource = "cluster"
 		}
-		message := stringField(finding, "message")
+		message := jsonutil.StringField(finding, "message")
 		detailText := message
 		if evidence := stringSlice(finding["evidence"]); len(evidence) > 0 {
 			detailText += "\nEvidence:\n- " + strings.Join(evidence, "\n- ")
 		}
-		item := testcase{Name: code + " " + resource, Classname: stringField(finding, "section"), SystemOut: detailText}
-		if rootIDs := rootsByFinding[stringField(finding, "id")]; len(rootIDs) > 0 {
+		item := testcase{Name: code + " " + resource, Classname: jsonutil.StringField(finding, "section"), SystemOut: detailText}
+		if rootIDs := rootsByFinding[jsonutil.StringField(finding, "id")]; len(rootIDs) > 0 {
 			item.Properties = &testproperties{Values: []testproperty{{Name: "root_cause_ids", Value: strings.Join(rootIDs, ",")}}}
 		}
 		detail := &testdetail{Type: code, Message: message, Text: detailText}
@@ -469,7 +470,7 @@ func JUnit(document Document) ([]byte, error) {
 func acknowledgementReason(value any) string {
 	switch acknowledgement := value.(type) {
 	case map[string]any:
-		if reason := stringField(acknowledgement, "reason"); reason != "" {
+		if reason := jsonutil.StringField(acknowledgement, "reason"); reason != "" {
 			return reason
 		}
 	case model.Acknowledgement:
@@ -572,22 +573,22 @@ func reportGraph(document Document) (map[string]reportGraphNode, []reportGraphEd
 	}
 	for _, root := range rootObjects(document) {
 		cause, _ := root["cause"].(map[string]any)
-		causeResource := stringField(cause, "resource")
+		causeResource := jsonutil.StringField(cause, "resource")
 		if causeResource == "" {
-			causeResource = "Finding/" + stringField(root, "id")
+			causeResource = "Finding/" + jsonutil.StringField(root, "id")
 		}
-		class := map[string]string{"root_cause": "rootCause", "cause_candidate": "causeCandidate"}[stringField(root, "classification")]
+		class := map[string]string{"root_cause": "rootCause", "cause_candidate": "causeCandidate"}[jsonutil.StringField(root, "classification")]
 		if class == "" {
 			class = "relatedCandidate"
 		}
-		label := stringField(root, "label") + ": " + causeResource
-		if message := graphText(stringField(cause, "message"), 140); message != "" {
+		label := jsonutil.StringField(root, "label") + ": " + causeResource
+		if message := graphText(jsonutil.StringField(cause, "message"), 140); message != "" {
 			label += "\n" + message
 		}
 		addNode(causeResource, label, class)
 		for _, group := range []string{"direct_impacts", "propagated_impacts"} {
-			for _, impact := range objectSlice(root[group]) {
-				target := stringField(impact, "resource")
+			for _, impact := range jsonutil.Objects(root[group]) {
+				target := jsonutil.StringField(impact, "resource")
 				path := stringSlice(impact["path"])
 				if len(path) == 0 && target != "" {
 					path = []string{target}
@@ -601,7 +602,7 @@ func reportGraph(document Document) (map[string]reportGraphNode, []reportGraphEd
 					resource := path[index]
 					impactLabel := resource
 					if resource == target {
-						if message := graphText(stringField(impact, "message"), 140); message != "" {
+						if message := graphText(jsonutil.StringField(impact, "message"), 140); message != "" {
 							impactLabel += "\n" + message
 						}
 					}
@@ -615,7 +616,7 @@ func reportGraph(document Document) (map[string]reportGraphNode, []reportGraphEd
 						relation = relations[relationIndex]
 					}
 					if relation == "" && index == len(path)-1 {
-						relation = stringField(impact, "relation")
+						relation = jsonutil.StringField(impact, "relation")
 					}
 					if relation == "" {
 						relation = "affects"
@@ -748,8 +749,12 @@ func Load(path string) (Document, error) {
 	if err != nil {
 		return nil, fmt.Errorf("snapshotを読み込めません: %w", err)
 	}
+	return decodeDocument(bytes.NewReader(data))
+}
+
+func decodeDocument(reader io.Reader) (Document, error) {
 	var document Document
-	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder := json.NewDecoder(reader)
 	decoder.UseNumber()
 	if err := decoder.Decode(&document); err != nil {
 		return nil, fmt.Errorf("snapshot JSONが壊れています: %w", err)
@@ -770,7 +775,7 @@ func Load(path string) (Document, error) {
 func Compare(before, after Document) map[string]any {
 	beforeMap, afterMap := findingMap(before), findingMap(after)
 	common, beforeOnly, afterOnly := setParts(beforeMap, afterMap)
-	unavailable := unavailableSections(after)
+	unavailable := jsonutil.UnavailableSections(after)
 	beforeCorrelation := correlationMap(valuesForIDs(beforeMap, beforeOnly), false)
 	afterCorrelation := correlationMap(valuesForIDs(afterMap, afterOnly), false)
 	changedBefore, changedAfter := map[string]bool{}, map[string]bool{}
@@ -785,16 +790,16 @@ func Compare(before, after Document) map[string]any {
 	}
 	for _, key := range commonKeys(beforeCorrelation, afterCorrelation) {
 		previous, current := beforeCorrelation[key], afterCorrelation[key]
-		previousID, currentID := stringField(previous, "id"), stringField(current, "id")
+		previousID, currentID := jsonutil.StringField(previous, "id"), jsonutil.StringField(current, "id")
 		changedBefore[previousID], changedAfter[currentID] = true, true
 		pair := map[string]any{"before": previous, "after": current}
-		if stringField(previous, "severity") != "unavailable" && stringField(current, "severity") == "unavailable" {
+		if jsonutil.StringField(previous, "severity") != "unavailable" && jsonutil.StringField(current, "severity") == "unavailable" {
 			if entry := unknownEntry(previous, unavailable, current); entry != nil {
 				unknown = append(unknown, entry)
 				continue
 			}
 		}
-		switch beforeWeight, afterWeight := severityWeight(stringField(previous, "severity")), severityWeight(stringField(current, "severity")); {
+		switch beforeWeight, afterWeight := severityWeight(jsonutil.StringField(previous, "severity")), severityWeight(jsonutil.StringField(current, "severity")); {
 		case afterWeight > beforeWeight:
 			worsened = append(worsened, pair)
 		case afterWeight < beforeWeight:
@@ -848,10 +853,10 @@ func CompareHistory(previous []Document, current Document) (map[string]any, erro
 		return nil, errors.New("履歴差分には1件以上の比較基準が必要です")
 	}
 	result := Compare(previous[len(previous)-1], current)
-	newValues := objectSlice(result["new"])
+	newValues := jsonutil.Objects(result["new"])
 	remaining := []any{}
 	for _, after := range newValues {
-		if stringField(after, "severity") == "unavailable" {
+		if jsonutil.StringField(after, "severity") == "unavailable" {
 			remaining = append(remaining, after)
 			continue
 		}
@@ -861,12 +866,12 @@ func CompareHistory(previous []Document, current Document) (map[string]any, erro
 			continue
 		}
 		pair := map[string]any{"before": before, "after": after, "unknown_samples": unknownSamples, "last_known_generated_at": generatedAt}
-		switch beforeWeight, afterWeight := severityWeight(stringField(before, "severity")), severityWeight(stringField(after, "severity")); {
+		switch beforeWeight, afterWeight := severityWeight(jsonutil.StringField(before, "severity")), severityWeight(jsonutil.StringField(after, "severity")); {
 		case afterWeight > beforeWeight:
 			result["worsened"] = appendAny(result["worsened"], pair)
 		case afterWeight < beforeWeight:
 			result["improved"] = appendAny(result["improved"], pair)
-		case stringField(before, "id") == stringField(after, "id"):
+		case jsonutil.StringField(before, "id") == jsonutil.StringField(after, "id"):
 			result["reconfirmed"] = appendAny(result["reconfirmed"], pair)
 		default:
 			result["changed"] = appendAny(result["changed"], pair)
@@ -875,10 +880,10 @@ func CompareHistory(previous []Document, current Document) (map[string]any, erro
 	result["new"] = remaining
 	counts, _ := result["counts"].(map[string]any)
 	for _, key := range []string{"new", "worsened", "improved", "changed", "reconfirmed"} {
-		counts[key] = len(objectSlice(result[key]))
+		counts[key] = len(jsonutil.Objects(result[key]))
 	}
 	rootDiff, _ := result["root_causes"].(map[string]any)
-	rootNew := objectSlice(rootDiff["new"])
+	rootNew := jsonutil.Objects(rootDiff["new"])
 	remainingRoots := []any{}
 	for _, root := range rootNew {
 		before, unknownSamples, generatedAt := lastKnownRoot(previous, root)
@@ -896,18 +901,22 @@ func CompareHistory(previous []Document, current Document) (map[string]any, erro
 	rootDiff["new"] = remainingRoots
 	rootCounts, _ := rootDiff["counts"].(map[string]any)
 	for _, key := range []string{"new", "changed", "reconfirmed"} {
-		rootCounts[key] = len(objectSlice(rootDiff[key]))
+		rootCounts[key] = len(jsonutil.Objects(rootDiff[key]))
 	}
 	return result, nil
 }
 
-func findingObjects(document Document) []map[string]any { return objectSlice(document["findings"]) }
-func rootObjects(document Document) []map[string]any    { return objectSlice(document["root_causes"]) }
+func findingObjects(document Document) []map[string]any {
+	return jsonutil.Objects(document["findings"])
+}
+func rootObjects(document Document) []map[string]any {
+	return jsonutil.Objects(document["root_causes"])
+}
 
 func findingMap(document Document) map[string]map[string]any {
 	result := map[string]map[string]any{}
 	for _, value := range findingObjects(document) {
-		if id := stringField(value, "id"); id != "" {
+		if id := jsonutil.StringField(value, "id"); id != "" {
 			result[id] = value
 		}
 	}
@@ -917,7 +926,7 @@ func findingMap(document Document) map[string]map[string]any {
 func rootMap(document Document) map[string]map[string]any {
 	result := map[string]map[string]any{}
 	for _, value := range rootObjects(document) {
-		if id := stringField(value, "id"); id != "" {
+		if id := jsonutil.StringField(value, "id"); id != "" {
 			result[id] = value
 		}
 	}
@@ -958,7 +967,7 @@ func correlationMap(values []map[string]any, roots bool) map[string]map[string]a
 		if roots {
 			finding, _ = value["cause"].(map[string]any)
 		}
-		code, resource := stringField(finding, "code"), stringField(finding, "resource")
+		code, resource := jsonutil.StringField(finding, "code"), jsonutil.StringField(finding, "resource")
 		if code == "" || resource == "" {
 			continue
 		}
@@ -986,7 +995,7 @@ func commonKeys(before, after map[string]map[string]any) []string {
 }
 
 func findingCorrelationKey(finding map[string]any) string {
-	code, resource := stringField(finding, "code"), stringField(finding, "resource")
+	code, resource := jsonutil.StringField(finding, "code"), jsonutil.StringField(finding, "resource")
 	if code == "" || resource == "" {
 		return ""
 	}
@@ -994,11 +1003,11 @@ func findingCorrelationKey(finding map[string]any) string {
 }
 
 func unknownEntry(before map[string]any, unavailable map[string][]map[string]any, after map[string]any) map[string]any {
-	if stringField(before, "severity") == "unavailable" {
+	if jsonutil.StringField(before, "severity") == "unavailable" {
 		return nil
 	}
-	section := stringField(before, "section")
-	blockers := matchingUnavailable(before, unavailable[section])
+	section := jsonutil.StringField(before, "section")
+	blockers := jsonutil.MatchingUnavailable(before, unavailable[section])
 	if section == "" || len(blockers) == 0 {
 		return nil
 	}
@@ -1011,29 +1020,6 @@ func unknownEntry(before map[string]any, unavailable map[string][]map[string]any
 		result["after"] = after
 	}
 	return result
-}
-
-func matchingUnavailable(finding map[string]any, blockers []map[string]any) []map[string]any {
-	ruleID := stringField(finding, "rule_id")
-	if ruleID == "" {
-		return blockers // v1の旧snapshotは生成ルールを持たないためsection単位へフォールバックする
-	}
-	result := make([]map[string]any, 0, len(blockers))
-	for _, blocker := range blockers {
-		blockerRule := stringField(blocker, "rule_id")
-		if blockerRule == "" {
-			blockerRule = strings.TrimPrefix(stringField(blocker, "resource"), "Rule/")
-		}
-		if blockerRule == ruleID {
-			result = append(result, blocker)
-		}
-	}
-	return result
-}
-
-func evaluationUnavailable(document Document, finding map[string]any) bool {
-	section := stringField(finding, "section")
-	return section != "" && len(matchingUnavailable(finding, unavailableSections(document)[section])) > 0
 }
 
 func compareRootCauses(before, after Document, unavailable map[string][]map[string]any) map[string]any {
@@ -1052,8 +1038,8 @@ func compareRootCauses(before, after Document, unavailable map[string][]map[stri
 	correlatedBefore, correlatedAfter := map[string]bool{}, map[string]bool{}
 	for _, key := range commonKeys(beforeCorrelation, afterCorrelation) {
 		left, right := beforeCorrelation[key], afterCorrelation[key]
-		correlatedBefore[stringField(left, "id")] = true
-		correlatedAfter[stringField(right, "id")] = true
+		correlatedBefore[jsonutil.StringField(left, "id")] = true
+		correlatedAfter[jsonutil.StringField(right, "id")] = true
 		changed = append(changed, map[string]any{"before": left, "after": right})
 	}
 	unknown, resolved, newValues := []any{}, []any{}, []any{}
@@ -1095,7 +1081,7 @@ func stableRoot(value map[string]any) map[string]any {
 		result[key] = value[key]
 	}
 	stableImpacts := func(raw any) []any {
-		impacts := objectSlice(raw)
+		impacts := jsonutil.Objects(raw)
 		items := make([]any, 0, len(impacts))
 		for _, impact := range impacts {
 			item := map[string]any{}
@@ -1118,7 +1104,7 @@ func semanticJSONEqual(left, right any) bool {
 }
 
 func lastKnownFinding(previous []Document, current map[string]any) (map[string]any, int, any) {
-	key, section := findingCorrelationKey(current), stringField(current, "section")
+	key, section := findingCorrelationKey(current), jsonutil.StringField(current, "section")
 	if key == "" || section == "" {
 		return nil, 0, nil
 	}
@@ -1126,13 +1112,13 @@ func lastKnownFinding(previous []Document, current map[string]any) (map[string]a
 	for index := len(previous) - 1; index >= 0; index-- {
 		document := previous[index]
 		correlated := correlationMap(findingObjects(document), false)[key]
-		if correlated != nil && stringField(correlated, "severity") != "unavailable" {
+		if correlated != nil && jsonutil.StringField(correlated, "severity") != "unavailable" {
 			if unknownSamples > 0 {
 				return correlated, unknownSamples, document["generated_at"]
 			}
 			return nil, 0, nil
 		}
-		if evaluationUnavailable(document, current) {
+		if jsonutil.EvaluationUnavailable(document, current) {
 			unknownSamples++
 			continue
 		}
@@ -1143,7 +1129,7 @@ func lastKnownFinding(previous []Document, current map[string]any) (map[string]a
 
 func lastKnownRoot(previous []Document, current map[string]any) (map[string]any, int, any) {
 	cause, _ := current["cause"].(map[string]any)
-	key, section := findingCorrelationKey(cause), stringField(cause, "section")
+	key, section := findingCorrelationKey(cause), jsonutil.StringField(cause, "section")
 	if key == "" || section == "" {
 		return nil, 0, nil
 	}
@@ -1157,7 +1143,7 @@ func lastKnownRoot(previous []Document, current map[string]any) (map[string]any,
 			}
 			return nil, 0, nil
 		}
-		if evaluationUnavailable(document, cause) {
+		if jsonutil.EvaluationUnavailable(document, cause) {
 			unknownSamples++
 			continue
 		}
@@ -1172,39 +1158,6 @@ func appendAny(value any, items ...any) []any {
 		result = append(result, existing...)
 	}
 	return append(result, items...)
-}
-
-func unavailableSections(document Document) map[string][]map[string]any {
-	result := map[string][]map[string]any{}
-	for _, value := range findingObjects(document) {
-		if stringField(value, "severity") == "unavailable" {
-			section := stringField(value, "section")
-			result[section] = append(result[section], value)
-		}
-	}
-	return result
-}
-
-func objectSlice(value any) []map[string]any {
-	result := []map[string]any{}
-	switch values := value.(type) {
-	case []any:
-		for _, item := range values {
-			if object, ok := item.(map[string]any); ok {
-				result = append(result, object)
-			}
-		}
-	case []map[string]any:
-		return values
-	}
-	return result
-}
-
-func stringField(value map[string]any, key string) string {
-	if value == nil || value[key] == nil {
-		return ""
-	}
-	return fmt.Sprint(value[key])
 }
 
 func stringSlice(value any) []string {

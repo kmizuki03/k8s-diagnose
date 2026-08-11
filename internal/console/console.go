@@ -56,6 +56,9 @@ func New(cfg config.Config, out, errOut io.Writer) *Console {
 
 func (c *Console) ColorEnabled() bool { return c.C.Reset != "" }
 
+// Width returns the display width available to render one terminal line.
+func (c *Console) Width() int { return c.width }
+
 func (c *Console) Write(values ...any) {
 	if len(values) == 0 {
 		fmt.Fprintln(c.Out)
@@ -104,6 +107,8 @@ func modeLabel(mode string) string {
 		return "list (--list)"
 	case "triage":
 		return "triage"
+	case "guide":
+		return "ガイド"
 	default:
 		return mode
 	}
@@ -148,8 +153,9 @@ func (c *Console) Flag(f model.Finding) {
 }
 
 type TableRow struct {
-	Cells  []string
-	Status string
+	Cells    []string
+	Status   string
+	Selected bool
 }
 
 func (c *Console) Table(headers []string, rows []TableRow, colorize bool) {
@@ -186,6 +192,11 @@ func (c *Console) Table(headers []string, rows []TableRow, colorize bool) {
 		color := ""
 		if colorize {
 			color = c.rowColor(index, row.Status+" "+strings.Join(row.Cells, " "))
+		}
+		if row.Selected {
+			// Some base colours intentionally include an ANSI reset. Apply the
+			// selection attributes last so either zebra colour remains selected.
+			color += c.C.Reverse + c.C.Bold
 		}
 		c.printColor(color, format(row.Cells))
 	}
@@ -226,7 +237,11 @@ func (c *Console) PodTable(headers []string, rows []TableRow) {
 	}
 	c.printColor(c.C.Cyan+c.C.Bold, line(headers))
 	for index, row := range rows {
-		c.printColor(c.rowColor(index, row.Status), line(row.Cells))
+		style := c.rowColor(index, row.Status)
+		if row.Selected {
+			style += c.C.Reverse + c.C.Bold
+		}
+		c.printColor(style, line(row.Cells))
 	}
 }
 
@@ -263,16 +278,23 @@ func (c *Console) RootCauseReport(values []model.RootCause) {
 		}
 	}
 	if c.ColorEnabled() {
-		fmt.Fprintf(c.Out, "%s診断結果: %s%s確定した根本原因 %d件%s / %s%s原因候補 %d件%s / %s%s関連候補 %d件%s\n",
+		fmt.Fprintf(c.Out, "%s原因分析: %s%s根本原因 %d件%s / %s%s原因候補 %d件%s / %s%s要確認 %d件%s\n",
 			c.C.Bold, c.C.Reset, c.C.Red+c.C.Bold, confirmed, c.C.Reset,
 			c.C.Yellow, c.C.Bold, probable, c.C.Reset, c.C.Magenta, c.C.Bold, related, c.C.Reset)
 	} else {
-		fmt.Fprintf(c.Out, "診断結果: 確定した根本原因 %d件 / 原因候補 %d件 / 関連候補 %d件\n", confirmed, probable, related)
+		fmt.Fprintf(c.Out, "原因分析: 根本原因 %d件 / 原因候補 %d件 / 要確認 %d件\n", confirmed, probable, related)
 	}
 	for index, root := range values {
 		icon, color := rootStyle(c, root)
 		c.Write()
-		c.printColor(color+c.C.Bold, fmt.Sprintf("[%d] %s %s: %s", index+1, icon, root.Label, MaskSecrets(root.Cause.Message, c.Config.Mask)))
+		c.printColor(color+c.C.Bold, fmt.Sprintf("[%d] %s %s", index+1, icon, root.Label))
+		c.printColor(color, "    "+MaskSecrets(root.Cause.Message, c.Config.Mask))
+		for _, evidence := range root.Evidence {
+			if evidence.Kind == "decision" && strings.TrimSpace(evidence.Value) != "" {
+				c.printColor(c.C.Cyan, "    検出理由: "+MaskSecrets(evidence.Value, c.Config.Mask))
+				break
+			}
+		}
 		counts := []string{}
 		keys := make([]string, 0, len(root.ImpactSummary))
 		for key := range root.ImpactSummary {
@@ -289,17 +311,37 @@ func (c *Console) RootCauseReport(values []model.RootCause) {
 	for index, root := range values {
 		icon, color := rootStyle(c, root)
 		c.Section(fmt.Sprintf("%s %s [%d]", icon, root.Label, index+1), color)
+		if c.Config.ShowCmd {
+			for _, command := range root.Commands {
+				c.Command(command)
+			}
+		}
 		c.printColor(color+c.C.Bold, fmt.Sprintf("%s %s [確信度: %d%%]", icon, root.Label, root.Confidence))
 		c.printColor(color+c.C.Bold, MaskSecrets(root.Cause.Message, c.Config.Mask))
-		if len(root.Evidence) > 0 {
+		reasons := []string{}
+		if root.Cause.Code != "" {
+			reasons = append(reasons, "判定ルール: "+root.Cause.Code)
+		}
+		if root.Cause.Resource != "" {
+			reasons = append(reasons, "対象リソース: "+root.Cause.Resource)
+		}
+		for _, evidence := range root.Evidence {
+			label := rootCauseEvidenceLabel(evidence)
+			value := evidence.Value
+			if label != "" {
+				value = label + ": " + value
+			}
+			reasons = append(reasons, value)
+		}
+		if len(reasons) > 0 {
 			c.Write()
-			c.printColor(c.C.Cyan+c.C.Bold, "根拠")
-			for i, evidence := range root.Evidence {
+			c.printColor(c.C.Cyan+c.C.Bold, "検出理由・根拠")
+			for i, reason := range reasons {
 				branch := "├─"
-				if i == len(root.Evidence)-1 {
+				if i == len(reasons)-1 {
 					branch = "└─"
 				}
-				c.Write(branch + " " + MaskSecrets(evidence.Value, c.Config.Mask))
+				c.Write(branch + " " + MaskSecrets(reason, c.Config.Mask))
 			}
 		}
 		impacts := append(append([]model.Impact{}, root.DirectImpacts...), root.PropagatedImpacts...)
@@ -315,19 +357,30 @@ func (c *Console) RootCauseReport(values []model.RootCause) {
 				c.printColor(c.C.Lime+c.C.Bold, "  ▶ "+MaskSecrets(remediation, c.Config.Mask))
 			}
 		}
-		if len(root.Commands) > 0 {
-			c.Write()
-			c.printColor(c.C.Cyan+c.C.Bold, "確認")
-			for _, command := range root.Commands {
-				command = MaskSecrets(command, c.Config.Mask)
-				if c.ColorEnabled() {
-					fmt.Fprintf(c.Out, "%s$ %s%s%s\n", c.C.Cyan, c.C.Reset+c.C.Dim, command, c.C.Reset)
-				} else {
-					fmt.Fprintln(c.Out, "$ "+command)
-				}
-			}
-		}
 	}
+}
+
+func rootCauseEvidenceLabel(evidence model.Evidence) string {
+	key := strings.Trim(strings.TrimSpace(evidence.Kind)+"."+strings.TrimSpace(evidence.Key), ".")
+	switch key {
+	case "service.spec.ports":
+		return "Serviceポート設定"
+	case "service.spec.selector":
+		return "Service selector"
+	case "service.selectorMatches", "pod.selectorMatches":
+		return "selector一致Pod"
+	case "pod.containerPortNames":
+		return "Pod側のcontainerPort"
+	case "decision.unresolved":
+		return "判定"
+	case "endpointSlice.resolvedPort":
+		return "EndpointSlice確認"
+	case "probe.portName":
+		return "Probeポート設定"
+	case "container.ports[].name":
+		return "containerPort設定"
+	}
+	return key
 }
 
 func rootStyle(c *Console, root model.RootCause) (string, string) {
@@ -397,15 +450,15 @@ func (c *Console) renderImpactTree(impacts []model.Impact, color string) {
 	walk(tree, "")
 }
 
-func (c *Console) Summary(state *model.State) {
+func (c *Console) Summary(state *model.State, beforeFinding ...func(model.Finding)) {
 	sections := []struct {
 		severity model.Severity
 		title    string
 		color    string
 	}{
 		{model.Issue, "確定異常", c.C.Red}, {model.Warning, "警告", c.C.Yellow},
-		{model.Unavailable, "診断不能・確認できなかった項目", c.C.Yellow},
-		{model.Candidate, "関連候補", c.C.Magenta},
+		{model.Unavailable, "確認できなかった項目", c.C.Yellow},
+		{model.Candidate, "要確認の候補", c.C.Magenta},
 	}
 	for _, section := range sections {
 		values := state.BySeverity(section.severity, false)
@@ -414,30 +467,60 @@ func (c *Console) Summary(state *model.State) {
 		}
 		c.Section(section.title, section.color)
 		for _, finding := range values {
+			for _, callback := range beforeFinding {
+				if callback != nil {
+					callback(finding)
+				}
+			}
 			c.Flag(finding)
 		}
 		c.Write(fmt.Sprintf("  (%d 件)", len(values)))
 	}
 	c.Section("クラスタ健全性スコア")
 	health, coverage := state.Health(), state.Coverage()
-	grade := "A"
-	healthColor := c.C.Green
+	grade, gradeLabel, healthColor := "A", "良好", c.C.Green
 	if health < 90 {
-		grade = "B"
-		healthColor = c.C.Yellow
+		grade, gradeLabel, healthColor = "B", "注意", c.C.Yellow
 	}
 	if health < 75 {
-		grade = "C"
+		grade, gradeLabel = "C", "要改善"
 	}
 	if health < 60 {
-		grade = "D"
-		healthColor = c.C.Red
+		grade, gradeLabel, healthColor = "D", "重大", c.C.Red
 	}
-	c.printColor(healthColor+c.C.Bold, fmt.Sprintf("  Health: %d / 100  (%s)", health, grade))
+	barWidth := max(12, min(24, c.width-38))
+	c.printColor(healthColor+c.C.Bold, fmt.Sprintf("  Health:   [%s] %3d/100  [%s] %s", scoreBar(health, barWidth), health, grade, gradeLabel))
 	ok, unavailable, total := state.CoverageCounts()
-	c.printColor(c.C.Blue, fmt.Sprintf("  Coverage: %d%%", coverage)+c.C.Reset+fmt.Sprintf(" (確認成功 %d/%d、取得失敗 %d 項目)", ok, total, unavailable))
-	c.Write(fmt.Sprintf("  重大度: ✘ 確定 %d / ▲ 警告 %d / ? 確認不能 %d / ◇ 候補 %d",
-		len(state.BySeverity(model.Issue, false)), len(state.BySeverity(model.Warning, false)), len(state.BySeverity(model.Unavailable, false)), len(state.BySeverity(model.Candidate, false))))
+	c.printColor(c.C.Cyan+c.C.Bold, fmt.Sprintf("  Coverage: [%s] %3d%%", scoreBar(coverage, barWidth), coverage))
+	coverageDetail := fmt.Sprintf("確認済み %d/%d・確認不能 %d項目", ok, total, unavailable)
+	if total == 0 {
+		coverageDetail = "確認対象なし"
+	}
+	c.printColor(c.C.Dim, "            "+coverageDetail)
+	issues := len(state.BySeverity(model.Issue, false))
+	warnings := len(state.BySeverity(model.Warning, false))
+	unavailableFindings := len(state.BySeverity(model.Unavailable, false))
+	candidates := len(state.BySeverity(model.Candidate, false))
+	if c.ColorEnabled() {
+		fmt.Fprintf(c.Out, "  所見:      %s✘ 確定 %d%s   %s▲ 警告 %d%s   %s? 確認不能 %d%s   %s◇ 候補 %d%s\n",
+			c.C.Red+c.C.Bold, issues, c.C.Reset,
+			c.C.Yellow+c.C.Bold, warnings, c.C.Reset,
+			c.C.Yellow, unavailableFindings, c.C.Reset,
+			c.C.Magenta, candidates, c.C.Reset)
+	} else {
+		c.Write(fmt.Sprintf("  所見:      ✘ 確定 %d   ▲ 警告 %d   ? 確認不能 %d   ◇ 候補 %d", issues, warnings, unavailableFindings, candidates))
+	}
+	c.printColor(c.C.Dim, "  Health＝クラスタ状態 / Coverage＝診断できた範囲")
+}
+
+func scoreBar(value, width int) string {
+	value = max(0, min(100, value))
+	width = max(1, width)
+	filled := value * width / 100
+	if value == 100 {
+		filled = width
+	}
+	return strings.Repeat("█", filled) + strings.Repeat("░", width-filled)
 }
 
 func (c *Console) printColor(color, value string) {
@@ -497,4 +580,31 @@ func Snip(value string, limit int) string {
 	}
 	runes := []rune(value)
 	return string(runes[:max(0, limit-1)]) + "…"
+}
+
+// TruncateDisplay shortens a string to at most limit terminal columns. It is
+// suitable for menu labels containing Japanese or other wide characters.
+func TruncateDisplay(value string, limit int) string {
+	value = redact.SanitizeText(value)
+	if limit <= 0 {
+		return ""
+	}
+	if DisplayWidth(value) <= limit {
+		return value
+	}
+	if limit == 1 {
+		return "…"
+	}
+	target := limit - DisplayWidth("…")
+	var builder strings.Builder
+	width := 0
+	for _, r := range value {
+		runeWidth := DisplayWidth(string(r))
+		if width+runeWidth > target {
+			break
+		}
+		builder.WriteRune(r)
+		width += runeWidth
+	}
+	return builder.String() + "…"
 }

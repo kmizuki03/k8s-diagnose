@@ -256,16 +256,17 @@ func ErrorReason(err error) string {
 		return ""
 	}
 	label := map[ErrorStatus]string{
-		StatusNotFound: "NotFound", StatusForbidden: "RBAC Forbidden",
-		StatusUnauthorized: "Unauthorized", StatusTimeout: "タイムアウト",
-		StatusUnavailable: "API到達不能", StatusInvalid: "API要求不正",
+		StatusNotFound: "対象が見つかりません", StatusForbidden: "アクセス権限がありません (RBAC)",
+		StatusUnauthorized: "認証が必要です", StatusTimeout: "要求がタイムアウトしました",
+		StatusUnavailable: "Kubernetes APIに到達できません", StatusInvalid: "API要求が不正です",
 	}[ClassifyError(err)]
 	detail := redact.MaskSecrets(strings.Join(strings.Fields(err.Error()), " "))
+	detail = strings.TrimSpace(strings.TrimPrefix(detail, "error:"))
 	if runes := []rune(detail); len(runes) > 300 {
 		detail = string(runes[:300]) + "…"
 	}
 	if label == "" {
-		return "APIエラー: " + detail
+		return "Kubernetes APIでエラーが発生しました: " + detail
 	}
 	if detail == "" {
 		return label
@@ -278,9 +279,9 @@ func (c *Clients) Preflight(ctx context.Context) error {
 	_, err := c.Kube.CoreV1().Pods(namespace).List(ctx, listOptions(1, "metadata.name=__k8s_diagnose_preflight__"))
 	if err != nil {
 		if c.Namespace != "" && apierrors.IsNotFound(err) {
-			return fmt.Errorf("namespace '%s' が見つかりません", c.Namespace)
+			return fmt.Errorf("Namespace %q が見つかりません", c.Namespace)
 		}
-		return fmt.Errorf("Kubernetesクラスタへ接続できません (%s)", ErrorReason(err))
+		return fmt.Errorf("Kubernetesクラスタに接続できません。原因: %s", ErrorReason(err))
 	}
 	return nil
 }

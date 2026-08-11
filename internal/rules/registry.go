@@ -57,6 +57,19 @@ func NewRegistry(values ...Rule) *Registry {
 
 func (r *Registry) Rules() []Rule { return append([]Rule{}, r.rules...) }
 
+// MetadataFor returns the declared inputs for one rule. Renderers use this to
+// show the equivalent kubectl command beside a finding when the finding does
+// not identify one concrete Kubernetes object.
+func (r *Registry) MetadataFor(id string) (Metadata, bool) {
+	for _, rule := range r.rules {
+		metadata := rule.Metadata()
+		if metadata.ID == id {
+			return metadata, true
+		}
+	}
+	return Metadata{}, false
+}
+
 // RequiredKeys returns the exact collector inputs needed by enabled rules.
 // This keeps --list cheap and avoids requesting resources unrelated to a mode.
 func (r *Registry) RequiredKeys(mode string) map[string]bool {

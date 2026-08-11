@@ -1,6 +1,7 @@
 package connect
 
 import (
+	"fmt"
 	"net/url"
 	"strings"
 	"testing"
@@ -294,5 +295,24 @@ func TestUnresolvedNamedProbePortIsExplicitIssue(t *testing.T) {
 	results, findings := (&Checker{Clients: &kube.Clients{}}).Check(t.Context(), &pod, nil)
 	if len(results) != 1 || len(findings) != 1 || findings[0].Code != "K8S.PROBE.PORT_UNRESOLVED" || findings[0].Severity != "issue" {
 		t.Fatalf("解決不能Probeの結果またはFindingが不正: results=%#v findings=%#v", results, findings)
+	}
+	for _, want := range []string{
+		"container \"api\" に設定されたreadinessProbe",
+		"ポート名 \"missing\" が指定されています",
+		"同じcontainerのports[].nameに \"missing\" は定義されていません",
+	} {
+		if !strings.Contains(findings[0].Message, want) {
+			t.Fatalf("Probeポート不一致の説明に%qがない: %q", want, findings[0].Message)
+		}
+	}
+	evidence := fmt.Sprint(findings[0].Evidence)
+	for _, want := range []string{
+		"readinessProbe.port: \"missing\"",
+		"container \"api\" の定義済みports[].name: なし",
+		"ポート名 \"missing\" に対応するcontainerPort: 0件",
+	} {
+		if !strings.Contains(evidence, want) {
+			t.Fatalf("Probeポート不一致の根拠に%qがない: %#v", want, findings[0].Evidence)
+		}
 	}
 }

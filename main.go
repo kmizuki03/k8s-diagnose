@@ -18,13 +18,14 @@ func main() {
 	if len(os.Args) > 0 {
 		program = os.Args[0]
 	}
-	cfg, err := config.Parse(os.Args[1:], program)
+	args := os.Args[1:]
+	cfg, err := config.Parse(args, program)
 	if errors.Is(err, config.ErrHelp) {
 		// os.File.Fd is uintptr for API compatibility, but a terminal descriptor
 		// is the platform's non-negative int file descriptor.
 		fd := int(os.Stdout.Fd()) // #nosec G115 -- canonical x/term descriptor conversion.
 		color := os.Getenv("NO_COLOR") == "" && term.IsTerminal(fd)
-		fmt.Print(config.HelpStyled(program, color))
+		fmt.Print(config.HelpStyledFor(program, config.HelpTopic(args), color))
 		return
 	}
 	if err != nil {
@@ -35,9 +36,42 @@ func main() {
 		fmt.Printf("k8s-diagnose %s (Go)\n", config.Version)
 		return
 	}
+	streams := app.Streams{In: os.Stdin, Out: os.Stdout, Err: os.Stderr}
+	if config.CommandName(args) == "config" {
+		if !app.InteractiveTerminal(streams) {
+			config.PrintError(os.Stderr, program, errors.New("configコマンドには対話端末が必要です"))
+			os.Exit(1)
+		}
+		_, saved, _, editErr := app.EditSettings(cfg, streams)
+		if editErr != nil {
+			if errors.Is(editErr, app.ErrInteractiveInterrupted) {
+				os.Exit(130)
+			}
+			config.PrintError(os.Stderr, program, editErr)
+			os.Exit(1)
+		}
+		if saved != "" {
+			fmt.Println("設定を保存しました:", saved)
+		}
+		return
+	}
+	if len(args) == 0 && app.InteractiveTerminal(streams) {
+		var quit bool
+		cfg, quit, err = app.Guide(cfg, streams)
+		if err != nil {
+			if errors.Is(err, app.ErrInteractiveInterrupted) {
+				os.Exit(130)
+			}
+			config.PrintError(os.Stderr, program, err)
+			os.Exit(1)
+		}
+		if quit {
+			return
+		}
+	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	code := app.Run(ctx, cfg, app.Streams{In: os.Stdin, Out: os.Stdout, Err: os.Stderr})
+	code := app.Run(ctx, cfg, streams)
 	code = interruptedExitCode(code, ctx.Err() != nil, cfg.Watch)
 	os.Exit(code)
 }

@@ -3,6 +3,7 @@ package config
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -16,10 +17,16 @@ func LoadINI(path string, cfg *Config) error {
 		return fmt.Errorf("設定ファイルを読み込めません: %s (%w)", path, err)
 	}
 	defer file.Close()
+	return loadINI(file, cfg)
+}
+
+// loadINI accepts a reader so the parser can be fuzzed without creating a
+// temporary file for every generated input.
+func loadINI(reader io.Reader, cfg *Config) error {
 	section := ""
 	seenSections := map[string]struct{}{}
 	seenKeys := map[string]struct{}{}
-	scanner := bufio.NewScanner(file)
+	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 4096), 1024*1024)
 	for lineNo := 1; scanner.Scan(); lineNo++ {
 		line := strings.TrimSpace(scanner.Text())
@@ -53,7 +60,10 @@ func LoadINI(path string, cfg *Config) error {
 			return fmt.Errorf("設定キーが重複しています: [%s] %s", section, key)
 		}
 		seenKeys[name] = struct{}{}
-		value := stripInlineComment(parts[1])
+		value, err := parseINIValue(parts[1])
+		if err != nil {
+			return fmt.Errorf("設定ファイルの値が不正です (%d行目): %w", lineNo, err)
+		}
 		if value == "" {
 			continue
 		}
@@ -68,33 +78,66 @@ func LoadINI(path string, cfg *Config) error {
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("設定ファイルを読み込めません: %w", err)
 	}
+	inheritLegacyAPIRequestSetting(cfg)
 	return nil
 }
 
-func knownSetting(name string) bool {
-	switch name {
-	case "target.namespace", "target.context", "target.kubeconfig", "target.timeout", "target.qps", "target.burst", "target.page_size",
-		"diagnosis.mode", "diagnosis.logs", "diagnosis.unused", "diagnosis.events_limit", "diagnosis.restart_threshold", "diagnosis.node_heartbeat_timeout", "diagnosis.watch", "diagnosis.workers", "diagnosis.log_signatures_file", "diagnosis.log_signature_lines",
-		"connection.enabled", "connection.port", "connection.path",
-		"debug.enabled", "debug.image", "debug.profile",
-		"display.tail", "display.mask_secrets", "display.exit_zero", "display.show_commands",
-		"report.format", "report.file", "report.save_snapshot", "report.diff", "report.baseline", "report.fail_on", "report.max_issues",
-		"history.database", "history.window", "history.flap_threshold", "history.restart_growth", "history.retain",
-		"notification.webhook_url_env", "notification.format", "notification.timeout":
-		return true
-	default:
-		return false
+func inheritLegacyAPIRequestSetting(cfg *Config) {
+	if cfg.SettingExplicit("display.show_commands") && !cfg.SettingExplicit("display.show_api_requests") {
+		cfg.ShowAPIRequests = cfg.ShowCmd
 	}
+}
+
+func knownSetting(name string) bool {
+	_, exists := settingByName[name]
+	return exists
+}
+
+func parseINIValue(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", nil
+	}
+	if value[0] == '"' {
+		quoted, rest, err := splitQuotedINIValue(value)
+		if err != nil {
+			return "", err
+		}
+		if rest != "" && rest[0] != '#' && rest[0] != ';' {
+			return "", fmt.Errorf("引用符付き値の後ろにはコメント以外を記述できません")
+		}
+		decoded, err := strconv.Unquote(quoted)
+		if err != nil {
+			return "", fmt.Errorf("引用符付き値を解析できません: %w", err)
+		}
+		return decoded, nil
+	}
+	return stripInlineComment(value), nil
+}
+
+func splitQuotedINIValue(value string) (string, string, error) {
+	escaped := false
+	for index := 1; index < len(value); index++ {
+		switch {
+		case escaped:
+			escaped = false
+		case value[index] == '\\':
+			escaped = true
+		case value[index] == '"':
+			return value[:index+1], strings.TrimSpace(value[index+1:]), nil
+		}
+	}
+	return "", "", fmt.Errorf("引用符が閉じられていません")
 }
 
 func stripInlineComment(value string) string {
 	value = strings.TrimSpace(value)
-	for index, r := range value {
-		if (r == '#' || r == ';') && index > 0 {
-			previous := value[index-1]
-			if previous == ' ' || previous == '\t' {
-				return strings.TrimSpace(value[:index])
-			}
+	for index := 0; index < len(value); index++ {
+		if value[index] != '#' && value[index] != ';' {
+			continue
+		}
+		if index > 0 && (value[index-1] == ' ' || value[index-1] == '\t') {
+			return strings.TrimSpace(value[:index])
 		}
 	}
 	return value
@@ -199,6 +242,8 @@ func applySetting(cfg *Config, section, key, value string) error {
 		return setBool(&cfg.ExitZero)
 	case "display.show_commands":
 		return setBool(&cfg.ShowCmd)
+	case "display.show_api_requests":
+		return setBool(&cfg.ShowAPIRequests)
 	case "report.format":
 		cfg.Output = strings.ToLower(value)
 	case "report.file":

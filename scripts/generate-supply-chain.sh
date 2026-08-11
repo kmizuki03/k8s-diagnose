@@ -40,13 +40,15 @@ if [[ -z $module_go_version ]]; then
   exit 1
 fi
 supply_toolchain=${K8S_DIAGNOSE_SUPPLY_GOTOOLCHAIN:-"go$module_go_version"}
+version=$("$script_dir/version.sh")
+version_symbol=github.com/kmizuki03/k8s-diagnose/internal/config.Version
 
 # Build the distributed artifact and generate its SBOM from the application
 # source. App mode evaluates build constraints and derives the main component
 # version from the Git checkout, unlike the more limited binary inspection mode.
 # Pin every analysis step to go.mod's patch release so a newer local GOROOT does
 # not change package discovery or the generated artifact.
-GOTOOLCHAIN="$supply_toolchain" go build -mod=readonly -trimpath -ldflags "-s -w" -o "$staging_dir/k8s-diagnose" .
+GOTOOLCHAIN="$supply_toolchain" go build -mod=readonly -trimpath -ldflags "-s -w -X $version_symbol=$version" -o "$staging_dir/k8s-diagnose" .
 GOTOOLCHAIN="$supply_toolchain" cyclonedx-gomod app -json -output-version 1.6 -output "$staging_dir/bom.cdx.json" "$project_dir"
 
 module_path=$(GOTOOLCHAIN="$supply_toolchain" go list -m -f '{{.Path}}')
