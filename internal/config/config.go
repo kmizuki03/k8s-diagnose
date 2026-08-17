@@ -47,6 +47,8 @@ type Config struct {
 	Output               string
 	OutputFile           string
 	SaveSnapshot         string
+	SaveClusterSnapshot  string
+	LoadClusterSnapshot  string
 	DiffFrom             string
 	FailOn               string
 	MaxIssues            *int
@@ -73,7 +75,10 @@ func Defaults() Config {
 	return Config{
 		Mode: "all", DebugImage: "busybox:1.36", DebugProfile: "general",
 		EventsLimit: 20, Tail: 30, RestartThreshold: 5, NodeHeartbeatTimeout: 180, RequestTimeout: 15,
-		Mask: true, ShowCmd: true, ShowAPIRequests: true, Output: "text", FailOn: "issue", Workers: 4,
+		// ShowAPIRequests defaults off: the API trace is a debugging aid, and
+		// printing it on every run buries the diagnosis it is meant to support.
+		// --api-requests turns it back on.
+		Mask: true, ShowCmd: true, ShowAPIRequests: false, Output: "text", FailOn: "issue", Workers: 4,
 		QPS: 10, Burst: 20, PageSize: 500,
 		HistoryWindow: 12, FlapThreshold: 3, RestartGrowth: 3, HistoryRetain: 1000,
 		WebhookFormat: "generic", WebhookTimeout: 5, LogSignatureLines: 200,
@@ -188,6 +193,8 @@ func Parse(args []string, prog string) (Config, error) {
 	fs.StringVar(&cfg.Output, "output", cfg.Output, "")
 	fs.StringVar(&cfg.OutputFile, "output-file", cfg.OutputFile, "")
 	fs.StringVar(&cfg.SaveSnapshot, "save-snapshot", cfg.SaveSnapshot, "")
+	fs.StringVar(&cfg.SaveClusterSnapshot, "save-cluster-snapshot", cfg.SaveClusterSnapshot, "")
+	fs.StringVar(&cfg.LoadClusterSnapshot, "load-cluster-snapshot", cfg.LoadClusterSnapshot, "")
 	fs.StringVar(&cfg.DiffFrom, "diff", cfg.DiffFrom, "")
 	fs.StringVar(&cfg.BaselineFile, "baseline", cfg.BaselineFile, "")
 	fs.StringVar(&cfg.FailOn, "fail-on", cfg.FailOn, "")
@@ -250,11 +257,12 @@ func Parse(args []string, prog string) (Config, error) {
 	if noCmd {
 		cfg.ShowCmd = false
 	}
-	if (showCmd || noCmd) && !showAPIRequests && !noAPIRequests && !cfg.SettingExplicit("display.show_api_requests") {
+	if (showCmd || noCmd) && !cfg.ShowCmd && !showAPIRequests && !noAPIRequests && !cfg.SettingExplicit("display.show_api_requests") {
 		// Before show_api_requests existed, --cmd/--no-cmd controlled both
-		// kubectl hints and the API trace. Preserve that behaviour unless the
-		// new setting is explicitly configured.
-		cfg.ShowAPIRequests = cfg.ShowCmd
+		// kubectl hints and the API trace. Only the silencing half of that is
+		// still inherited: --no-cmd keeps meaning "print nothing extra", while
+		// --cmd must not resurrect a trace that is now off by default.
+		cfg.ShowAPIRequests = false
 	}
 	if showAPIRequests && noAPIRequests {
 		return cfg, errors.New("--api-requests と --no-api-requests は同時に指定できません")
@@ -432,6 +440,32 @@ func (c Config) Validate(raw []string) error {
 	if (c.SaveSnapshot != "" || c.DiffFrom != "") && c.Watch > 0 {
 		return errors.New("--save-snapshot または --diff と、--watch は併用できません")
 	}
+	if c.SaveClusterSnapshot != "" && c.LoadClusterSnapshot != "" {
+		return errors.New("--save-cluster-snapshot と --load-cluster-snapshot は併用できません")
+	}
+	// list mode never runs the diagnosis path that records or replays cluster
+	// state, so accepting these there would silently do nothing.
+	if (c.SaveClusterSnapshot != "" || c.LoadClusterSnapshot != "") && c.Mode == "list" {
+		return errors.New("--save-cluster-snapshot / --load-cluster-snapshot は、-a、--triage、-s と組み合わせてください")
+	}
+	if c.LoadClusterSnapshot != "" && c.Watch > 0 {
+		return errors.New("--load-cluster-snapshot と --watch は併用できません")
+	}
+	// A replayed snapshot is a fixed recording: there is no cluster to reach,
+	// so anything that performs live access would silently do nothing or fail.
+	if c.LoadClusterSnapshot != "" && (c.Connect || c.Debug || c.ShowLogs) {
+		return errors.New("--load-cluster-snapshot では、--connect、--debug、--logs は使用できません（保存済みのクラスタ状態にはクラスタへの接続がありません）")
+	}
+	// A replay is historical input, not the cluster's current state. Recording
+	// it in the operational history or notifying it as a new incident would
+	// corrupt trends and produce misleading alerts. --diff and report/snapshot
+	// output stay available because they are side-effect-free regression tools.
+	if c.LoadClusterSnapshot != "" && (c.HistoryDB != "" || c.WebhookURLEnv != "") {
+		return errors.New("--load-cluster-snapshot では、--history-db と --webhook-url-env は使用できません（保存済みの過去状態を現在の履歴・通知として扱わないためです）")
+	}
+	if c.LoadClusterSnapshot != "" && c.explicitlyConfigured(raw, "display.show_api_requests", "--api-requests", "--no-api-requests") && c.ShowAPIRequests {
+		return errors.New("--load-cluster-snapshot ではKubernetes APIへ接続しないため、--api-requestsは使用できません")
+	}
 	if !oneOf(c.FailOn, "issue", "warning", "unavailable", "any", "none") {
 		return errors.New("--fail-on は issue、warning、unavailable、any、none のいずれかを指定してください")
 	}
@@ -493,11 +527,13 @@ func validateDistinctOutputPaths(c Config) error {
 	writers := []configuredPath{
 		{"--output-file", c.OutputFile, false},
 		{"--save-snapshot", c.SaveSnapshot, false},
+		{"--save-cluster-snapshot", c.SaveClusterSnapshot, false},
 		{"--history-db", c.HistoryDB, true},
 	}
 	readers := []configuredPath{
 		{"--config", c.ConfigFile, false},
 		{"--diff", c.DiffFrom, false},
+		{"--load-cluster-snapshot", c.LoadClusterSnapshot, false},
 		{"--baseline", c.BaselineFile, false},
 		{"--log-signatures", c.LogSignatures, false},
 		{"--kubeconfig", c.Kubeconfig, false},
@@ -719,12 +755,16 @@ Pod選択操作 (-s / -a --debug):
   -w, --watch SEC           1秒以上の間隔で再診断 (-a / --triage)
       --cmd / --no-cmd      各診断項目の確認用kubectlの表示切替
       --api-requests / --no-api-requests
-                            末尾の「実行したKubernetes API要求」の表示切替
+                            末尾の「実行したKubernetes API要求」の表示切替 (既定は非表示)
       --exit-zero           所見があってもexit 0
       --output FORMAT       text/json/sarif/junit/mermaid/dot
       --output-file FILE    構造化出力の保存先
       --save-snapshot FILE  今回の結果を保存
       --diff FILE           前回snapshotと比較
+      --save-cluster-snapshot FILE
+                            診断元のクラスタ状態を保存 (マスク済み。不具合報告用)
+      --load-cluster-snapshot FILE
+                            保存したクラスタ状態で再診断 (クラスタ接続不要)
       --baseline FILE       期限・理由付き承認済み所見INI
       --fail-on LEVEL       issue/warning/unavailable/any/none
       --max-issues N        fail-on対象の許容件数
@@ -811,18 +851,4 @@ func PrintError(stream io.Writer, prog string, err error) {
 	message := redact.MaskSecrets(err.Error())
 	program := redact.SanitizeText(prog)
 	fmt.Fprintf(stream, "エラー: %s\n使い方は '%s --help'、全フラグと組み合わせは '%s advanced --help' で確認できます。\n", message, program, program)
-}
-
-func EnsureReadableFile(path string) error {
-	if path == "" {
-		return nil
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-	if !info.Mode().IsRegular() {
-		return errors.New("指定されたパスは通常ファイルではありません")
-	}
-	return nil
 }

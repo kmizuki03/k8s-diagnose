@@ -198,7 +198,15 @@ func (runner *Runner) promptPod(pods []corev1.Pod) (*corev1.Pod, bool, error) {
 		}
 		runner.Console.Write("  ↑/↓: 選択  Enter/→: 決定")
 		runner.Console.Write("  n: Namespace検索  /・f: Pod名検索  r: 両方を編集")
-		runner.Console.Write("  c: 条件を消去  b: 戻る  q: 終了")
+		// "b" is the single back key across every screen, and the only step this
+		// one can go back to is the search that narrowed the list. Offering 戻る
+		// with nothing behind it is what made it read as a second quit key, so it
+		// is listed only while a search is actually applied.
+		if namespaceQuery != "" || nameQuery != "" {
+			runner.Console.Write("  c: 条件を消去  b: 検索前へ戻る  q: 終了")
+		} else {
+			runner.Console.Write("  c: 条件を消去  q: 終了")
+		}
 
 		action, err := readPodSelectionKey(reader, runner.Streams.In)
 		if err != nil {
@@ -275,7 +283,17 @@ func (runner *Runner) promptPod(pods []corev1.Pod) (*corev1.Pod, bool, error) {
 			}
 		case podSelectionClearSearch:
 			namespaceQuery, nameQuery, selected = "", "", 0
-		case podSelectionBack, podSelectionQuit:
+		case podSelectionBack:
+			if namespaceQuery == "" && nameQuery == "" {
+				// Nothing precedes this screen: the guide has already finished by
+				// the time the diagnosis runs, so there is no parent to return to.
+				// Quitting here would make the documented back key a second quit
+				// key and throw away the list the operator is working through.
+				notice = "これ以上戻る画面はありません。終了する場合は q を押してください。"
+				break
+			}
+			namespaceQuery, nameQuery, selected = "", "", 0
+		case podSelectionQuit:
 			return nil, true, nil
 		case podSelectionInterrupt:
 			return nil, false, errPodSelectionInterrupted
@@ -368,6 +386,30 @@ func readPodSelectionSequence(reader *bufio.Reader) (podSelectionAction, error) 
 	}
 }
 
+// scanEscapeParameters reads the parameter bytes of a CSI/SS3 escape sequence
+// up to its final byte, which the standard defines as the first byte in the
+// range 0x40..0x7e. limit bounds how many bytes are consumed so a malformed or
+// hostile stream cannot make the caller read forever.
+//
+// found reports whether a final byte was reached within the limit. Errors —
+// including io.EOF — are returned unwrapped so each caller can apply its own
+// policy: pod selection treats a truncated sequence as "no key pressed", while
+// the wizard propagates the read error.
+func scanEscapeParameters(reader *bufio.Reader, limit int) (parameters []byte, final byte, found bool, err error) {
+	parameters = make([]byte, 0, 8)
+	for range limit {
+		value, readErr := reader.ReadByte()
+		if readErr != nil {
+			return parameters, 0, false, readErr
+		}
+		if value >= 0x40 && value <= 0x7e {
+			return parameters, value, true, nil
+		}
+		parameters = append(parameters, value)
+	}
+	return parameters, 0, false, nil
+}
+
 func readPodEscapeSequence(reader *bufio.Reader) (podSelectionAction, error) {
 	prefix, err := reader.ReadByte()
 	if errors.Is(err, io.EOF) {
@@ -379,19 +421,14 @@ func readPodEscapeSequence(reader *bufio.Reader) (podSelectionAction, error) {
 	if prefix != '[' && prefix != 'O' {
 		return podSelectionNone, nil
 	}
-	parameters := make([]byte, 0, 8)
-	for range 16 {
-		value, err := reader.ReadByte()
-		if errors.Is(err, io.EOF) {
-			return podSelectionNone, nil
-		}
-		if err != nil {
-			return podSelectionNone, err
-		}
-		if value < 0x40 || value > 0x7e {
-			parameters = append(parameters, value)
-			continue
-		}
+	parameters, value, found, err := scanEscapeParameters(reader, 16)
+	if errors.Is(err, io.EOF) {
+		return podSelectionNone, nil
+	}
+	if err != nil {
+		return podSelectionNone, err
+	}
+	if found {
 		switch value {
 		case 'A':
 			return podSelectionUp, nil
@@ -441,7 +478,6 @@ func readPodEscapeSequence(reader *bufio.Reader) (podSelectionAction, error) {
 				return podMouseWheelAction(button), nil
 			}
 		}
-		return podSelectionNone, nil
 	}
 	return podSelectionNone, nil
 }

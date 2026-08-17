@@ -58,7 +58,9 @@ func Validate(ctx context.Context, path string) error {
 	if err != nil {
 		return err
 	}
-	info, statErr := os.Stat(path)
+	// Lstat, not Stat: a symlink at the database path must be reported as a
+	// non-regular file and rejected rather than silently followed to its target.
+	info, statErr := os.Lstat(path)
 	if statErr != nil {
 		if !errors.Is(statErr, os.ErrNotExist) {
 			return fmt.Errorf("履歴DBを確認できません: %w", statErr)
@@ -101,6 +103,8 @@ func open(ctx context.Context, path string) (*sql.DB, error) {
 }
 
 func ensurePrivateDatabaseFile(path string) error {
+	// O_EXCL|O_CREATE refuses to follow a symlink when creating, so a freshly
+	// created database is always a real 0600 regular file.
 	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o600) // #nosec G304 -- --history-db explicitly selects this private 0600 database.
 	if err == nil {
 		return file.Close()
@@ -108,14 +112,23 @@ func ensurePrivateDatabaseFile(path string) error {
 	if !errors.Is(err, os.ErrExist) {
 		return fmt.Errorf("履歴DBを安全に作成できません: %w", err)
 	}
-	info, statErr := os.Stat(path)
+	// The file already exists. Open it without following a final-component
+	// symlink and run every check against the descriptor (fstat/fchmod) so a
+	// planted symlink can neither be chmod'd nor written through on a shared
+	// host.
+	file, err = openExistingNoFollow(path)
+	if err != nil {
+		return fmt.Errorf("履歴DBを安全に開けません（シンボリックリンクの可能性があります）: %w", err)
+	}
+	defer file.Close()
+	info, statErr := file.Stat()
 	if statErr != nil {
 		return fmt.Errorf("履歴DBを確認できません: %w", statErr)
 	}
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("履歴DBのパスがファイルではありません: %s", path)
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
+	if err := file.Chmod(0o600); err != nil {
 		return fmt.Errorf("履歴DBの権限を0600に設定できません: %w", err)
 	}
 	return nil

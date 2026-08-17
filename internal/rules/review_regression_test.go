@@ -784,19 +784,57 @@ func TestSecretConfirmationCommandDoesNotPrintSecretYAML(t *testing.T) {
 	}
 }
 
-func TestOptionalDependencyMissingIsIgnoredAndRequiredWins(t *testing.T) {
+func TestOptionalDependencyMissingIsExplicitAndRequiredWins(t *testing.T) {
 	optional := true
 	required := false
 	pod := corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "ns"}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", EnvFrom: []corev1.EnvFromSource{
 		{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "settings"}, Optional: &optional}},
 	}}}}}
-	if findings := (DependencyRule{}).Evaluate(context.Background(), &kube.Snapshot{Pods: []corev1.Pod{pod}}, config.Defaults()); len(findings) != 1 || findings[0].Resource != "ServiceAccount/ns/default" {
-		t.Fatalf("optional ConfigMapが検出された: %#v", findings)
+	snapshot := &kube.Snapshot{Pods: []corev1.Pod{pod}, ServiceAccounts: []corev1.ServiceAccount{{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "ns"}}}}
+	findings := (DependencyRule{}).Evaluate(context.Background(), snapshot, config.Defaults())
+	if !hasCodeAndResource(findings, "K8S.DEPENDENCY.OPTIONAL_OBJECT_MISSING", "ConfigMap/ns/settings") {
+		t.Fatalf("存在しないoptional ConfigMapが明示されない: %#v", findings)
+	}
+	if len(findings) != 1 || findings[0].Severity != model.Candidate || !strings.Contains(findings[0].Message, "リソース自体") {
+		t.Fatalf("optional ConfigMapを確定異常にせず明示する必要がある: %#v", findings)
 	}
 	pod.Spec.Containers[0].EnvFrom = append(pod.Spec.Containers[0].EnvFrom, corev1.EnvFromSource{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "settings"}, Optional: &required}})
-	findings := (DependencyRule{}).Evaluate(context.Background(), &kube.Snapshot{Pods: []corev1.Pod{pod}}, config.Defaults())
+	snapshot.Pods = []corev1.Pod{pod}
+	findings = (DependencyRule{}).Evaluate(context.Background(), snapshot, config.Defaults())
 	if !hasCodeAndResource(findings, "K8S.DEPENDENCY.MISSING_OBJECT", "ConfigMap/ns/settings") {
 		t.Fatalf("required参照がoptionalに握りつぶされた: %#v", findings)
+	}
+	if hasCodeAndResource(findings, "K8S.DEPENDENCY.OPTIONAL_OBJECT_MISSING", "ConfigMap/ns/settings") {
+		t.Fatalf("required参照とoptional候補が二重表示された: %#v", findings)
+	}
+	for _, finding := range findings {
+		if finding.Code != "K8S.DEPENDENCY.MISSING_OBJECT" || finding.Resource != "ConfigMap/ns/settings" {
+			continue
+		}
+		if !strings.Contains(finding.Message, "ConfigMap ns/settings") || !strings.Contains(finding.Message, "リソース自体が未作成か、すでに削除") {
+			t.Fatalf("存在しない必須ConfigMapの説明が曖昧: %q", finding.Message)
+		}
+		if !evidenceContains(finding, "一致するリソースは0件") {
+			t.Fatalf("存在しないと判定した根拠がない: %#v", finding.Evidence)
+		}
+	}
+}
+
+func TestUnrelatedConfigMapDoesNotSatisfyNamedReference(t *testing.T) {
+	pod := corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "ns"}, Spec: corev1.PodSpec{
+		ServiceAccountName: "default",
+		Containers: []corev1.Container{{Name: "app", EnvFrom: []corev1.EnvFromSource{{
+			ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "app-settings"}},
+		}}}},
+	}}
+	snapshot := &kube.Snapshot{
+		Pods:            []corev1.Pod{pod},
+		ConfigMaps:      []corev1.ConfigMap{{ObjectMeta: metav1.ObjectMeta{Name: "kube-root-ca.crt", Namespace: "ns"}}},
+		ServiceAccounts: []corev1.ServiceAccount{{ObjectMeta: metav1.ObjectMeta{Name: "default", Namespace: "ns"}}},
+	}
+	findings := (DependencyRule{}).Evaluate(context.Background(), snapshot, config.Defaults())
+	if !hasCodeAndResource(findings, "K8S.DEPENDENCY.MISSING_OBJECT", "ConfigMap/ns/app-settings") {
+		t.Fatalf("無関係なkube-root-ca.crtを参照先ConfigMapと誤認した: %#v", findings)
 	}
 }
 
@@ -1046,4 +1084,297 @@ func hasCodeAndResource(findings []model.Finding, code, resource string) bool {
 		}
 	}
 	return false
+}
+
+// numericTargetPortPod builds a Pod that declares 8080 both as a containerPort
+// and as the readinessProbe destination, and reports itself Ready. Every static
+// signal therefore looks healthy no matter what the Service points at, which is
+// exactly what makes a wrong numeric targetPort so hard to see.
+func numericTargetPortPod() corev1.Pod {
+	return corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "api-abc", Namespace: "ns", Labels: map[string]string{"app": "api"}},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{
+			Name:  "api",
+			Ports: []corev1.ContainerPort{{ContainerPort: 8080, Protocol: corev1.ProtocolTCP}},
+			ReadinessProbe: &corev1.Probe{ProbeHandler: corev1.ProbeHandler{
+				HTTPGet: &corev1.HTTPGetAction{Port: intstr.FromInt32(8080), Path: "/"},
+			}},
+		}}},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}
+}
+
+func numericTargetPortService(target int32) corev1.Service {
+	return corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "ns"},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{"app": "api"},
+			Ports:    []corev1.ServicePort{{Name: "web", Port: 80, Protocol: corev1.ProtocolTCP, TargetPort: intstr.FromInt32(target)}},
+		},
+	}
+}
+
+func TestNumericTargetPortMismatchIsReportedAsCandidate(t *testing.T) {
+	pod := numericTargetPortPod()
+	// The EndpointSlice carries the Service's targetPort verbatim and the Pod is
+	// Ready, so NO_READY_ENDPOINT stays silent. Without this rule the whole
+	// diagnosis would not mention the port at all.
+	port, ready := int32(8081), true
+	slice := discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "ns", Labels: map[string]string{"kubernetes.io/service-name": "api"}},
+		Endpoints:  []discoveryv1.Endpoint{{Conditions: discoveryv1.EndpointConditions{Ready: &ready}}},
+		Ports:      []discoveryv1.EndpointPort{{Port: &port}},
+	}
+	findings := (ServiceRule{}).Evaluate(context.Background(), &kube.Snapshot{
+		Pods: []corev1.Pod{pod}, Services: []corev1.Service{numericTargetPortService(8081)}, EndpointSlices: []discoveryv1.EndpointSlice{slice},
+	}, config.Defaults())
+	if !hasCodeAndResource(findings, "K8S.SERVICE.TARGET_PORT_UNDECLARED", "Service/ns/api") {
+		t.Fatalf("数値targetPortの不一致を検出できない: %#v", findings)
+	}
+	for _, finding := range findings {
+		if finding.Code != "K8S.SERVICE.TARGET_PORT_UNDECLARED" {
+			continue
+		}
+		if finding.Severity != model.Candidate {
+			t.Fatalf("数値targetPortは宣言必須ではないためCandidateであるべき: %s", finding.Severity)
+		}
+		if !strings.Contains(finding.Message, "8081") || !strings.Contains(finding.Message, "設定どおり") {
+			t.Fatalf("誤検知しうることが本文から読み取れない: %q", finding.Message)
+		}
+	}
+}
+
+func TestNumericTargetPortStaysSilentWhenThePortIsAccountedFor(t *testing.T) {
+	probeOnly := numericTargetPortPod()
+	probeOnly.Spec.Containers[0].Ports = nil // probe alone already proves 8080 is served
+	undeclared := numericTargetPortPod()
+	undeclared.Spec.Containers[0].Ports = nil
+	undeclared.Spec.Containers[0].ReadinessProbe = nil // nothing declared: no evidence either way
+	for _, tc := range []struct {
+		name   string
+		pod    corev1.Pod
+		target int32
+	}{
+		{"containerPortに一致", numericTargetPortPod(), 8080},
+		{"Probeのポートに一致", probeOnly, 8080},
+		{"ポートを何も宣言していない", undeclared, 8081},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			findings := (ServiceRule{}).Evaluate(context.Background(), &kube.Snapshot{
+				Pods: []corev1.Pod{tc.pod}, Services: []corev1.Service{numericTargetPortService(tc.target)},
+			}, config.Defaults())
+			if hasCodeAndResource(findings, "K8S.SERVICE.TARGET_PORT_UNDECLARED", "Service/ns/api") {
+				t.Fatalf("誤検知: %#v", findings)
+			}
+		})
+	}
+}
+
+// optional:true turns a mistyped key from a startup error into silence: the
+// container runs, no event is recorded, and the variable simply does not exist.
+// The object being present is what separates this from a feature that is
+// genuinely not deployed, which stays unreported.
+func TestOptionalKeyMissingFromAnExistingObjectIsReported(t *testing.T) {
+	optional := true
+	pod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "ns"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Env: []corev1.EnvVar{{
+			Name: "DATABASE_URL", ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "cm"}, Key: "DATABASE_URL", Optional: &optional,
+			}},
+		}}}}},
+	}
+	configMap := corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cm", Namespace: "ns"},
+		Data:       map[string]string{"database_url": "postgres://x"},
+	}
+	findings := (DependencyRule{}).Evaluate(context.Background(), &kube.Snapshot{
+		Pods: []corev1.Pod{pod}, ConfigMaps: []corev1.ConfigMap{configMap},
+	}, config.Defaults())
+	if !hasCodeAndResource(findings, "K8S.DEPENDENCY.OPTIONAL_KEY_MISSING", "ConfigMap/ns/cm") {
+		t.Fatalf("optional指定のキー名誤りを検出できない: %#v", findings)
+	}
+	for _, finding := range findings {
+		if finding.Code != "K8S.DEPENDENCY.OPTIONAL_KEY_MISSING" {
+			continue
+		}
+		if finding.Severity != model.Candidate {
+			t.Errorf("optionalは利用者が明示した設定なのでCandidateであるべき: %s", finding.Severity)
+		}
+		// The operator needs the name that does exist in order to spot the typo.
+		if !hasEvidenceValue(finding, "database_url") {
+			t.Errorf("実在するキー名が検出根拠にない: %#v", finding.Evidence)
+		}
+	}
+}
+
+func TestOptionalKeyPresentIsNotReported(t *testing.T) {
+	optional := true
+	pod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "ns"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Env: []corev1.EnvVar{{
+			Name: "DATABASE_URL", ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "cm"}, Key: "database_url", Optional: &optional,
+			}},
+		}}}}},
+	}
+	configMap := corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cm", Namespace: "ns"},
+		Data:       map[string]string{"database_url": "postgres://x"},
+	}
+	findings := (DependencyRule{}).Evaluate(context.Background(), &kube.Snapshot{
+		Pods: []corev1.Pod{pod}, ConfigMaps: []corev1.ConfigMap{configMap},
+	}, config.Defaults())
+	if hasCodeAndResource(findings, "K8S.DEPENDENCY.OPTIONAL_KEY_MISSING", "ConfigMap/ns/cm") {
+		t.Fatalf("解決できているoptional参照を誤検知した: %#v", findings)
+	}
+}
+
+func hasEvidenceValue(finding model.Finding, needle string) bool {
+	for _, evidence := range finding.Evidence {
+		if strings.Contains(evidence.Value, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// Kubernetes keeps the last entry for a duplicated variable, so the manifest can
+// state one value while the container runs with another.
+func TestDuplicateEnvNameWithADifferentValueIsReported(t *testing.T) {
+	pod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "ns"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Env: []corev1.EnvVar{
+			{Name: "LOG_LEVEL", Value: "debug"},
+			{Name: "LOG_LEVEL", Value: "info"},
+		}}}},
+	}
+	findings := (ConfigRiskRule{}).Evaluate(context.Background(), &kube.Snapshot{Pods: []corev1.Pod{pod}}, config.Defaults())
+	if !hasCodeAndResource(findings, "K8S.CONFIG.ENV_DUPLICATE_NAME", "Pod/ns/app") {
+		t.Fatalf("env重複を検出できない: %#v", findings)
+	}
+	for _, finding := range findings {
+		if finding.Code == "K8S.CONFIG.ENV_DUPLICATE_NAME" && !hasEvidenceValue(finding, `value "info"`) {
+			t.Errorf("どちらが採用されるのか検出根拠から分からない: %#v", finding.Evidence)
+		}
+	}
+}
+
+func TestDuplicateEnvNameWithTheSameValueIsNotReported(t *testing.T) {
+	pod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "ns"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Env: []corev1.EnvVar{
+			{Name: "LOG_LEVEL", Value: "info"},
+			{Name: "LOG_LEVEL", Value: "info"},
+		}}}},
+	}
+	findings := (ConfigRiskRule{}).Evaluate(context.Background(), &kube.Snapshot{Pods: []corev1.Pod{pod}}, config.Defaults())
+	if hasCodeAndResource(findings, "K8S.CONFIG.ENV_DUPLICATE_NAME", "Pod/ns/app") {
+		t.Fatalf("同じ値の重複を誤検知した: %#v", findings)
+	}
+}
+
+func TestDuplicateEnvEquivalentOptionalDefaultsAreNotReported(t *testing.T) {
+	optionalFalse := false
+	pod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "ns"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Env: []corev1.EnvVar{
+			{Name: "CONFIG", ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "settings"}, Key: "mode",
+			}}},
+			{Name: "CONFIG", ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "settings"}, Key: "mode", Optional: &optionalFalse,
+			}}},
+		}}}},
+	}
+	findings := (ConfigRiskRule{}).Evaluate(context.Background(), &kube.Snapshot{Pods: []corev1.Pod{pod}}, config.Defaults())
+	if hasCodeAndResource(findings, "K8S.CONFIG.ENV_DUPLICATE_NAME", "Pod/ns/app") {
+		t.Fatalf("optional未指定とfalseという同じ参照を異なる値として誤検知した: %#v", findings)
+	}
+}
+
+func TestDuplicateEnvNameReportsTheActualLastOfThreeDefinitions(t *testing.T) {
+	pod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "ns"},
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Env: []corev1.EnvVar{
+			{Name: "LOG_LEVEL", Value: "debug"},
+			{Name: "LOG_LEVEL", Value: "info"},
+			{Name: "LOG_LEVEL", Value: "warn"},
+		}}}},
+	}
+	findings := (ConfigRiskRule{}).Evaluate(context.Background(), &kube.Snapshot{Pods: []corev1.Pod{pod}}, config.Defaults())
+	count := 0
+	for _, finding := range findings {
+		if finding.Code != "K8S.CONFIG.ENV_DUPLICATE_NAME" {
+			continue
+		}
+		count++
+		for _, evidence := range finding.Evidence {
+			if evidence.Key == "effective" && (!strings.Contains(evidence.Value, `value "warn"`) || strings.Contains(evidence.Value, `value "info"`)) {
+				t.Errorf("最終定義ではない値を採用値として表示した: %q", evidence.Value)
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("3重定義は最終値を示す1件に集約すべき: count=%d findings=%#v", count, findings)
+	}
+}
+
+func webhookSnapshot(services ...corev1.Service) *kube.Snapshot {
+	fail := admissionv1.Fail
+	snapshot := &kube.Snapshot{
+		Services: services,
+		ValidatingWebhooks: []admissionv1.ValidatingWebhookConfiguration{{
+			ObjectMeta: metav1.ObjectMeta{Name: "addon"},
+			Webhooks: []admissionv1.ValidatingWebhook{{
+				Name:          "addon.example.com",
+				FailurePolicy: &fail,
+				ClientConfig: admissionv1.WebhookClientConfig{
+					Service: &admissionv1.ServiceReference{Namespace: "addon-system", Name: "addon-webhook"},
+				},
+			}},
+		}},
+	}
+	return snapshot
+}
+
+// Webhook configurations are cluster-scoped while Services are collected inside
+// the requested namespace, so a namespaced run simply never sees a webhook's
+// Service in another namespace. Calling that "does not exist" turned every
+// healthy cluster add-on into a confirmed defect.
+func TestWebhookServiceOutsideTheDiagnosedNamespaceIsUnverifiableNotMissing(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Namespace = "shop"
+	findings := (WebhookRule{}).Evaluate(context.Background(), webhookSnapshot(), cfg)
+	if hasCodeAndResource(findings, "K8S.WEBHOOK.MISSING_SERVICE", "ValidatingWebhookConfiguration/addon") {
+		t.Fatalf("取得対象外のServiceを存在しないと断定した: %#v", findings)
+	}
+	if !hasCodeAndResource(findings, "K8S.WEBHOOK.SERVICE_UNVERIFIABLE", "ValidatingWebhookConfiguration/addon") {
+		t.Fatalf("確認できない旨を報告していない: %#v", findings)
+	}
+	for _, finding := range findings {
+		if finding.Code == "K8S.WEBHOOK.SERVICE_UNVERIFIABLE" && finding.Severity != model.Unavailable {
+			t.Errorf("確認不能として扱われていない: %s", finding.Severity)
+		}
+	}
+}
+
+// A Service that really is absent inside the diagnosed namespace stays a
+// confirmed defect, and a cluster-wide run can still judge every webhook.
+func TestWebhookMissingServiceIsStillReportedWhenItIsInScope(t *testing.T) {
+	inScope := config.Defaults()
+	inScope.Namespace = "addon-system"
+	if !hasCodeAndResource((WebhookRule{}).Evaluate(context.Background(), webhookSnapshot(), inScope), "K8S.WEBHOOK.MISSING_SERVICE", "ValidatingWebhookConfiguration/addon") {
+		t.Fatal("対象namespace内の欠落Serviceを検出できない")
+	}
+	if !hasCodeAndResource((WebhookRule{}).Evaluate(context.Background(), webhookSnapshot(), config.Defaults()), "K8S.WEBHOOK.MISSING_SERVICE", "ValidatingWebhookConfiguration/addon") {
+		t.Fatal("全namespace実行で欠落Serviceを検出できない")
+	}
+	present := corev1.Service{ObjectMeta: metav1.ObjectMeta{Namespace: "addon-system", Name: "addon-webhook"}}
+	if findings := (WebhookRule{}).Evaluate(context.Background(), webhookSnapshot(present), config.Defaults()); len(findings) != 0 {
+		t.Fatalf("実在するServiceを誤検知した: %#v", findings)
+	}
 }

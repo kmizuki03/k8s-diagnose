@@ -11,6 +11,43 @@ import (
 	"github.com/kmizuki03/k8s-diagnose/internal/report"
 )
 
+// TestHistoryDatabaseRejectsSymlinkTarget guards the shared-host (bastion)
+// hardening: a symlink planted at the database path must be refused, and its
+// target must never be chmod'd or written through.
+func TestHistoryDatabaseRejectsSymlinkTarget(t *testing.T) {
+	dir := t.TempDir()
+	victim := filepath.Join(dir, "victim.secret")
+	if err := os.WriteFile(victim, []byte("do-not-touch"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(dir, "history.db")
+	if err := os.Symlink(victim, dbPath); err != nil {
+		t.Skipf("シンボリックリンクを作成できない環境のためスキップ: %v", err)
+	}
+
+	if err := ensurePrivateDatabaseFile(dbPath); err == nil {
+		t.Fatal("シンボリックリンクを介した履歴DBを受理した")
+	}
+	if err := Validate(context.Background(), dbPath); err == nil {
+		t.Fatal("Validateがシンボリックリンクの履歴DBを受理した")
+	}
+
+	info, err := os.Stat(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o644 {
+		t.Fatalf("被害者ファイルの権限が変更された: %o", perm)
+	}
+	data, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "do-not-touch" {
+		t.Fatalf("被害者ファイルが書き換えられた: %q", data)
+	}
+}
+
 func historyDocument(generated, severity string, restart int) report.Document {
 	findings := []any{}
 	if severity != "" {

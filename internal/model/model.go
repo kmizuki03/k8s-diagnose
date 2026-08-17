@@ -58,14 +58,14 @@ type Finding struct {
 }
 
 func NewFinding(severity Severity, code, section, resource, reason, stableKey, message string, confidence int, evidence ...Evidence) Finding {
+	// A negative confidence means "use the severity's default"; defaultConfidence
+	// only ever returns 40..100, so clamping the low end again afterwards would
+	// be unreachable.
 	if confidence < 0 {
 		confidence = defaultConfidence(severity)
 	}
 	if confidence > 100 {
 		confidence = 100
-	}
-	if confidence < 0 {
-		confidence = 0
 	}
 	f := Finding{
 		Code: code, Severity: severity, Section: section, Resource: resource,

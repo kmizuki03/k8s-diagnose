@@ -498,14 +498,12 @@ func buildDependencyGraph(snapshot *kube.Snapshot) *dependencyGraph {
 			graph.add(sliceRef, ref("Service", slice.Namespace, service), "service-endpoints", "")
 		}
 	}
+	podIndex := indexPodsByNamespace(snapshot.Pods)
 	for i := range snapshot.Services {
 		service := &snapshot.Services[i]
 		serviceRef := ref("Service", service.Namespace, service.Name)
-		for podIndex := range snapshot.Pods {
-			pod := &snapshot.Pods[podIndex]
-			if serviceMatchesPod(service, pod) {
-				graph.add(ref("Pod", pod.Namespace, pod.Name), serviceRef, "service-selector", "")
-			}
+		for _, pod := range podIndex.selected(service) {
+			graph.add(ref("Pod", pod.Namespace, pod.Name), serviceRef, "service-selector", "")
 		}
 	}
 	for i := range snapshot.Ingresses {

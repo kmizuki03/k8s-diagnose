@@ -882,23 +882,21 @@ func discardWizardEscapeSequence(reader *bufio.Reader) error {
 	}
 	switch prefix {
 	case '[', 'O': // CSI / SS3: 最終バイトは 0x40〜0x7e。
-		for index := range 128 {
-			value, readErr := reader.ReadByte()
-			if readErr != nil {
-				return readErr
-			}
-			if value >= 0x40 && value <= 0x7e {
-				// 古いX10マウス形式は ESC [ M の後ろにボタン・X・Yの
-				// 3バイトを続ける。ここまで捨てないと座標が文字になる。
-				if prefix == '[' && index == 0 && value == 'M' {
-					for range 3 {
-						if _, readErr = reader.ReadByte(); readErr != nil {
-							return readErr
-						}
+		parameters, value, found, readErr := scanEscapeParameters(reader, 128)
+		if readErr != nil {
+			return readErr
+		}
+		if found {
+			// 古いX10マウス形式は ESC [ M の後ろにボタン・X・Yの
+			// 3バイトを続ける。ここまで捨てないと座標が文字になる。
+			if prefix == '[' && len(parameters) == 0 && value == 'M' {
+				for range 3 {
+					if _, readErr = reader.ReadByte(); readErr != nil {
+						return readErr
 					}
 				}
-				return nil
 			}
+			return nil
 		}
 	case ']': // OSC: BEL または ST (ESC \\) まで。
 		escape := false

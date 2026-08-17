@@ -9,6 +9,8 @@ import (
 	"github.com/kmizuki03/k8s-diagnose/internal/kube"
 	"github.com/kmizuki03/k8s-diagnose/internal/model"
 	"github.com/kmizuki03/k8s-diagnose/internal/rules"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestDiagnosticItemsAssociateRuleResultAndItemSpecificCommands(t *testing.T) {
@@ -79,6 +81,34 @@ func TestDiagnosticItemsSeparateCurrentAndPreviousLogResultsAndCommands(t *testi
 	currentCommands, previousCommands := strings.Join(currentItem.Commands, "\n"), strings.Join(previousItem.Commands, "\n")
 	if strings.Contains(currentCommands, "--previous") || !strings.Contains(previousCommands, "--previous") {
 		t.Fatalf("current/previousのログコマンドが混在した: current=%q previous=%q", currentCommands, previousCommands)
+	}
+}
+
+func TestDiagnosticItemsExplicitlyReportsSuccessfullyFetchedEmptyResources(t *testing.T) {
+	cfg := config.Defaults()
+	runner := &Runner{Config: cfg, Registry: rules.Builtins()}
+	snapshot := kube.NewSnapshot()
+	snapshot.Statuses["configmaps"] = kube.FetchStatus{Available: true}
+	state := model.NewState()
+	state.AddCheck(model.Check{ID: "configmaps", Section: "ConfigMap", Description: "ConfigMap診断", Available: true})
+
+	item := diagnosticItemByID(t, runner.diagnosticItems(snapshot, state), "configmaps")
+	if len(item.InputSummaries) != 1 || item.InputSummaries[0] != "ConfigMap一覧: 0件（この診断範囲には存在しません）" {
+		t.Fatalf("取得成功した空のConfigMap一覧が明示されない: %#v", item.InputSummaries)
+	}
+	snapshot.ConfigMaps = []corev1.ConfigMap{{ObjectMeta: metav1.ObjectMeta{Name: "kube-root-ca.crt", Namespace: "prod"}}}
+	snapshot.ResetIndex()
+	item = diagnosticItemByID(t, runner.diagnosticItems(snapshot, state), "configmaps")
+	if len(item.InputSummaries) != 1 || item.InputSummaries[0] != "ConfigMap一覧: kube-root-ca.crt以外 0件（kube-root-ca.crt 1件のみ）" {
+		t.Fatalf("自動注入ConfigMapとその他の内訳が分からない: %#v", item.InputSummaries)
+	}
+
+	// An unavailable collection is not empty; it is unknown and must remain in
+	// the separate diagnostic-unavailable path.
+	snapshot.Statuses["configmaps"] = kube.FetchStatus{Available: false, Reason: "forbidden"}
+	item = diagnosticItemByID(t, runner.diagnosticItems(snapshot, state), "configmaps")
+	if len(item.InputSummaries) != 0 {
+		t.Fatalf("取得不能を件数表示した: %#v", item.InputSummaries)
 	}
 }
 

@@ -3,6 +3,7 @@ package rules
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 
 	"github.com/kmizuki03/k8s-diagnose/internal/config"
@@ -11,6 +12,98 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
+
+// duplicateEnvFindings reports a container that sets the same variable twice
+// with different values. Kubernetes keeps the last entry and discards the
+// earlier one without complaint, so the manifest states one value while the
+// container runs with another.
+//
+// Appending an override list after a base list is a real templating pattern, so
+// this stays a candidate and only fires when the two values actually differ:
+// repeating a variable with the identical value changes nothing.
+func duplicateEnvFindings(pod *corev1.Pod) []model.Finding {
+	result := []model.Finding{}
+	report := func(container corev1.Container) {
+		definitions := map[string][]corev1.EnvVar{}
+		order := []string{}
+		for _, env := range container.Env {
+			if _, seen := definitions[env.Name]; !seen {
+				order = append(order, env.Name)
+			}
+			definitions[env.Name] = append(definitions[env.Name], env)
+		}
+		for _, name := range order {
+			values := definitions[name]
+			if len(values) < 2 {
+				continue
+			}
+			effective := values[len(values)-1]
+			differs := false
+			overridden := make([]string, 0, len(values)-1)
+			for _, earlier := range values[:len(values)-1] {
+				overridden = append(overridden, envValueText(earlier))
+				if !sameEnvValue(earlier, effective) {
+					differs = true
+				}
+			}
+			if !differs {
+				continue
+			}
+			result = append(result, model.NewFinding(
+				model.Candidate, "K8S.CONFIG.ENV_DUPLICATE_NAME", "構成リスク",
+				ref("Pod", pod.Namespace, pod.Name), "EnvDuplicateName", container.Name+"/env/"+name,
+				fmt.Sprintf("Pod %s のコンテナ %q では、環境変数 %q が異なる値で複数回定義されています。Kubernetesは最後の定義だけを採用するため、先に書かれた値はコンテナに渡りません。上書きを意図した記述であれば設定どおりです",
+					shortRef(pod.Namespace, pod.Name), container.Name, name), 50,
+				model.Evidence{Kind: "container", Key: "env", Value: fmt.Sprintf("コンテナ %q の env に %q が%d回定義されています", container.Name, name, len(values))},
+				model.Evidence{Kind: "container", Key: "effective", Value: "最後に採用される定義: " + envValueText(effective)},
+				model.Evidence{Kind: "container", Key: "overridden", Value: "先に書かれ、無視される定義: " + strings.Join(overridden, " / ")},
+				model.Evidence{Kind: "decision", Key: "precedence", Value: "Kubernetesはenvを名前で解決し、同名がある場合は後の定義を採用します"},
+			))
+		}
+	}
+	for _, container := range pod.Spec.InitContainers {
+		report(container)
+	}
+	for _, container := range pod.Spec.Containers {
+		report(container)
+	}
+	for _, container := range pod.Spec.EphemeralContainers {
+		report(corev1.Container(container.EphemeralContainerCommon))
+	}
+	return result
+}
+
+// sameEnvValue reports whether two entries for one variable resolve to the same
+// thing. Two references are only treated as equal when they name the same
+// source, since this rule must never claim a difference it cannot see.
+func sameEnvValue(a, b corev1.EnvVar) bool {
+	if a.ValueFrom == nil && b.ValueFrom == nil {
+		return a.Value == b.Value
+	}
+	if a.ValueFrom == nil || b.ValueFrom == nil {
+		return false
+	}
+	if left, right := a.ValueFrom.ConfigMapKeyRef, b.ValueFrom.ConfigMapKeyRef; left != nil || right != nil {
+		return left != nil && right != nil && left.Name == right.Name && left.Key == right.Key && boolValue(left.Optional, false) == boolValue(right.Optional, false)
+	}
+	if left, right := a.ValueFrom.SecretKeyRef, b.ValueFrom.SecretKeyRef; left != nil || right != nil {
+		return left != nil && right != nil && left.Name == right.Name && left.Key == right.Key && boolValue(left.Optional, false) == boolValue(right.Optional, false)
+	}
+	return reflect.DeepEqual(a.ValueFrom, b.ValueFrom)
+}
+
+func envValueText(env corev1.EnvVar) string {
+	switch {
+	case env.ValueFrom != nil && env.ValueFrom.ConfigMapKeyRef != nil:
+		return fmt.Sprintf("configMapKeyRef %s/%s", env.ValueFrom.ConfigMapKeyRef.Name, env.ValueFrom.ConfigMapKeyRef.Key)
+	case env.ValueFrom != nil && env.ValueFrom.SecretKeyRef != nil:
+		return fmt.Sprintf("secretKeyRef %s/%s", env.ValueFrom.SecretKeyRef.Name, env.ValueFrom.SecretKeyRef.Key)
+	case env.ValueFrom != nil:
+		return "valueFrom（fieldRef等）"
+	default:
+		return fmt.Sprintf("value %q", env.Value)
+	}
+}
 
 type ConfigRiskRule struct{}
 
@@ -82,6 +175,7 @@ func (ConfigRiskRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ con
 				result = append(result, model.NewFinding(model.Candidate, "K8S.CONFIG.LIVENESS_PROBE_MISSING", "構成リスク", ref("Pod", pod.Namespace, pod.Name), "LivenessProbeMissing", container.Name+"/liveness", fmt.Sprintf("Pod %s のコンテナ %q には、livenessProbe が設定されていません", shortRef(pod.Namespace, pod.Name), container.Name), 35))
 			}
 		}
+		result = append(result, duplicateEnvFindings(pod)...)
 	}
 	return result
 }

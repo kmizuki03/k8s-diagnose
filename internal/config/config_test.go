@@ -160,14 +160,16 @@ func TestBooleanSettingsExposeSelectionMetadataAndReadableSummary(t *testing.T) 
 	if !spec.Boolean {
 		t.Fatalf("真偽値設定として定義されていない: %#v", spec)
 	}
-	if got := SettingSummary(Defaults(), spec); got != "有効（true）［組み込み既定］" {
+	// The API trace is off by default; the summary must say so and mark it as
+	// the built-in value rather than something the operator chose.
+	if got := SettingSummary(Defaults(), spec); got != "無効（false）［組み込み既定］" {
 		t.Fatalf("既定値の表示=%q", got)
 	}
-	updated, err := Defaults().WithSetting(spec.Name, "false")
+	updated, err := Defaults().WithSetting(spec.Name, "true")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := SettingSummary(updated, spec); got != "無効（false）" {
+	if got := SettingSummary(updated, spec); got != "有効（true）" {
 		t.Fatalf("明示値の表示=%q", got)
 	}
 }
@@ -329,6 +331,65 @@ func TestQPSRejectsNonFiniteAndFloat32Overflow(t *testing.T) {
 	cfg.QPS = 0.1
 	if err := cfg.Validate(nil); err != nil {
 		t.Fatalf("通常の正の有限QPSを拒否した: %v", err)
+	}
+}
+
+// TestPositiveDurationBoundsRejectZero locks in the lower bound for the
+// timeout-style options. A zero --timeout would otherwise disable net/http's
+// client timeout entirely, turning any unresponsive API server into an
+// indefinite hang during incident response.
+func TestPositiveDurationBoundsRejectZero(t *testing.T) {
+	cases := []struct {
+		label string
+		set   func(c *Config, v int)
+	}{
+		{"--timeout", func(c *Config, v int) { c.RequestTimeout = v }},
+		{"--webhook-timeout", func(c *Config, v int) { c.WebhookTimeout = v }},
+		{"--node-heartbeat-timeout", func(c *Config, v int) { c.NodeHeartbeatTimeout = v }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.label, func(t *testing.T) {
+			for _, v := range []int{0, -1} {
+				cfg := Defaults()
+				tc.set(&cfg, v)
+				if err := cfg.Validate(nil); err == nil {
+					t.Fatalf("%s=%d を受理した", tc.label, v)
+				}
+			}
+		})
+	}
+}
+
+// TestClusterSnapshotOptionCombinations covers the support workflow flags: a
+// replay has no cluster behind it, so anything requiring live access must be
+// refused rather than silently doing nothing.
+func TestClusterSnapshotOptionCombinations(t *testing.T) {
+	rejected := [][]string{
+		{"-a", "--save-cluster-snapshot", "a.json", "--load-cluster-snapshot", "b.json"},
+		{"-a", "--load-cluster-snapshot", "b.json", "--watch", "5"},
+		{"-a", "--load-cluster-snapshot", "b.json", "--logs"},
+		{"-a", "--load-cluster-snapshot", "b.json", "--history-db", "history.db"},
+		{"-a", "--load-cluster-snapshot", "b.json", "--diff", "previous.json", "--webhook-url-env", "HOOK_URL"},
+		{"-a", "--load-cluster-snapshot", "b.json", "--api-requests"},
+		{"-l", "--save-cluster-snapshot", "a.json"},
+		{"-l", "--load-cluster-snapshot", "b.json"},
+		// A replay input must never be clobbered by an output path.
+		{"-a", "--load-cluster-snapshot", "same.json", "--save-snapshot", "same.json"},
+	}
+	for _, args := range rejected {
+		if _, err := Parse(args, "k8s-diagnose"); err == nil {
+			t.Errorf("不正な組み合わせを受理した: %v", args)
+		}
+	}
+	accepted := [][]string{
+		{"-a", "--save-cluster-snapshot", "a.json"},
+		{"-a", "--load-cluster-snapshot", "b.json"},
+		{"--triage", "--save-cluster-snapshot", "a.json"},
+	}
+	for _, args := range accepted {
+		if _, err := Parse(args, "k8s-diagnose"); err != nil {
+			t.Errorf("正当な組み合わせを拒否した: %v (%v)", args, err)
+		}
 	}
 }
 
@@ -597,5 +658,31 @@ func TestFocusedHelpShowsOnlyTheSelectedEntryPoint(t *testing.T) {
 	}
 	if topic := HelpTopic([]string{"-s", "--help"}); topic != "pod" {
 		t.Fatalf("従来モードからhelp topicを解決できない: %q", topic)
+	}
+}
+
+// The API trace is a debugging aid. Printing it on every run buries the
+// diagnosis it exists to support, so it stays off until asked for — and --cmd
+// must not switch it back on through the pre-show_api_requests coupling.
+func TestAPIRequestTraceIsOffUntilRequested(t *testing.T) {
+	if Defaults().ShowAPIRequests {
+		t.Fatal("実API要求が既定で表示される")
+	}
+	for _, tc := range []struct {
+		args []string
+		want bool
+	}{
+		{[]string{"-a"}, false},
+		{[]string{"-a", "--cmd"}, false},
+		{[]string{"-a", "--api-requests"}, true},
+		{[]string{"-a", "--no-cmd"}, false},
+	} {
+		cfg, err := Parse(tc.args, "k8s-diagnose")
+		if err != nil {
+			t.Fatalf("%v: %v", tc.args, err)
+		}
+		if cfg.ShowAPIRequests != tc.want {
+			t.Errorf("%v: ShowAPIRequests=%v, want %v", tc.args, cfg.ShowAPIRequests, tc.want)
+		}
 	}
 }

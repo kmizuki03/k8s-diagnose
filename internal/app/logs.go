@@ -16,6 +16,40 @@ import (
 
 const maxLogBytesPerContainer = 512 * 1024
 
+// addReplayLogUnavailable makes the implicit per-Pod log diagnosis in select
+// mode explicit when the input is an offline snapshot. Cluster snapshots store
+// Kubernetes objects, not container logs; attempting the normal API request
+// would dereference the intentionally nil offline client. Mark both log views
+// unavailable so Coverage also reflects that this part was not reproduced.
+func (runner *Runner) addReplayLogUnavailable(snapshot *kube.Snapshot, state *model.State, selected bool) {
+	reason := "保存済みクラスタ状態にはコンテナログが含まれず、再生時はKubernetes APIへ接続しないため取得できません"
+	referenceTime := snapshot.ServerTime
+	if referenceTime.IsZero() {
+		referenceTime = time.Now()
+	}
+	for i := range snapshot.Pods {
+		pod := &snapshot.Pods[i]
+		if !selected && isHealthyPod(pod, runner.Config, referenceTime) {
+			continue
+		}
+		for _, source := range []struct{ key, label string }{{"current", "現在"}, {"previous", "前回終了時"}} {
+			state.AddCheck(model.Check{
+				ID:      "logs/" + pod.Namespace + "/" + pod.Name + "/" + source.key,
+				Section: "ログ", Description: fmt.Sprintf("Pod %s/%s のログ（%s）", pod.Namespace, pod.Name, source.label),
+				Available: false, Reason: reason,
+			})
+			finding := model.NewFinding(
+				model.Unavailable, "K8S.LOG.REPLAY_UNAVAILABLE", "ログ", "Pod/"+pod.Namespace+"/"+pod.Name,
+				"LogNotStored", source.key,
+				fmt.Sprintf("Pod %s/%s のログ（%s）は、保存済みクラスタ状態からは再現できません", pod.Namespace, pod.Name, source.label), 100,
+				model.Evidence{Kind: "snapshot", Key: "logs", Value: reason},
+			)
+			finding.RuleID = "logs"
+			state.Add(finding)
+		}
+	}
+}
+
 func (runner *Runner) collectLogs(ctx context.Context, snapshot *kube.Snapshot, state *model.State, selected bool) {
 	referenceTime := snapshot.ServerTime
 	if referenceTime.IsZero() {

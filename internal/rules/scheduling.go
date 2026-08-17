@@ -305,23 +305,11 @@ func hasTaint(taints []corev1.Taint, key string) bool {
 func pvcNodeSchedulingConstraints(pod *corev1.Pod, node *corev1.Node, snapshot *kube.Snapshot) ([]string, []string) {
 	result := []string{}
 	unknowns := []string{}
-	classes := map[string]*storagev1.StorageClass{}
-	for i := range snapshot.StorageClasses {
-		class := &snapshot.StorageClasses[i]
-		classes[class.Name] = class
-	}
 	pvsTrackedStatus, pvsTracked := snapshot.Statuses["pvs"]
 	pvsKnown := pvsTracked && pvsTrackedStatus.Available || !pvsTracked && len(snapshot.PersistentVolumes) > 0
 	for _, reference := range podPVCReferences(pod) {
 		name := reference.claimName
-		var pvc *corev1.PersistentVolumeClaim
-		for i := range snapshot.PersistentVolumeClaims {
-			candidate := &snapshot.PersistentVolumeClaims[i]
-			if candidate.Namespace == pod.Namespace && candidate.Name == name {
-				pvc = candidate
-				break
-			}
-		}
+		pvc, _ := snapshot.PersistentVolumeClaim(pod.Namespace, name)
 		if pvc == nil {
 			if reference.ephemeral {
 				result = append(result, fmt.Sprintf("Generic Ephemeral Volume %q に必要なPVC %q が存在しません", reference.volume, name))
@@ -355,13 +343,7 @@ func pvcNodeSchedulingConstraints(pod *corev1.Pod, node *corev1.Node, snapshot *
 				unknowns = append(unknowns, fmt.Sprintf("PVを取得できなかったため、PVC %q の nodeAffinity は評価していません", name))
 				continue
 			}
-			var persistentVolume *corev1.PersistentVolume
-			for i := range snapshot.PersistentVolumes {
-				if snapshot.PersistentVolumes[i].Name == pvc.Spec.VolumeName {
-					persistentVolume = &snapshot.PersistentVolumes[i]
-					break
-				}
-			}
+			persistentVolume, _ := snapshot.PersistentVolume(pvc.Spec.VolumeName)
 			if persistentVolume == nil {
 				result = append(result, fmt.Sprintf("PVC %q が参照するPV %q は存在しません", name, pvc.Spec.VolumeName))
 				continue
@@ -377,7 +359,7 @@ func pvcNodeSchedulingConstraints(pod *corev1.Pod, node *corev1.Node, snapshot *
 		if pvc.Spec.StorageClassName != nil {
 			className = *pvc.Spec.StorageClassName
 		}
-		class := classes[className]
+		class, _ := snapshot.StorageClass(className)
 		waitForConsumer := class != nil && class.VolumeBindingMode != nil && *class.VolumeBindingMode == storagev1.VolumeBindingWaitForFirstConsumer
 		if pvc.Status.Phase == corev1.ClaimPending && waitForConsumer {
 			if node != nil && !matchesAllowedTopologies(class.AllowedTopologies, node.Labels) {

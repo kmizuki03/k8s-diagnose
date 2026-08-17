@@ -138,6 +138,21 @@ func (r *warningRecorder) Drain() []string {
 	return values
 }
 
+// OfflineClients returns a Clients that performs no cluster access. It exists
+// for replaying a saved cluster snapshot, where there is no API server to reach
+// and no kubeconfig to require. Only the descriptive fields used by reporting
+// are populated; every client interface stays nil, so any accidental live call
+// fails loudly instead of silently contacting the wrong cluster.
+func OfflineClients(cfg config.Config) *Clients {
+	return &Clients{
+		Context:   "(保存済みクラスタ状態)",
+		Namespace: cfg.Namespace,
+		Timeout:   time.Duration(cfg.RequestTimeout) * time.Second,
+		warnings:  &warningRecorder{},
+		trace:     &requestTracer{},
+	}
+}
+
 func NewClients(cfg config.Config) (*Clients, error) {
 	rules := clientcmd.NewDefaultClientConfigLoadingRules()
 	if cfg.Kubeconfig != "" {
@@ -203,7 +218,12 @@ func (c *Clients) BeginCollection() {
 
 // SetTraceWriter enables a sanitized trace of the actual client-go HTTP
 // requests. Authentication headers and request bodies are never printed.
-func (c *Clients) SetTraceWriter(writer io.Writer) { c.trace.setWriter(writer) }
+func (c *Clients) SetTraceWriter(writer io.Writer) {
+	if c == nil || c.trace == nil {
+		return
+	}
+	c.trace.setWriter(writer)
+}
 
 func (c *Clients) ServerTime() time.Time {
 	if c == nil || c.trace == nil {

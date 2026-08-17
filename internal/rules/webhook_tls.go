@@ -26,7 +26,7 @@ func (WebhookRule) Metadata() Metadata {
 	return Metadata{ID: "webhooks", Section: "Webhook", Description: "Admission Webhookが参照するService", Required: []string{"validatingwebhooks", "mutatingwebhooks", "services"}, Permissions: permissions, Modes: []string{"all", "triage"}}
 }
 
-func (WebhookRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Config) []model.Finding {
+func (WebhookRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, cfg config.Config) []model.Finding {
 	result := []model.Finding{}
 	serviceExists := func(namespace, name string) bool {
 		for i := range snapshot.Services {
@@ -38,6 +38,20 @@ func (WebhookRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config
 	}
 	check := func(kind, owner, name string, client admissionv1.WebhookClientConfig, policy *admissionv1.FailurePolicyType) {
 		if client.Service == nil || serviceExists(client.Service.Namespace, client.Service.Name) {
+			return
+		}
+		// Webhook configurations are cluster-scoped, but Services are collected
+		// only within the requested namespace. A webhook pointing somewhere else
+		// is therefore simply not in the snapshot, and "not collected" must never
+		// be reported as "does not exist" — on a namespaced run that turned every
+		// healthy cluster add-on into a confirmed defect.
+		if cfg.Namespace != "" && client.Service.Namespace != cfg.Namespace {
+			result = append(result, model.NewFinding(
+				model.Unavailable, "K8S.WEBHOOK.SERVICE_UNVERIFIABLE", "Webhook", ref(kind, "", owner), "ServiceOutOfScope", name,
+				fmt.Sprintf("%s %s のWebhook %q が参照するService %s/%s の有無を確認できません。診断対象が namespace %q のため、別namespaceのServiceは取得していません", kind, owner, name, client.Service.Namespace, client.Service.Name, cfg.Namespace), 100,
+				model.Evidence{Kind: "reference", Key: "service", Value: shortRef(client.Service.Namespace, client.Service.Name)},
+				model.Evidence{Kind: "decision", Key: "scope", Value: fmt.Sprintf("Webhook設定はクラスタ全体、Serviceは namespace %q だけを取得しています。全namespaceで実行すると判定できます", cfg.Namespace)},
+			))
 			return
 		}
 		failurePolicy := admissionv1.Fail

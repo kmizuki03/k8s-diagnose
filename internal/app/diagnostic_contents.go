@@ -1,6 +1,7 @@
 package app
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/kmizuki03/k8s-diagnose/internal/console"
@@ -27,10 +28,149 @@ func (runner *Runner) diagnosticItems(snapshot *kube.Snapshot, state *model.Stat
 		}
 		items = append(items, console.DiagnosticItem{
 			Check: check, Findings: findingsForDiagnosticCheck(original, state.Findings),
-			Commands: displayCommands, Supplemental: supplemental,
+			Commands: displayCommands, InputSummaries: runner.inputSummariesForDiagnosticCheck(snapshot, original, optionalKey), Supplemental: supplemental,
 		})
 	}
 	return items
+}
+
+// inputSummariesForDiagnosticCheck distinguishes a successful list from an API
+// request that could not be completed and shows the actual target count. In
+// particular, kube-root-ca.crt is normally injected into every namespace; its
+// presence must not leave the impression that an application ConfigMap exists.
+func (runner *Runner) inputSummariesForDiagnosticCheck(snapshot *kube.Snapshot, check model.Check, optionalKey string) []string {
+	if snapshot == nil || strings.HasPrefix(check.ID, "logs/") {
+		return nil
+	}
+	keys := []string{}
+	switch {
+	case optionalKey != "":
+		keys = append(keys, optionalKey)
+	case strings.HasPrefix(check.ID, "unused/"):
+		keys = append(keys, strings.TrimPrefix(check.ID, "unused/"))
+	case runner.Registry != nil:
+		if metadata, ok := runner.Registry.MetadataFor(check.ID); ok {
+			keys = append(keys, metadata.Required...)
+		}
+	}
+
+	seen := map[string]struct{}{}
+	result := []string{}
+	for _, key := range keys {
+		if _, duplicate := seen[key]; duplicate {
+			continue
+		}
+		primary := len(seen) == 0
+		seen[key] = struct{}{}
+		if status, tracked := snapshot.Statuses[key]; tracked && !status.Available {
+			continue
+		}
+		count, countable := diagnosticInputCount(snapshot, key)
+		if !countable || count > 0 && !primary && key != "configmaps" {
+			continue
+		}
+		result = append(result, diagnosticInputSummary(snapshot, key, count))
+	}
+	return result
+}
+
+func diagnosticInputSummary(snapshot *kube.Snapshot, key string, count int) string {
+	label := diagnosticInputLabel(key)
+	if count == 0 {
+		return label + ": 0件（この診断範囲には存在しません）"
+	}
+	if key != "configmaps" {
+		return fmt.Sprintf("%s: %d件", label, count)
+	}
+	rootCA := 0
+	for i := range snapshot.ConfigMaps {
+		if snapshot.ConfigMaps[i].Name == "kube-root-ca.crt" {
+			rootCA++
+		}
+	}
+	if count == rootCA {
+		return fmt.Sprintf("%s: kube-root-ca.crt以外 0件（kube-root-ca.crt %d件のみ）", label, rootCA)
+	}
+	return fmt.Sprintf("%s: %d件（kube-root-ca.crt %d件 / その他 %d件）", label, count, rootCA, count-rootCA)
+}
+
+func diagnosticInputCount(snapshot *kube.Snapshot, key string) (int, bool) {
+	switch key {
+	case "pods":
+		return len(snapshot.Pods), true
+	case "all_pods":
+		return len(snapshot.AllPods), true
+	case "nodes":
+		return len(snapshot.Nodes), true
+	case "node_leases":
+		return len(snapshot.NodeLeases), true
+	case "services":
+		return len(snapshot.Services), true
+	case "endpoints":
+		return len(snapshot.Endpoints), true
+	case "endpoint_slices":
+		return len(snapshot.EndpointSlices), true
+	case "pvcs":
+		return len(snapshot.PersistentVolumeClaims), true
+	case "pvs":
+		return len(snapshot.PersistentVolumes), true
+	case "configmaps":
+		return len(snapshot.ConfigMaps), true
+	case "secrets":
+		return len(snapshot.Secrets), true
+	case "serviceaccounts":
+		return len(snapshot.ServiceAccounts), true
+	case "namespaces":
+		return len(snapshot.Namespaces), true
+	case "events":
+		return len(snapshot.Events), true
+	case "resourcequotas":
+		return len(snapshot.ResourceQuotas), true
+	case "limitranges":
+		return len(snapshot.LimitRanges), true
+	case "deployments":
+		return len(snapshot.Deployments), true
+	case "statefulsets":
+		return len(snapshot.StatefulSets), true
+	case "daemonsets":
+		return len(snapshot.DaemonSets), true
+	case "replicasets":
+		return len(snapshot.ReplicaSets), true
+	case "jobs":
+		return len(snapshot.Jobs), true
+	case "cronjobs":
+		return len(snapshot.CronJobs), true
+	case "hpas":
+		return len(snapshot.HPAs), true
+	case "ingresses":
+		return len(snapshot.Ingresses), true
+	case "ingressclasses":
+		return len(snapshot.IngressClasses), true
+	case "networkpolicies":
+		return len(snapshot.NetworkPolicies), true
+	case "validatingwebhooks":
+		return len(snapshot.ValidatingWebhooks), true
+	case "mutatingwebhooks":
+		return len(snapshot.MutatingWebhooks), true
+	case "storageclasses":
+		return len(snapshot.StorageClasses), true
+	case "pdbs":
+		return len(snapshot.PodDisruptionBudgets), true
+	case "priorityclasses":
+		return len(snapshot.PriorityClasses), true
+	case "runtimeclasses":
+		return len(snapshot.RuntimeClasses), true
+	case "node_metrics":
+		return len(snapshot.NodeMetrics), true
+	case "pod_metrics":
+		return len(snapshot.PodMetrics), true
+	case "apiservices":
+		return len(snapshot.APIServices), true
+	case "crds":
+		return len(snapshot.CustomResourceDefs), true
+	default:
+		return 0, false
+	}
 }
 
 func (runner *Runner) commandsForDiagnosticCheck(snapshot *kube.Snapshot, check model.Check, optionalKey string) [][]string {
@@ -201,6 +341,7 @@ var diagnosticInputLabels = map[string]string{ // #nosec G101 -- Kubernetes reso
 	"replicasets":        "ReplicaSet一覧",
 	"jobs":               "Job一覧",
 	"cronjobs":           "CronJob一覧",
+	"hpas":               "HorizontalPodAutoscaler一覧",
 	"ingresses":          "Ingress一覧",
 	"networkpolicies":    "NetworkPolicy一覧",
 	"resourcequotas":     "ResourceQuota一覧",

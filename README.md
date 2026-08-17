@@ -12,7 +12,7 @@ Go版の主な目的は次の4点です。
 ## 1. 動作要件
 
 - 実行時: 有効なkubeconfigまたはin-cluster相当の認証情報
-- ビルド時: `go.mod`とCIが指定するGo 1.25.12。別minor系列を使う場合も、その系列の最新security patchを使用
+- ビルド時: `go.mod`とCIが指定するGo 1.25.13以上。別minor系列を使う場合も、その系列の最新security patchを使用
 - `kubectl`: 通常診断には不要。`--debug`の対話実行時のみ必要
 - `curl` / `jq` / `openssl` / `nc`: 不要
 
@@ -26,7 +26,7 @@ make build
 ./k8s-diagnose --help
 ```
 
-`make build`はGit tag（tagがなければcommit hash、変更中は`-dirty`付き）をバイナリへ注入します。直接ビルドする場合は次のように同じ値を渡せます。
+`make build`はGit tag（tagがなければcommit hash、変更中は`-dirty`付き）をバイナリへ注入します。また、端末に別のGoが入っていても、既定では`go.mod`に記載したパッチ版を`GOTOOLCHAIN`で使用します。別の修正版を明示する場合は、例えば`make GOTOOLCHAIN=go1.26.6 build`とします。直接ビルドする場合は次のように同じ値を渡せます。
 
 ```bash
 VERSION=$(./scripts/version.sh)
@@ -172,7 +172,7 @@ dist/releases/k8s-diagnose_VERSION_OS_ARCH/
 | `--node-heartbeat-timeout SEC` | Node Lease停滞判定秒数。既定180。`-a` / `--triage`のみ |
 | `--log-signatures FILE` | カスタムログシグネチャINI。`-s`または`-a --logs` |
 | `--log-signature-lines N` | 解析する末尾行数、1〜5000。既定200 |
-| `--connect` | `-s`でProbe/Pod/Service指定Podを一時port-forwardにより単発確認。追加確認なし |
+| `--connect` | `-s`でProbe/Pod直接/Serviceの転送先ポートを一時port-forwardにより単発確認。追加確認なし。port-forwardはPodへ直接つなぐため、ClusterIP経由の経路は検証しない |
 | `--connect-port PORT` | ローカル先頭ポート、1024〜65535。`--connect`必須 |
 | `--connect-path PATH` | `/`で始まるHTTP pathの上書き。`--connect`必須 |
 | `--debug` | 診断後に対話debugメニュ。`-a` / `-s`のtext出力のみ |
@@ -186,13 +186,15 @@ dist/releases/k8s-diagnose_VERSION_OS_ARCH/
 | `--tail N` | `30` | text表示ログ行数。明示指定は`-s`または`-a --logs` |
 | `--no-mask` | mask有効 | 対話端末のtext出力だけマスクを無効化。pipe/redirectおよび永続出力との組み合わせはエラー |
 | `--cmd`, `--no-cmd` | 表示 | text出力で、各診断項目の見出し直後・結果本文の前に等価kubectlコマンドを表示／非表示 |
-| `--api-requests`, `--no-api-requests` | 表示 | text出力末尾の「実行したKubernetes API要求」を表示／非表示。INIでは`[display] show_api_requests = false` |
+| `--api-requests`, `--no-api-requests` | 非表示 | text出力末尾の「実行したKubernetes API要求」を表示／非表示。既定は非表示で、`--api-requests`または`[display] show_api_requests = true`で表示 |
 | `-w, --watch SEC` | 無効 | `-a` / `--triage`の定期実行。1以上 |
 | `--exit-zero` | 無効 | 所見があってもexit 0。引数/API/保存/通知エラーは1。`--list`では使用不可 |
 | `--output FORMAT` | `text` | `text`, `json`, `sarif`, `junit`, `mermaid`, `dot` |
 | `--output-file FILE` | stdout | 構造化出力の保存先 |
 | `--save-snapshot FILE` | 無し | report/v1 JSON snapshotをatomic保存 |
 | `--diff FILE` | 無し | 前回snapshotと比較 |
+| `--save-cluster-snapshot FILE` | 無し | 診断元のクラスタ状態（入力）をマスクして保存。`--list`では使用不可 |
+| `--load-cluster-snapshot FILE` | 無し | 保存したクラスタ状態で再診断。クラスタ接続不要 |
 | `--baseline FILE` | 無し | 期限・理由付き承認所見INI。`-a` / `-s` / `--triage` |
 | `--fail-on LEVEL` | `issue` | `issue`, `warning`, `unavailable`, `any`, `none`。明示指定は`-a` / `--triage` |
 | `--max-issues N` | 無し | fail-on対象所見の許容件数。`-a` / `--triage` |
@@ -200,7 +202,30 @@ dist/releases/k8s-diagnose_VERSION_OS_ARCH/
 | `--no-config` | 無効 | カレントディレクトリの`k8s-diagnose.ini`を自動読込しない |
 | `--version` |  | バージョン表示 |
 
-`--output-file`、`--save-snapshot`、`--history-db`は互いに別ファイルへ保存してください。また、設定・差分・baseline・ログシグネチャ・明示指定したkubeconfigと同じ実体（symlink / hard linkを含む）は、入力ファイルの上書きを防ぐため拒否します。
+`--output-file`、`--save-snapshot`、`--save-cluster-snapshot`、`--history-db`は互いに別ファイルへ保存してください。また、設定・差分・baseline・ログシグネチャ・明示指定したkubeconfig・`--load-cluster-snapshot`と同じ実体（symlink / hard linkを含む）は、入力ファイルの上書きを防ぐため拒否します。
+
+#### クラスタ状態の保存と再生（不具合報告・回帰テスト用）
+
+`--save-snapshot`は診断の**結果**を保存しますが、`--save-cluster-snapshot`は診断の**入力**であるクラスタ状態そのものを保存します。報告者がクラスタを直した後でも、受け取った側が同じ指摘を再現できます。
+
+```bash
+# 報告する側: 指摘が出た状態を保存する
+./k8s-diagnose -a --save-cluster-snapshot snapshot.json
+
+# 受け取った側: クラスタに接続せずに同じ診断を再現する
+./k8s-diagnose -a --load-cluster-snapshot snapshot.json
+```
+
+- 保存時に既存のマスク方針（`redact`）を適用します。環境変数の値、annotation中の資格情報、`name: DB_PASSWORD` のようなname/value形式の値もマスクします。異なる秘匿値を再生時に同一値と誤認しないよう、保存ごとの一時HMACによる非可逆な識別子だけを残します（鍵と元値は保存しません）
+- クラスタの内部構成を含むため、ファイルは`0600`で書き出します
+- 再生時はKubernetes APIへ接続せず、kubeconfigも不要です。保存元contextが記録されている場合は、接続先を`CONTEXT（保存済みクラスタ状態）`と表示します
+- 保存ファイルには取得時の診断モード、namespace範囲、`--unused`の有無を記録します。部分取得したデータをクラスタ全体と誤認しないよう、再生時は保存時と同じモード・`-n/--namespace`・`--unused`指定が必要です。一致しない場合は診断を開始せずエラーにします
+- `-s --load-cluster-snapshot`では、保存済みのPod一覧から選択し、選択後の構成・状態診断も保存データだけで行います。コンテナログ自体はクラスタ状態ファイルへ保存しないため、現在／前回ログは理由付きの`確認不能`としてCoverageへ反映します
+- 接続が前提の`--connect`、`--debug`、`--logs`、および`--watch`とは併用できません
+- 過去状態を現在の運用履歴や新規アラートとして扱わないよう、`--history-db`と`--webhook-url-env`も再生時は使用できません。副作用のない`--diff`、構造化出力、結果snapshot保存、CI終了条件は利用できます
+- スキーマは`k8s-diagnose/cluster-snapshot/v2`で、`schema`が一致しないファイルは読み込みを拒否します。v2では安全な再生に必要な取得範囲を必須情報として保持します
+
+受け取ったスナップショットはそのまま回帰テストのフィクスチャやベンチマーク入力として使えます。
 
 `--watch`は所見によって途中終了せず、Ctrl-Cを正常終了として扱うため、`--exit-zero`、`--fail-on`、`--max-issues`は併用できません。`--exit-zero`と`--fail-on/--max-issues`、および`--fail-on none`と`--max-issues`も、片方の指定が意味を失うためエラーにします。
 
@@ -227,9 +252,9 @@ Webhook URLはHTTPS必須、userinfo/fragment/制御文字禁止です。HTTP 3x
 
 対話端末では`--help`と診断結果をANSIカラーで表示します。Pod一覧は正常Podを緑2色のゼブラ、待機・要注意を黄色、確定異常を赤で表示します。Root Causeは確定を赤、原因候補を黄色、要確認を紫、修正候補を明るい緑で強調します。
 
-text形式の診断結果には「診断内容（実施状況）」セクションを表示します。各項目は`検査内容 → 同等のkubectlコマンド → 結果`の順で並び、結果には`所見なし`、`確定異常`、`警告`、`要確認`、`確認不能`の件数と、該当した具体的なメッセージを表示します。補助的に取得するEndpointSliceやStorageClassなどは親ルールの異常判定と混同せず、`追加情報を取得済み`または理由付きの`確認不能`として示します。コマンドは`--no-cmd`または`show_commands = false`で非表示にできます。`実施済み`は異常がないという意味ではなく、判定処理を実行できたことを表します。
+text形式の診断結果には「診断内容（実施状況）」セクションを表示します。実施できた項目は`検査内容 → 対象 → 結果`の順で並び、結果には`所見なし`、`確定異常`、`警告`、`要確認`の件数を表示します。ConfigMapやSecretなどの一覧取得に成功した場合は対象件数を示し、0件なら`この診断範囲には存在しません`と明示して取得不能と区別します。ConfigMapは、各namespaceへ通常自動注入される`kube-root-ca.crt`とその他の件数を分けるため、アプリ用ConfigMapが0件なのに「ConfigMapがある」ように見えることもありません。所見がある項目では、その直後に手動確認用コマンドも表示します。具体的な所見本文は続く重大度別一覧へ集約し、同じ文章を二重表示しません。確認不能な項目は共通理由ごとにまとめ、全件の詳細は「確認できなかった項目」に表示します。補助的に取得するEndpointSliceやStorageClassなどは親ルールの異常判定と混同せず、`追加情報を取得済み`または理由付きの`確認不能`として示します。コマンドは`--no-cmd`または`show_commands = false`で非表示にできます。`実施済み`は異常がないという意味ではなく、判定処理を実行できたことを表します。
 
-引数なしのガイド、設定エディタ、`-s`のPod選択はすべて`↑` / `↓`とEnterまたは`→`で操作します。複数選択ではSpaceまたはEnterでチェックを切り替えます。戻るキーは`b`、終了キーは`q`です。戻るための選択行は表示しません。最初の「何を診断しますか？」は余白を抑え、一般的な23行以上の端末では8項目をページ分割せず全件表示します。Pod選択では、一覧を表示したまま`n`でNamespace、`/`または`f`でPod名を検索でき、`r`で両方を続けて編集、`c`で条件消去できます。対話端末では選択UI全体を代替スクリーンへ描画するため、決定・終了後は一覧と操作案内を消して元の画面へ戻してから診断結果を表示します。Pod数やその他のメニュー項目が端末高を超える場合は、選択行を中心に表示範囲を自動スクロールします。
+引数なしのガイド、設定エディタ、`-s`のPod選択はすべて`↑` / `↓`とEnterまたは`→`で操作します。複数選択ではSpaceまたはEnterでチェックを切り替えます。戻るキーは`b`、終了キーは`q`です。戻るための選択行は表示しません。最初の「何を診断しますか？」は余白を抑え、一般的な23行以上の端末では8項目をページ分割せず全件表示します。Pod選択では、一覧を表示したまま`n`でNamespace、`/`または`f`でPod名を検索でき、`r`で両方を続けて編集、`c`で条件消去できます。Pod一覧での`b`は検索前の一覧へ戻る操作で、検索していないときは戻り先がないため案内に表示せず、押しても終了しません。対話端末では選択UI全体を代替スクリーンへ描画するため、決定・終了後は一覧と操作案内を消して元の画面へ戻してから診断結果を表示します。Pod数やその他のメニュー項目が端末高を超える場合は、選択行を中心に表示範囲を自動スクロールします。
 
 パイプ、ファイルredirect、構造化出力ではANSIコードを自動的に出しません。端末でも色を止める場合は標準の`NO_COLOR`を設定してください。
 
@@ -242,13 +267,14 @@ NO_COLOR=1 ./k8s-diagnose -a
 - Pod/container: CrashLoopBackOff、ImagePullBackOff、現在/直近終了のOOMKilled、Ready、Pending、native sidecar、DisruptionTarget、PodReadyToStartContainers、直近再起動（debug用ephemeral containerの終了はPod異常にしない）
 - Workload: Deployment / ReplicaSet / StatefulSet / DaemonSetのreplica、ProgressDeadlineExceeded、ReplicaFailure、CronJob suspend
 - Scheduling/Node: nodeSelector、required nodeAffinity、taint/toleration、cordon、Node状態taint、Node Lease heartbeat、CPU/Memory/HugePages/extended resource、Pod数上限、Pod overhead、in-place resize、PVC、schedulingGate、nominatedNodeName
-- Service: selector、EndpointSlice ready/terminating+serving、Endpoints fallback、named targetPort、LoadBalancer pending
-- 依存: optionalを考慮したSecret/ConfigMapオブジェクトとキー、PVC、ServiceAccount、PriorityClass、RuntimeClass。Secret Volume、projected Volume、CSI `nodePublishSecretRef`、従来型VolumeプラグインのSecret参照も追跡。欠落imagePullSecretはNode資格情報等でpull可能なためwarning
+- Service: selector、EndpointSlice ready/terminating+serving、Endpoints fallback、named targetPort、数値targetPortの未宣言（候補扱い）、LoadBalancer pending
+- 依存: optionalを考慮したSecret/ConfigMapオブジェクトとキー、PVC、ServiceAccount、PriorityClass、RuntimeClass。参照先リソース自体が無い場合は、種別・namespace・名前・参照元を明示します。`optional: true`ならPod起動を妨げないため確定異常にはせず「要確認」とし、必須参照と同じ対象を併記している場合は必須側だけを表示します。オブジェクトは存在するのに参照キーだけ無い場合も、キー名の誤りが疑われる候補として報告します。Secret Volume、projected Volume、CSI `nodePublishSecretRef`、従来型VolumeプラグインのSecret参照も追跡。欠落imagePullSecretはNode資格情報等でpull可能なためwarning
+- ConfigMap: 参照は解決できてもコンテナへ反映されない状態を診断します。同じ変数名が複数の`envFrom`や`env`から設定されてConfigMapの値が使われないキー衝突（値が実際に異なる場合のみ・候補扱い）、`subPath`マウント（ConfigMapを更新してもファイルが差し替わらない・候補扱い）、1オブジェクト上限1MiBへの接近を確認します。Kubernetes 1.34では緩和済み環境変数名が既定で有効なため、数字で始まるConfigMapキーを異常扱いしません。また、kubeletの`envFrom`が展開するのは`data`だけであり、`binaryData`を環境変数や衝突元として扱いません
 - Storage/TLS: WaitForFirstConsumer、PVC Lost/resize condition、PV Failed/Released/Pending、Ingressが参照するOpaque Secretを含むPEM/DERバンドル全証明書、TLSキー欠落・空データ・秘密鍵不正・証明書との不一致、期限切れ/有効開始前
 - Ingress/Webhook/API: backend/TLS/IngressClass参照、Admission Webhook Service、APIService、CRD condition、API warning header、readyz/livez（各endpointを独立してCoverageへ計上）
 - Policy: ResourceQuota使用率、PodDisruptionBudget、NetworkPolicy selector適用状況
 - メトリクス: `metrics.k8s.io/v1beta1`からNode使用量とCPU上位10 Podを取得（NodeとPodを別々にCoverageへ計上）
-- 構成リスク: `:latest`/タグなしimage、CPU/Memory requests未設定、livenessProbe未設定（Job Podを除外）。Pod-level requestsがあるresourceはcontainer未設定を候補にしない
+- 構成リスク: `:latest`/タグなしimage、CPU/Memory requests未設定、livenessProbe未設定（Job Podを除外）。Pod-level requestsがあるresourceはcontainer未設定を候補にしない。同一コンテナで同じ環境変数名が異なる値で複数回定義されている場合は、後の定義だけが採用され先の値が捨てられるため候補として報告（値が同じ重複は報告しない）
 - ログ: OOM、Go panic、Python Traceback、x509期限切れ、address in use、通信失敗等のシグネチャ
 
 Pending解析は偽陽性を抑えるため「5分以上継続」「PodScheduled=UnschedulableまたはFailedScheduling Event」「未評価制約なし」「配置可能Node 0」が揃った時だけissueにします。podAffinity / podAntiAffinity / topologySpreadConstraints / hostPort / DRA / custom schedulerを無理に確定せず、未評価として示します。全namespace Pod、PVC、StorageClass、Eventなど任意入力の取得に失敗してもnodeSelector・taint等の評価は続け、欠けた部分だけCoverageを下げます。Pending PVCが明示指定したStorageClassが存在しない場合は、一般的な未Bound警告ではなく確定異常として示します。
@@ -290,10 +316,35 @@ Service → Admission Webhook
 - `httpHeaders`の`Host`は再現するが、`httpGet.host` / `tcpSocket.host`は接続先そのものの指定なので、Podへのport-forwardでは同じ経路を再現できず「未実施（診断不能）」として表示
 - User-Agent / AcceptをProbe側が明示した場合は明示値を優先
 - response bodyはkubeletに合わせ10KiBまで
-- 失敗時のHTTP本文はマスクして端末にだけ表示し、Finding・snapshot・履歴・Webhookにはstatus code / Content-Type / 読取byte数だけを保存
+- アプリの応答本文は改行を保ったままマスクして端末にだけ表示します。確認に失敗した対象は全文（上限あり）、成功した対象は1行のプレビューを出すため、「200だが中身はエラーページ」を見分けられます。画像などバイナリの本文はバイト列を出さず種別とサイズだけを示します。Finding・snapshot・履歴・Webhookには従来どおりstatus code / Content-Type / 読取byte数だけを保存
 - HTTP 2xx/3xxを成功、別host redirectと10回超は追従せず注意扱い
-- HTTP ProbeのないポートはHTTPを送らず`net.Dial`のTCP connectのみ
-- Pod直接とService selector/targetPortから決定したPodの経路を別々に表示
+- HTTP ProbeのないポートはHTTPを送らずTCP接続のみを確認します。port-forwardのローカル側は転送先へ到達する前に接続を受け付けるため、`net.Dial`の成功だけでは待ち受けの有無を判定できません。接続後の読み取りで判定し、即座に切断された場合は「トンネルは確立したが転送先が待ち受けていない」として失敗、要求待ちのまま維持された場合を成功とします。port-forward自身が報告した理由も併記します
+- 「Pod直接」と「Serviceの転送先ポート」を別々に表示。ポートの出所が違うだけで、どちらもPodへの直接接続
+- 両者が同じポートに解決した場合は比較対象がないため、port-forwardを1本共有して同じ結果を再掲（二重にトンネルを張らない）
+- 対話端末では、確認結果の後に**ポートとパスを指定した追加確認**ができます。マニフェストが宣言していないポート（管理用・メトリクス等）や、実際に配信しているパスを、同じport-forward経由でその場で確認できます。空欄でEnterすると終了します
+
+```text
+▎ポートとパスを指定して確認
+  例: 9000（TCP接続のみ） / 8080/healthz / http://localhost:8080/secure / https://8443/metrics
+  空欄のままEnterで終了します。
+  確認先: http://localhost:8080/secure
+    ✔ 手動確認 http://localhost:8080/secure -> HTTP 200
+      HTTP/1.1 200 OK
+      Cache-Control: no-store
+      Content-Type: application/json; charset=utf-8
+      Location: /login
+      Server: nginx/1.25.3
+      Set-Cookie: <masked>
+      X-Request-Id: 7f3c1a20
+      （本文 15バイト）
+```
+
+  `curl -i`と同じく応答行とヘッダをそのまま表示します。どのハンドラが応答したか、リダイレクト先はどこか、キャッシュや認証のヘッダはどうかは、手でエンドポイントを叩くときに見たいものそのものだからです。ヘッダは名前順に整列し、資格情報を含みうるヘッダ（`Set-Cookie`など）は値をマスクします。応答行・ヘッダは端末表示だけに使い、Finding・snapshot・履歴・Webhookには従来どおりstatus code / Content-Type / 読取byte数しか保存しません
+
+  `curl`へ渡すURLをそのまま貼れます。ホストは`localhost` / `127.0.0.1`（ループバック）だけを受け付け、それ以外のホストは無視せずエラーにします。確認は必ず選択したPodへのport-forward経由で行うため、別の宛先を渡されたまま黙ってPodを確認すると、聞かれていない問いに答えることになるためです。ポートだけを指定した場合はTCP接続のみを確認します。HTTPを話さないポートへHTTP要求を送っても、健全かどうかの判断材料にならないためです。手動確認は探索用なので、2xx以外でも確定異常とは扱いません
+- 再現用のport-forward / curlは、**確認できなかった対象にのみ**表示します。成功した確認まで並べると結果本文より長くなり、どのコマンドがどの確認のものか読み取れなくなるためです
+- HTTP確認では`kubectl port-forward`に続けて、実際に送った要求と同じ`curl`（scheme・path・Probeのヘッダを含む。httpsは検証をスキップする`-k`付き）も表示するため、手元でそのまま再現できます。TCP確認は要求を送らないためcurlは表示しません。資格情報を含みうるヘッダ（`Authorization`など）は値を表示せず、省略した旨だけを末尾のコメントとして付けます
+- Service由来の対象には`kubectl port-forward service/NAME LOCAL:SERVICEPORT`も併記します。診断自体は対象Podへ固定してトンネルを張りますが、`service/`形式ではkubectlがselector・Endpoint・ServiceポートからtargetPortへの解決を行うため、Pod固定の確認では通らない解決経路を手元で確認できます（kubectlが選ぶPodは診断対象と異なる場合があります）
 - ローカル先頭ポート+オフセットが65535を超える場合はcluster issueでなくunavailable
 
 これは1回のport-forward模擬です。kubeletの`failureThreshold` / `successThreshold`による連続判定を再現しないため、失敗はwarningかつ低確信度の原因候補であり、それだけでKubernetesの確定異常とはしません。またService確認はClusterIPを通すネットワークテストではなく、Serviceのselector/targetPortで選ばれるPodへのport-forward確認です。
@@ -359,7 +410,7 @@ Baselineは所見を削除しません。`acknowledged=true`、理由、期限�
 
 Go版の通常診断は`kubectl`コマンドを起動しません。下表の「対応kubectl」は、client-goが行うAPI要求と同等の内容を人が手動確認するためのコマンドです。既定の`--cmd`表示では、冒頭へ一括表示せず、Pod一覧、メトリクス、Warning Event、ログ、個別所見、接続確認など、対応する診断項目の見出し直後・結果本文の前に必要なコマンドだけを表示します。説明ラベルは挟まず、`$ kubectl ...`をそのまま表示します。個別所見が具体的なリソースを示す場合は、例えば`kubectl get pod NAME -n NAMESPACE -o json`のように対象を絞ります。
 
-client-goが実際に送ったHTTP method/path/queryは、診断結果を読み終えた後の技術情報「実行したKubernetes API要求」として末尾に表示します。この項目だけを消す場合は`--no-api-requests`、常時消す場合は設定ファイルへ次を記述します。確認用kubectlの表示は`show_commands`で独立して制御できます。従来の設定との互換性のため、`show_api_requests`を省略した古いINIでは`show_commands`の値を実API要求にも引き継ぎます。
+client-goが実際に送ったHTTP method/path/queryは、診断結果を読み終えた後の技術情報「実行したKubernetes API要求」として末尾に表示できます。デバッグ用の情報で常時表示すると診断結果が埋もれるため既定では非表示で、`--api-requests`または設定ファイルで有効にします。確認用kubectlの表示は`show_commands`で独立して制御できます。従来の設定との互換性のため、`show_api_requests`を省略した古いINIで`show_commands = false`が指定されている場合は実API要求も非表示のままにしますが、`show_commands = true`が既定オフの実API要求を有効化することはありません。
 
 ```ini
 [display]

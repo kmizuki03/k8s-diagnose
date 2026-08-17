@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/kmizuki03/k8s-diagnose/internal/baseline"
 	"github.com/kmizuki03/k8s-diagnose/internal/config"
+	"github.com/kmizuki03/k8s-diagnose/internal/connect"
 	"github.com/kmizuki03/k8s-diagnose/internal/console"
 	"github.com/kmizuki03/k8s-diagnose/internal/kube"
 	"github.com/kmizuki03/k8s-diagnose/internal/model"
@@ -128,6 +130,64 @@ func TestResolveSelectedPodRejectsDeletedOrRecreatedTarget(t *testing.T) {
 	recreated := corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "api", UID: types.UID("pod-2")}}
 	if _, err := resolveSelectedPod([]corev1.Pod{recreated}, selected); err == nil {
 		t.Fatal("同名で再作成された別UIDのPodを診断対象として受理した")
+	}
+}
+
+func TestSelectModeReplaysSavedPodListWithoutLiveClients(t *testing.T) {
+	snapshot := kube.NewSnapshot()
+	snapshot.Pods = []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "api"}}}
+	snapshot.Statuses["pods"] = kube.FetchStatus{Available: true}
+	path := filepath.Join(t.TempDir(), "cluster.json")
+	if err := kube.SaveClusterSnapshot(path, "test", kube.ClusterSnapshotScope{
+		Context: "saved-context", Namespace: "prod", Mode: "select",
+	}, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Defaults()
+	cfg.Mode = "select"
+	cfg.Namespace = "prod"
+	cfg.LoadClusterSnapshot = path
+	var output, stderr bytes.Buffer
+	code := Run(context.Background(), cfg, Streams{
+		In: strings.NewReader("q"), Out: &output, Err: &stderr,
+	})
+	if code != 0 {
+		t.Fatalf("保存済みPod一覧から選択モードを終了できない: code=%d stderr=%q", code, stderr.String())
+	}
+	if strings.Contains(stderr.String(), "panic") || strings.Contains(stderr.String(), "Pod一覧を取得できません") {
+		t.Fatalf("オフライン再生でAPI取得へフォールバックした: %q", stderr.String())
+	}
+}
+
+func TestSelectModeDiagnosesSavedPodWithoutTryingToFetchLogs(t *testing.T) {
+	snapshot := kube.NewSnapshot()
+	snapshot.Pods = []corev1.Pod{{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "prod", Name: "api"},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "api", Image: "example/api:1.0"}}},
+		Status: corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		},
+	}}
+	snapshot.Statuses["pods"] = kube.FetchStatus{Available: true}
+	path := filepath.Join(t.TempDir(), "cluster.json")
+	if err := kube.SaveClusterSnapshot(path, "test", kube.ClusterSnapshotScope{
+		Context: "saved-context", Namespace: "prod", Mode: "select",
+	}, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Defaults()
+	cfg.Mode, cfg.Namespace, cfg.LoadClusterSnapshot = "select", "prod", path
+	cfg.ExitZero = true
+	var output, stderr bytes.Buffer
+	code := Run(context.Background(), cfg, Streams{
+		In: strings.NewReader("\r"), Out: &output, Err: &stderr,
+	})
+	if code != 0 {
+		t.Fatalf("保存済みPodの診断を完了できない: code=%d stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(output.String(), "保存済みクラスタ状態にはコンテナログが含まれず") {
+		t.Fatalf("ログを再現できないことがCoverageへ表示されない: %q", output.String())
 	}
 }
 
@@ -680,6 +740,9 @@ func TestRenderTextKeepsCommandsOutOfThePreambleAndTraceAtTheEnd(t *testing.T) {
 	output := &bytes.Buffer{}
 	cfg := config.Defaults()
 	cfg.Mode = "all"
+	// The trace is off by default; this test is about where it lands when the
+	// operator has asked for it.
+	cfg.ShowAPIRequests = true
 	runner := &Runner{
 		Config:  cfg,
 		Streams: Streams{Out: output, Err: output},
@@ -937,5 +1000,378 @@ func TestPodMetricRowsSortCPUAndLimitTen(t *testing.T) {
 		if row.Cells[1] == "pod-01" {
 			t.Fatalf("CPU最下位Podが上位10件へ残った: %#v", rows)
 		}
+	}
+}
+
+// TestEscapeSequenceScannerSharedByBothReaders locks in the behaviour of the
+// scanner shared by pod selection (which maps keys) and the wizard (which
+// discards sequences). Terminal input parsing regresses silently, so the arrow
+// keys, the SGR mouse form and the X10 mouse form are all pinned here.
+func TestEscapeSequenceScannerSharedByBothReaders(t *testing.T) {
+	t.Run("scanner", func(t *testing.T) {
+		cases := []struct {
+			name   string
+			input  string
+			limit  int
+			params string
+			final  byte
+			found  bool
+		}{
+			{"arrow-up", "A", 16, "", 'A', true},
+			{"home-tilde", "1~", 16, "1", '~', true},
+			{"sgr-mouse", "<64;10;20M", 16, "<64;10;20", 'M', true},
+			{"no-final-byte-within-limit", strings.Repeat("1", 20), 16, strings.Repeat("1", 16), 0, false},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				params, final, found, err := scanEscapeParameters(bufio.NewReader(strings.NewReader(tc.input)), tc.limit)
+				if err != nil {
+					t.Fatalf("予期しないエラー: %v", err)
+				}
+				if found != tc.found || final != tc.final || string(params) != tc.params {
+					t.Fatalf("params=%q final=%q found=%v, want params=%q final=%q found=%v",
+						params, final, found, tc.params, tc.final, tc.found)
+				}
+			})
+		}
+	})
+
+	t.Run("truncated input is a read error", func(t *testing.T) {
+		if _, _, _, err := scanEscapeParameters(bufio.NewReader(strings.NewReader("1")), 16); err == nil {
+			t.Fatal("入力が尽きたのにエラーにならなかった")
+		}
+	})
+
+	// Pod selection must treat a truncated sequence as "no key", not an error.
+	t.Run("pod selection tolerates truncation", func(t *testing.T) {
+		action, err := readPodEscapeSequence(bufio.NewReader(strings.NewReader("[")))
+		if err != nil || action != podSelectionNone {
+			t.Fatalf("action=%v err=%v, want (none, nil)", action, err)
+		}
+	})
+
+	t.Run("pod selection maps arrows and X10 mouse", func(t *testing.T) {
+		up, err := readPodEscapeSequence(bufio.NewReader(strings.NewReader("[A")))
+		if err != nil || up != podSelectionUp {
+			t.Fatalf("上矢印: action=%v err=%v", up, err)
+		}
+		// ESC [ M <button> <x> <y>: wheel-up is button 64 (0x20+64 = '`').
+		wheel, err := readPodEscapeSequence(bufio.NewReader(strings.NewReader("[M\x60\x21\x21")))
+		if err != nil {
+			t.Fatalf("X10マウス: err=%v", err)
+		}
+		if wheel != podSelectionUp {
+			t.Fatalf("X10ホイール上: action=%v, want up", wheel)
+		}
+	})
+
+	// The wizard must consume the trailing X10 coordinate bytes, or they leak
+	// into the next read as stray characters.
+	t.Run("wizard discards X10 coordinates", func(t *testing.T) {
+		reader := bufio.NewReader(strings.NewReader("[M\x60\x21\x21rest"))
+		if err := discardWizardEscapeSequence(reader); err != nil {
+			t.Fatalf("err=%v", err)
+		}
+		remaining, _ := io.ReadAll(reader)
+		if string(remaining) != "rest" {
+			t.Fatalf("残り=%q, want %q", remaining, "rest")
+		}
+	})
+}
+
+func podSelectionRunner(input string) (*Runner, *bytes.Buffer) {
+	cfg := config.Defaults()
+	output := &bytes.Buffer{}
+	return &Runner{
+		Config: cfg, Streams: Streams{In: strings.NewReader(input), Out: output, Err: output},
+		Clients: &kube.Clients{Context: "test"}, Console: console.New(cfg, output, output),
+	}, output
+}
+
+// "b" is documented as the one back key on every screen, so it must never act as
+// a second quit key: pressing it on the unfiltered list used to end the whole
+// session and discard the list the operator was working through.
+func TestPodSelectionBackKeyDoesNotQuitTheSession(t *testing.T) {
+	pods := []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{Namespace: "team-b", Name: "api"}}}
+	runner, output := podSelectionRunner("bb\r")
+	selected, quit, err := runner.promptPod(pods)
+	if err != nil {
+		t.Fatalf("Pod選択でエラー: %v", err)
+	}
+	if quit || selected == nil || selected.Name != "api" {
+		t.Fatalf("bで終了してしまった: selected=%#v quit=%v", selected, quit)
+	}
+	if !strings.Contains(output.String(), "これ以上戻る画面はありません") {
+		t.Errorf("戻れない理由が表示されない: %q", output.String())
+	}
+	if strings.Contains(output.String(), "b: 検索前へ戻る") {
+		t.Errorf("戻り先がないのに戻るキーを案内している: %q", output.String())
+	}
+}
+
+func TestPodSelectionBackKeyReturnsToTheUnfilteredList(t *testing.T) {
+	pods := []corev1.Pod{
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "team-a", Name: "api"}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "team-b", Name: "web"}},
+	}
+	// Narrow to a single Pod, then go back: the full list must return and the
+	// selection must land on the first Pod of the restored list, not the filter.
+	runner, output := podSelectionRunner("/web\nb\r")
+	selected, quit, err := runner.promptPod(pods)
+	if err != nil || quit || selected == nil {
+		t.Fatalf("検索前へ戻れない: selected=%#v quit=%v err=%v", selected, quit, err)
+	}
+	if selected.Name != "api" {
+		t.Fatalf("検索条件が解除されていない: %#v", selected)
+	}
+	if !strings.Contains(output.String(), "b: 検索前へ戻る") {
+		t.Errorf("検索中に戻るキーを案内していない: %q", output.String())
+	}
+}
+
+func TestPodSelectionQuitKeyStillQuits(t *testing.T) {
+	pods := []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{Namespace: "team-b", Name: "api"}}}
+	runner, _ := podSelectionRunner("q")
+	selected, quit, err := runner.promptPod(pods)
+	if err != nil {
+		t.Fatalf("Pod選択でエラー: %v", err)
+	}
+	if !quit || selected != nil {
+		t.Fatalf("qで終了しない: selected=%#v quit=%v", selected, quit)
+	}
+}
+
+// --connect is rejected outside -s, so the connection check and the commands it
+// prints only ever exist on the Pod選択 path. This locks in that the curl really
+// reaches that screen, quoted and masked like every other printed command.
+func TestConnectCommandsIncludeTheMatchingCurlOnTheSelectScreen(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Mode = "select"
+	cfg.Connect = true
+	if err := cfg.Validate(nil); err != nil {
+		t.Fatalf("-s --connect が許可されない: %v", err)
+	}
+	output := &bytes.Buffer{}
+	runner := &Runner{
+		Config: cfg, Streams: Streams{In: strings.NewReader(""), Out: output, Err: output},
+		Clients: &kube.Clients{Context: "test"}, Console: console.New(cfg, output, output),
+	}
+	result := connect.Result{
+		LocalPort: 16081, Tested: true, Successful: true,
+		Target: connect.Target{
+			Group: "pod", Label: "readinessProbe", Protocol: "http", Scheme: "http",
+			Path: "/ready", RemotePort: 8080, Active: true,
+			Headers: []corev1.HTTPHeader{{Name: "Authorization", Value: "Bearer super-secret-token"}},
+		},
+	}
+	runner.kubectlCmds = append(runner.kubectlCmds,
+		kube.KubectlCommand(cfg, "port-forward", "pod/api", "16081:8080", "-n", "ns"))
+	command, ok := connect.CurlCommand(result)
+	if !ok {
+		t.Fatal("HTTP対象にcurlが生成されない")
+	}
+	runner.kubectlCmds = append(runner.kubectlCmds, command)
+	runner.renderConnectResults([]connect.Result{result})
+
+	rendered := output.String()
+	if !strings.Contains(rendered, "port-forward pod/api 16081:8080") {
+		t.Errorf("port-forwardコマンドが選択画面に出ていない: %q", rendered)
+	}
+	if !strings.Contains(rendered, "curl") || !strings.Contains(rendered, "http://127.0.0.1:16081/ready") {
+		t.Errorf("curlが選択画面に出ていない: %q", rendered)
+	}
+	if strings.Contains(rendered, "super-secret-token") {
+		t.Errorf("Probeヘッダの資格情報がマスクされずに表示された: %q", rendered)
+	}
+}
+
+// kubectl accepts service/NAME, and that form makes kubectl resolve the
+// selector, the endpoints and the service port → targetPort mapping before
+// forwarding — the part a Pod-pinned tunnel skips. It is offered as an
+// alternative, so a shared result still gets it even though its Pod-pinned
+// command is suppressed as a duplicate.
+func TestServiceTargetsAlsoOfferTheServiceFormOfPortForward(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Mode = "select"
+	cfg.Connect = true
+	output := &bytes.Buffer{}
+	runner := &Runner{
+		Config: cfg, Streams: Streams{In: strings.NewReader(""), Out: output, Err: output},
+		Clients: &kube.Clients{Context: "test"}, Console: console.New(cfg, output, output),
+	}
+	shared := connect.Result{
+		LocalPort: 16081, Tested: true, Successful: true, Shared: true,
+		Target: connect.Target{
+			Group: "service", Label: "svc/api :80→8080", Protocol: "tcp", RemotePort: 8080,
+			Active: true, ServiceName: "api", ServicePort: 80,
+		},
+	}
+	runner.kubectlCmds = append(runner.kubectlCmds, kube.KubectlCommand(
+		cfg, "port-forward", "service/"+shared.Target.ServiceName,
+		fmt.Sprintf("%d:%d", shared.LocalPort, shared.Target.ServicePort), "-n", "ns"))
+	runner.renderConnectResults([]connect.Result{shared})
+
+	rendered := output.String()
+	if !strings.Contains(rendered, "port-forward service/api 16081:80") {
+		t.Fatalf("service/ 形式のport-forwardが出ていない: %q", rendered)
+	}
+	// The service port, not the container port, is what kubectl maps here.
+	if strings.Contains(rendered, "service/api 16081:8080") {
+		t.Errorf("service/ にtargetPortを渡している。kubectlはServiceのポートを受け取る: %q", rendered)
+	}
+}
+
+// Three command lines per target buried the results on a Pod with several
+// ports. Commands exist to hand an investigation over, so they follow the
+// checks that give the operator something to investigate.
+func TestReproductionCommandsFollowTheChecksWorthInvestigating(t *testing.T) {
+	base := connect.Target{Group: "pod", Protocol: "tcp", RemotePort: 8080, Active: true}
+	for _, tc := range []struct {
+		name   string
+		result connect.Result
+		want   bool
+	}{
+		{"成功した確認", connect.Result{Tested: true, Successful: true, Target: base}, false},
+		{"失敗した確認", connect.Result{Tested: true, Successful: false, Target: base}, true},
+		{"注意付きで成功", connect.Result{Tested: true, Successful: true, Warned: true, Target: base}, true},
+		{"実施できなかった確認", connect.Result{Tested: false, Target: base}, true},
+		{"対象外", connect.Result{Tested: true, Successful: true, Target: connect.Target{Group: "pod", Protocol: "tcp", RemotePort: 8080}}, false},
+	} {
+		if got := needsReproduction(tc.result); got != tc.want {
+			t.Errorf("%s: needsReproduction=%v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestAllGreenConnectRunExplainsWhyNoCommandsArePrinted(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Mode = "select"
+	output := &bytes.Buffer{}
+	runner := &Runner{
+		Config: cfg, Streams: Streams{In: strings.NewReader(""), Out: output, Err: output},
+		Clients: &kube.Clients{Context: "test"}, Console: console.New(cfg, output, output),
+	}
+	runner.renderConnectResults([]connect.Result{{
+		LocalPort: 16081, Tested: true, Successful: true,
+		Target: connect.Target{Group: "pod", Label: "readinessProbe", Protocol: "http", RemotePort: 8080, Active: true},
+	}})
+	rendered := output.String()
+	if strings.Contains(rendered, "$ ") {
+		t.Errorf("全て成功したのに再現コマンドが出ている: %q", rendered)
+	}
+	if !strings.Contains(rendered, "確認できなかった対象にのみ表示します") {
+		t.Errorf("コマンドを省いた理由が示されていない: %q", rendered)
+	}
+}
+
+// Whoever types a URL into the manual check is reaching for curl -i: which
+// handler answered, where a redirect points and what the cache headers say are
+// the reason for poking an endpoint by hand.
+func TestManualResultShowsTheResponseHeadersWithoutLeakingThem(t *testing.T) {
+	cfg := config.Defaults()
+	output := &bytes.Buffer{}
+	runner := &Runner{
+		Config: cfg, Streams: Streams{In: strings.NewReader(""), Out: output, Err: output},
+		Clients: &kube.Clients{Context: "test"}, Console: console.New(cfg, output, output),
+	}
+	target, err := connect.ManualTarget("http://localhost:8080/secure")
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := http.Header{}
+	header.Set("Content-Type", "application/json")
+	header.Set("Location", "/login")
+	header.Set("X-Request-Id", "7f3c1a20")
+	header.Add("Set-Cookie", "session=SUPERSECRETVALUE; Path=/")
+	runner.renderManualResult(connect.Result{
+		Target: target, LocalPort: 16081, Tested: true, Successful: true,
+		StatusCode: 200, BodyBytes: 15, Detail: "HTTP 200", Proto: "HTTP/1.1", Header: header,
+	})
+
+	rendered := output.String()
+	for _, want := range []string{"HTTP/1.1 200 OK", "Location: /login", "X-Request-Id: 7f3c1a20", "（本文 15バイト）"} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("%q が表示されていない: %q", want, rendered)
+		}
+	}
+	// A response header is as capable of carrying a credential as a request one.
+	if strings.Contains(rendered, "SUPERSECRETVALUE") {
+		t.Fatalf("Set-Cookieの値が表示された: %q", rendered)
+	}
+	// Header order must not depend on Go's map iteration.
+	if strings.Index(rendered, "Content-Type:") > strings.Index(rendered, "Location:") {
+		t.Errorf("ヘッダの並びが安定していない: %q", rendered)
+	}
+}
+
+func bodyResult(contentType, body string, successful bool) connect.Result {
+	target, _ := connect.ManualTarget("http://localhost:8080/api")
+	header := http.Header{}
+	header.Set("Content-Type", contentType)
+	return connect.Result{
+		Target: target, LocalPort: 16081, Tested: true, Successful: successful,
+		StatusCode: 200, Proto: "HTTP/1.1", Header: header, ContentType: contentType,
+		Body: body, BodyBytes: len(body), Detail: "HTTP 200",
+	}
+}
+
+func renderedManual(t *testing.T, result connect.Result) string {
+	t.Helper()
+	cfg := config.Defaults()
+	output := &bytes.Buffer{}
+	runner := &Runner{
+		Config: cfg, Streams: Streams{In: strings.NewReader(""), Out: output, Err: output},
+		Clients: &kube.Clients{Context: "test"}, Console: console.New(cfg, output, output),
+	}
+	runner.renderManualResult(result)
+	return output.String()
+}
+
+// "200 with the expected payload" and "200 with an error page" are the same row
+// without the body, and the line structure is what makes a payload readable.
+func TestManualResultShowsTheApplicationResponseBody(t *testing.T) {
+	got := renderedManual(t, bodyResult("application/json", "{\n  \"status\": \"ok\",\n  \"uptime\": 3600\n}", true))
+	for _, want := range []string{"── 応答本文", `"status": "ok"`, `"uptime": 3600`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("%q が表示されていない: %q", want, got)
+		}
+	}
+	// console.Snip collapses whitespace; a payload must keep its lines.
+	if strings.Count(got, "\n") < 5 {
+		t.Errorf("本文が1行に潰れている: %q", got)
+	}
+}
+
+// Dumping an image into the terminal helps nobody; saying one came back does.
+func TestManualResultSummarisesBinaryResponseBodies(t *testing.T) {
+	got := renderedManual(t, bodyResult("image/png", string([]byte{0x89, 0x50, 0x4e, 0x47, 0x00, 0x1a}), true))
+	if !strings.Contains(got, "image/png のため表示しません") {
+		t.Errorf("バイナリ本文をそのまま出そうとしている: %q", got)
+	}
+	if strings.Contains(got, "── 応答本文") {
+		t.Errorf("バイナリを本文として描画した: %q", got)
+	}
+}
+
+// An application is perfectly capable of printing its own configuration.
+func TestResponseBodyIsMaskedLikeEveryOtherOutput(t *testing.T) {
+	got := renderedManual(t, bodyResult("text/plain", "password=hunter2secret\ntoken=AKIAIOSFODNN7EXAMPLE\nport=8080", true))
+	for _, secret := range []string{"hunter2secret", "AKIAIOSFODNN7EXAMPLE"} {
+		if strings.Contains(got, secret) {
+			t.Fatalf("応答本文から資格情報が漏れた: %q", got)
+		}
+	}
+	if !strings.Contains(got, "port=8080") {
+		t.Errorf("機密でない行まで消えた: %q", got)
+	}
+}
+
+func TestResponseBodyIsClippedInsteadOfFloodingTheTerminal(t *testing.T) {
+	got := renderedManual(t, bodyResult("text/plain", strings.Repeat("line\n", 200), true))
+	if !strings.Contains(got, "以降は省略") {
+		t.Errorf("長い本文が省略されていない: %q", got)
+	}
+	if lines := strings.Count(got, "\n"); lines > manualBodyLines+10 {
+		t.Errorf("省略が効かず%d行出力された", lines)
 	}
 }

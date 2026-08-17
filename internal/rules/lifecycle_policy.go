@@ -75,17 +75,16 @@ func (LimitRangeRule) Metadata() Metadata {
 
 func (LimitRangeRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Config) []model.Finding {
 	result := []model.Finding{}
+	// Look up only the pods in the LimitRange's own namespace instead of
+	// rescanning every pod in the cluster for each LimitRange.
+	podIndex := indexPodsByNamespace(snapshot.Pods)
 	for rangeIndex := range snapshot.LimitRanges {
 		limitRange := &snapshot.LimitRanges[rangeIndex]
 		for _, item := range limitRange.Spec.Limits {
 			if item.Type != corev1.LimitTypeContainer {
 				continue
 			}
-			for podIndex := range snapshot.Pods {
-				pod := &snapshot.Pods[podIndex]
-				if pod.Namespace != limitRange.Namespace {
-					continue
-				}
+			for _, pod := range podIndex[limitRange.Namespace] {
 				containers := append(append([]corev1.Container{}, pod.Spec.InitContainers...), pod.Spec.Containers...)
 				for _, container := range containers {
 					for resourceName, minimum := range item.Min {
@@ -116,6 +115,7 @@ func limitRangeMismatch(limitRangeName string, pod *corev1.Pod, container string
 
 func (NetworkPolicyRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Config) []model.Finding {
 	result := []model.Finding{}
+	podIndex := indexPodsByNamespace(snapshot.Pods)
 	for i := range snapshot.NetworkPolicies {
 		policy := &snapshot.NetworkPolicies[i]
 		selector, err := metav1.LabelSelectorAsSelector(&policy.Spec.PodSelector)
@@ -124,9 +124,8 @@ func (NetworkPolicyRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ 
 			continue
 		}
 		matched := 0
-		for podIndex := range snapshot.Pods {
-			pod := &snapshot.Pods[podIndex]
-			if pod.Namespace == policy.Namespace && selector.Matches(labels.Set(pod.Labels)) {
+		for _, pod := range podIndex[policy.Namespace] {
+			if selector.Matches(labels.Set(pod.Labels)) {
 				matched++
 			}
 		}

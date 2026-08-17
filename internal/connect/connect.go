@@ -6,12 +6,14 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +22,7 @@ import (
 	"github.com/kmizuki03/k8s-diagnose/internal/config"
 	"github.com/kmizuki03/k8s-diagnose/internal/kube"
 	"github.com/kmizuki03/k8s-diagnose/internal/model"
+	"github.com/kmizuki03/k8s-diagnose/internal/redact"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/portforward"
@@ -27,14 +30,19 @@ import (
 )
 
 type Target struct {
-	Container   string
-	ProbeType   string
-	Group       string
-	Label       string
-	Protocol    string
-	RemotePort  int
-	PortName    string
-	Path        string
+	Container  string
+	ProbeType  string
+	Group      string
+	Label      string
+	Protocol   string
+	RemotePort int
+	PortName   string
+	Path       string
+	// RawPath and RawQuery are used only by a manually pasted URL. Kubernetes
+	// HTTPGetAction.path is deliberately stored in Path alone so '?' and '#'
+	// remain literal escaped path characters, matching kubelet.
+	RawPath     string
+	RawQuery    string
 	Scheme      string
 	Headers     []corev1.HTTPHeader
 	Probe       *corev1.Probe
@@ -44,6 +52,14 @@ type Target struct {
 	Unavailable bool
 	Invalid     bool
 	Inactive    string
+	// ServiceName and ServicePort identify the Service a "service" group target
+	// was derived from. The check itself always tunnels to the Pod under
+	// diagnosis, but kubectl also accepts service/NAME, and that form is worth
+	// printing: it makes kubectl resolve the selector, the endpoints and the
+	// service port → targetPort mapping, which is the part a Pod-pinned tunnel
+	// skips over.
+	ServiceName string
+	ServicePort int32
 }
 
 type Result struct {
@@ -57,6 +73,18 @@ type Result struct {
 	BodyBytes   int
 	Detail      string
 	Body        string
+	// Proto and Header carry the response line and headers for display only, the
+	// same way Body does. Findings keep only the status code, Content-Type and
+	// byte count, so nothing here reaches a report, a snapshot, the history
+	// database or a webhook.
+	Proto  string
+	Header http.Header
+	// Shared marks a result copied from an earlier target that resolved to the
+	// same destination and would have issued a byte-for-byte identical request.
+	// The row is still reported so both groups stay visible, but no second
+	// tunnel is opened, no second request is sent, and no duplicate finding is
+	// raised for what is one and the same fact.
+	Shared bool
 }
 
 func Targets(pod *corev1.Pod, services []corev1.Service, pathOverride string) []Target {
@@ -191,14 +219,14 @@ func targetsAt(pod *corev1.Pod, services []corev1.Service, pathOverride string, 
 			if targetText == "" {
 				targetText = strconv.Itoa(remote)
 			}
-			target := Target{Group: "service", Label: fmt.Sprintf("svc/%s :%d→%s", service.Name, servicePort.Port, targetText), Protocol: "tcp", RemotePort: remote, PortName: targetName, Source: "service", Strict: false, Active: true}
+			target := Target{Group: "service", Label: fmt.Sprintf("svc/%s :%d→%s", service.Name, servicePort.Port, targetText), Protocol: "tcp", RemotePort: remote, PortName: targetName, Source: "service", Strict: false, Active: true, ServiceName: service.Name, ServicePort: servicePort.Port}
 			for _, probeTarget := range podTargets {
 				if probeTarget.Source != "probe" || probeTarget.Protocol != "http" || !probeTarget.Active {
 					continue
 				}
 				if probeTarget.RemotePort == remote || targetName != "" && probeTarget.PortName == targetName {
 					target.Container, target.ProbeType = probeTarget.Container, probeTarget.ProbeType
-					target.Protocol, target.Path, target.Scheme = "http", probeTarget.Path, probeTarget.Scheme
+					target.Protocol, target.Path, target.RawPath, target.RawQuery, target.Scheme = "http", probeTarget.Path, probeTarget.RawPath, probeTarget.RawQuery, probeTarget.Scheme
 					target.Headers, target.Probe, target.Strict = append([]corev1.HTTPHeader{}, probeTarget.Headers...), probeTarget.Probe, probeTarget.Strict
 					break
 				}
@@ -368,6 +396,14 @@ func (checker *Checker) Check(ctx context.Context, pod *corev1.Pod, services []c
 		base = randomBasePort(len(targets))
 	}
 	offset := 0
+	// A Service whose targetPort resolves to a port the Pod group already covers
+	// produces a second target aimed at the very same destination. That pairing
+	// is the point of having two groups — when the ports differ, the difference
+	// is the diagnosis — but when they coincide there is nothing left to compare,
+	// and opening a second port-forward would only repeat the identical request.
+	// port-forward is the most expensive and most failure-prone thing this tool
+	// does, so the earlier result is reused instead.
+	checkedPodTargets := map[string]int{}
 	for _, target := range targets {
 		if !target.Active {
 			results = append(results, Result{Target: target, Detail: "未実施: " + target.Inactive})
@@ -384,6 +420,10 @@ func (checker *Checker) Check(ctx context.Context, pod *corev1.Pod, services []c
 			}
 			continue
 		}
+		if index, duplicate := reusablePodResult(target, checkedPodTargets); duplicate {
+			results = append(results, sharedResult(results[index], target))
+			continue
+		}
 		local := base + offset
 		offset++
 		if local > 65535 {
@@ -393,6 +433,9 @@ func (checker *Checker) Check(ctx context.Context, pod *corev1.Pod, services []c
 		}
 		result, err := checker.checkOne(ctx, pod, target, local)
 		results = append(results, result)
+		if target.Group == "pod" {
+			checkedPodTargets[checkSignature(target)] = len(results) - 1
+		}
 		if err != nil {
 			results[len(results)-1].Tested = false
 			findings = append(findings, model.NewFinding(model.Unavailable, "K8S.CONNECT.PORT_FORWARD_UNAVAILABLE", "接続確認", targetResource(target, pod), "PortForwardFailed", target.Group+"/"+targetName(target)+"/"+strconv.Itoa(target.RemotePort), fmt.Sprintf("%s へのport-forwardを開始できないため、接続確認を実施できません。原因: %v", connectionTargetDescription(target, pod), err), 100))
@@ -468,6 +511,132 @@ func probePortStableKey(target Target) string {
 	return target.Container + "/" + target.ProbeType + "/port/" + target.PortName
 }
 
+// ManualTarget parses an operator-typed destination into a check.
+//
+// The automatic targets only cover ports the manifest already declares, which
+// is not where an investigation usually ends up: the interesting port is often
+// an admin or metrics endpoint nothing references, and the interesting path is
+// whatever the application actually serves. One field is accepted rather than
+// three because the shape people already have in mind is a URL.
+//
+//	9000                            port 9000 へのTCP接続だけを確認
+//	8080/healthz                    http://…:8080/healthz を確認
+//	https://8443/metrics            TLSで確認（証明書の検証は行わない）
+//	http://localhost:8080/secure    curlに渡すURLをそのまま貼れる
+//
+// A bare port stays a TCP check on purpose: sending an HTTP request to a port
+// that speaks something else proves nothing about whether it is healthy.
+//
+// A host is accepted only when it is the loopback address, because that is what
+// the forwarded port genuinely is. Any other host is refused rather than
+// ignored: silently checking the Pod after being handed another destination
+// would answer a question nobody asked.
+func ManualTarget(input string) (Target, error) {
+	value := strings.TrimSpace(input)
+	if value == "" {
+		return Target{}, errors.New("確認先が空です")
+	}
+	scheme, authority := "", ""
+	path, rawPath, rawQuery := "", "", ""
+	hasHTTPPart := false
+	lower := strings.ToLower(value)
+	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+		parsed, err := url.Parse(value)
+		if err != nil || parsed.Host == "" {
+			return Target{}, fmt.Errorf("接続先URLとして解釈できません: %q", input)
+		}
+		if parsed.User != nil {
+			return Target{}, errors.New("接続先URLにユーザー情報は指定できません")
+		}
+		if parsed.Fragment != "" {
+			return Target{}, errors.New("URLフラグメント（#以降）はHTTP要求へ送信されないため指定できません")
+		}
+		scheme, authority = strings.ToLower(parsed.Scheme), parsed.Host
+		path, rawPath, rawQuery = parsed.Path, parsed.RawPath, parsed.RawQuery
+		hasHTTPPart = true
+	} else {
+		if strings.Contains(value, "#") {
+			return Target{}, errors.New("URLフラグメント（#以降）はHTTP要求へ送信されないため指定できません")
+		}
+		index := strings.IndexAny(value, "/?")
+		if index < 0 {
+			authority = value
+		} else {
+			authority = value[:index]
+			parsed, err := url.Parse("http://localhost" + value[index:])
+			if err != nil {
+				return Target{}, fmt.Errorf("接続先として解釈できません: %q", input)
+			}
+			path, rawPath, rawQuery = parsed.Path, parsed.RawPath, parsed.RawQuery
+			hasHTTPPart = true
+		}
+	}
+	portText := strings.TrimSpace(authority)
+	if strings.Contains(portText, ":") {
+		host, hostPort, splitErr := net.SplitHostPort(portText)
+		if splitErr != nil {
+			return Target{}, fmt.Errorf("接続先として解釈できません: %q", authority)
+		}
+		if !loopbackHost(host) {
+			return Target{}, fmt.Errorf("ホスト %q は指定できません。確認は選択したPodへのport-forward経由で行うため、localhost / 127.0.0.1 かポート番号だけを指定してください", host)
+		}
+		portText = hostPort
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return Target{}, fmt.Errorf("ポート番号として解釈できません: %q（1〜65535の数値で指定してください）", portText)
+	}
+	if !hasHTTPPart && scheme == "" {
+		return Target{
+			Group: "manual", Label: fmt.Sprintf("手動確認 :%d", port), Protocol: "tcp",
+			RemotePort: port, Source: "manual", Active: true,
+		}, nil
+	}
+	if scheme == "" {
+		scheme = "http"
+	}
+	if path == "" {
+		path = "/"
+	}
+	target := Target{
+		Group: "manual", Protocol: "http", Scheme: scheme, Path: path, RawPath: rawPath, RawQuery: rawQuery,
+		RemotePort: port, Source: "manual", Active: true,
+		// Strict is false: an operator poking at an arbitrary endpoint is
+		// exploring, not asserting that a non-2xx answer is a cluster defect.
+		Strict: false,
+	}
+	target.Label = "手動確認 " + targetLocalURL(target, port)
+	return target, nil
+}
+
+// loopbackHost reports whether a typed host names the local end of the tunnel.
+func loopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	address := net.ParseIP(host)
+	return address != nil && address.IsLoopback()
+}
+
+// CheckTarget runs a single check against an explicitly chosen destination,
+// reusing the same tunnel, timeouts and judgement as the automatic checks.
+func (checker *Checker) CheckTarget(ctx context.Context, pod *corev1.Pod, target Target, local int) (Result, error) {
+	return checker.checkOne(ctx, pod, target, local)
+}
+
+// NextLocalPort picks a local port for an extra check that will not collide
+// with the ones the automatic checks already bound.
+func NextLocalPort(results []Result) int {
+	highest := 0
+	for _, result := range results {
+		highest = max(highest, result.LocalPort)
+	}
+	if highest < 1 || highest >= 65535 {
+		return randomBasePort(1)
+	}
+	return highest + 1
+}
+
 func randomBasePort(targets int) int {
 	if targets < 1 {
 		targets = 1
@@ -504,9 +673,61 @@ func targetResource(target Target, pod *corev1.Pod) string {
 	return "Pod/" + pod.Namespace + "/" + pod.Name
 }
 
-func groupLabel(group string) string {
+// checkSignature identifies the request a target would issue. Two targets share
+// a signature only when the tunnel destination and the whole request are equal,
+// so reusing a result can never hide a difference that would have been tested:
+// a Service pointing at a different port, path or scheme keeps its own check.
+func checkSignature(target Target) string {
+	headers := make([]string, 0, len(target.Headers))
+	for _, header := range target.Headers {
+		headers = append(headers, header.Name+": "+header.Value)
+	}
+	timeoutSeconds := int32(0)
+	if target.Probe != nil {
+		timeoutSeconds = target.Probe.TimeoutSeconds
+	}
+	return strings.Join([]string{
+		strconv.Itoa(target.RemotePort), target.Protocol, target.Scheme, target.Path, target.RawPath, target.RawQuery,
+		strings.Join(headers, "\n"), strconv.FormatBool(target.Strict), strconv.Itoa(int(timeoutSeconds)),
+	}, "\x00")
+}
+
+// reusablePodResult limits result sharing to the one safe optimization: a
+// Service-derived display target that copies an already-executed Pod request.
+// Pod probes are deliberately never deduplicated. readiness, liveness and
+// startup are independent kubelet checks and must each remain visible and be
+// executed even when their URL happens to be identical.
+func reusablePodResult(target Target, checkedPodTargets map[string]int) (int, bool) {
+	if target.Group != "service" {
+		return 0, false
+	}
+	index, ok := checkedPodTargets[checkSignature(target)]
+	return index, ok
+}
+
+// sharedResult copies an earlier check onto a target that resolves to the same
+// destination, recording which check it came from so the report never implies
+// the connection was established twice.
+func sharedResult(origin Result, target Target) Result {
+	shared := origin
+	shared.Target = target
+	shared.Shared = true
+	note := fmt.Sprintf("%s :%d と同じ転送先のため、同じ接続結果です", GroupLabel(origin.Target.Group), origin.Target.RemotePort)
+	if detail := strings.TrimSpace(origin.Detail); detail != "" {
+		note = detail + " / " + note
+	}
+	shared.Detail = note
+	return shared
+}
+
+// GroupLabel names a check group for humans. The service wording deliberately
+// says "the port the Service forwards to" rather than anything resembling
+// "the Service": every check in both groups is a port-forward straight to the
+// Pod, so none of them exercises the ClusterIP, kube-proxy or the EndpointSlice
+// path. What separates the groups is only where the port number came from.
+func GroupLabel(group string) string {
 	if group == "service" {
-		return "Service指定Pod"
+		return "Serviceの転送先ポート"
 	}
 	return "Pod直接"
 }
@@ -516,18 +737,29 @@ func connectionTargetDescription(target Target, pod *corev1.Pod) string {
 	if protocol == "" {
 		protocol = "TCP"
 	}
-	endpoint := fmt.Sprintf("%s :%d%s", protocol, target.RemotePort, target.Path)
-	return fmt.Sprintf("Pod %s/%s の%s（%s、確認経路: %s）", pod.Namespace, pod.Name, targetName(target), endpoint, groupLabel(target.Group))
+	endpoint := fmt.Sprintf("%s :%d%s", protocol, target.RemotePort, targetRequestURI(target))
+	return fmt.Sprintf("Pod %s/%s の%s（%s、確認経路: %s）", pod.Namespace, pod.Name, targetName(target), endpoint, GroupLabel(target.Group))
 }
 
 func (checker *Checker) checkOne(ctx context.Context, pod *corev1.Pod, target Target, local int) (Result, error) {
 	result := Result{Target: target, LocalPort: local, Tested: true}
-	stop, ready, done, errorsFound, err := checker.forward(ctx, pod.Namespace, pod.Name, local, target.RemotePort)
+	opened, err := checker.forward(ctx, pod.Namespace, pod.Name, local, target.RemotePort)
 	if err != nil {
 		return result, err
 	}
-	var once sync.Once
-	cleanup := func() { once.Do(func() { close(stop); <-done }) }
+	cancel, ready, done, errorsFound := opened.cancel, opened.ready, opened.done, opened.errors
+	// cancel is idempotent; the ctx watcher inside forward may also invoke it.
+	// Waiting on done is bounded: closing stop normally unblocks ForwardPorts,
+	// but a tunnel wedged inside the SPDY dial would otherwise keep this
+	// deferred cleanup — and the whole diagnosis — blocked forever. Leaking the
+	// goroutine is strictly better than hanging an incident-response tool.
+	cleanup := func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(forwardShutdownTimeout):
+		}
+	}
 	defer cleanup()
 	select {
 	case <-ctx.Done():
@@ -539,14 +771,18 @@ func (checker *Checker) checkOne(ctx context.Context, pod *corev1.Pod, target Ta
 	if target.Protocol == "tcp" {
 		connection, err := (&net.Dialer{Timeout: timeoutFor(target.Probe, 3*time.Second)}).DialContext(ctx, "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(local)))
 		if err != nil {
-			result.Detail = "TCP接続に失敗しました: " + err.Error()
+			result.Detail = withForwardReason("TCP接続に失敗しました: "+err.Error(), opened)
 			return result, nil
 		}
-		_ = connection.Close()
-		result.Successful, result.Detail = true, "TCP接続成立"
+		defer connection.Close()
+		reachable, detail := remoteAccepted(connection)
+		result.Successful, result.Detail = reachable, detail
+		if !reachable {
+			result.Detail = withForwardReason(detail, opened)
+		}
 		return result, nil
 	}
-	requestURL := localProbeURL(target.Scheme, local, target.Path)
+	requestURL := targetLocalURL(target, local)
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
 	if err != nil {
 		return result, err
@@ -600,6 +836,7 @@ func (checker *Checker) checkOne(ctx context.Context, pod *corev1.Pod, target Ta
 	result.StatusCode = response.StatusCode
 	result.ContentType = response.Header.Get("Content-Type")
 	result.BodyBytes = len(body)
+	result.Proto, result.Header = response.Proto, response.Header.Clone()
 	result.Body = string(body)
 	if readErr != nil {
 		result.Detail = "HTTP応答本文を読み取れませんでした: " + readErr.Error()
@@ -618,15 +855,77 @@ func (checker *Checker) checkOne(ctx context.Context, pod *corev1.Pod, target Ta
 	return result, nil
 }
 
-func localProbeURL(scheme string, port int, path string) string {
+// CurlCommand renders the request this target issues as a curl invocation
+// against the forwarded local port, so the printed port-forward command can
+// actually be followed by something. Reconstructing the scheme, path and probe
+// headers by hand is the tedious part of reproducing a failed check.
+//
+// It mirrors checkOne exactly, including -k: the tunnel is reached as 127.0.0.1
+// so a certificate issued for the Pod never matches, and the checker itself
+// skips verification for the same reason kubelet does.
+//
+// TCP targets get nothing. There is no request to reproduce — the check is a
+// bare connect, and the port-forward command already covers it.
+func CurlCommand(result Result) ([]string, bool) {
+	if result.Target.Protocol != "http" || result.LocalPort < 1 || result.Shared {
+		return nil, false
+	}
+	scheme := result.Target.Scheme
+	if scheme == "" {
+		scheme = "http"
+	}
+	command := []string{"curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}\\n"}
+	if scheme == "https" {
+		command = append(command, "-k")
+	}
+	// The URL goes before the headers on purpose. Printed commands are masked
+	// line by line, and a credential-bearing header is masked to end of line —
+	// which would swallow everything after it. Keeping the URL ahead of the
+	// headers means the essential part of the command survives regardless.
+	target := result.Target
+	target.Scheme = scheme
+	command = append(command, targetLocalURL(target, result.LocalPort))
+	omitted := []string{}
+	for _, header := range result.Target.Headers {
+		// A probe header may carry a credential. Printing it is not acceptable
+		// even masked, because the masking that protects it also truncates the
+		// rest of the line and leaves an unusable command behind. Such headers
+		// are dropped and named instead, so it stays obvious that the printed
+		// request is not the complete one.
+		if redact.IsSensitiveKey(header.Name) {
+			omitted = append(omitted, header.Name)
+			continue
+		}
+		command = append(command, "-H", header.Name+": "+header.Value)
+	}
+	// Any note has to come last. '#' opens a shell comment, so placing it before
+	// the remaining arguments would quietly disable the headers after it.
+	if len(omitted) > 0 {
+		command = append(command, "#", fmt.Sprintf("%s ヘッダは値を表示しないため省略しています。実際の確認では送信しています", strings.Join(omitted, "、")))
+	}
+	return command, true
+}
+
+func targetLocalURL(target Target, port int) string {
 	// kubelet's utilnet.FormatURL assigns HTTPGetAction.path to url.URL.Path.
-	// Building a raw URL string would incorrectly treat '?' and '#' in that
-	// field as a query or fragment instead of escaped path characters.
+	// Building a raw URL string would incorrectly treat '?' and '#' in a Probe
+	// path as a query or fragment. RawPath/RawQuery remain empty for Kubernetes
+	// probes and are populated only when an operator pastes a complete URL.
+	scheme := target.Scheme
+	if scheme == "" {
+		scheme = "http"
+	}
 	return (&url.URL{
-		Scheme: scheme,
-		Host:   net.JoinHostPort("127.0.0.1", strconv.Itoa(port)),
-		Path:   path,
+		Scheme:   scheme,
+		Host:     net.JoinHostPort("127.0.0.1", strconv.Itoa(port)),
+		Path:     target.Path,
+		RawPath:  target.RawPath,
+		RawQuery: target.RawQuery,
 	}).String()
+}
+
+func targetRequestURI(target Target) string {
+	return (&url.URL{Path: target.Path, RawPath: target.RawPath, RawQuery: target.RawQuery}).RequestURI()
 }
 
 func defaultProbeHost(podIP string, port int) string {
@@ -653,20 +952,125 @@ func timeoutFor(probe *corev1.Probe, fallback time.Duration) time.Duration {
 	return fallback
 }
 
-func (checker *Checker) forward(_ context.Context, namespace, pod string, local, remote int) (chan struct{}, chan struct{}, chan struct{}, chan error, error) {
+// portForwardTimeout bounds the SPDY upgrade round-trip so a black-holed API
+// server can never hang the diagnosis indefinitely. Each tunnel carries a
+// single short probe (its own timeout is <= a few seconds) and is torn down
+// immediately after, so this ceiling never truncates a healthy probe; it only
+// caps the pathological "connect hangs forever" case.
+const portForwardTimeout = 30 * time.Second
+
+// forwardShutdownTimeout bounds how long cleanup waits for ForwardPorts to
+// return after the tunnel is cancelled. Teardown is normally immediate; this
+// only caps the pathological case where the forwarder never returns.
+const forwardShutdownTimeout = 5 * time.Second
+
+// forward opens a port-forward tunnel. It honours ctx: cancellation or deadline
+// closes the tunnel and unblocks ForwardPorts. The returned cancel func is
+// idempotent (guarded by sync.Once) and is the single owner of the stop signal,
+// so the ctx watcher here and the caller's cleanup can both invoke it safely.
+// remoteSettleTimeout bounds how long a TCP check waits to see whether the
+// tunnel stays open. A container port that is refused is dropped as soon as
+// kubelet answers, so this only has to cover one round trip to the API server;
+// a port that is genuinely listening simply waits, and that wait is the success.
+const remoteSettleTimeout = 2 * time.Second
+
+// remoteAccepted decides whether anything is actually listening on the far side
+// of a port-forward.
+//
+// Dialing the local port proves nothing: the forwarder binds and accepts the
+// local connection before it ever asks kubelet to reach the container, so a
+// refused container port still produces a successful Dial. That is exactly the
+// "the tunnel is up but nothing answers" case, and treating Dial as the answer
+// reports it as a healthy connection.
+//
+// Reading tells them apart. If kubelet could not reach the port the forwarder
+// tears the connection down and the read returns at once with EOF or a reset.
+// A listening server usually says nothing until spoken to, so a read that
+// simply times out with the connection still open is the success signal — and
+// a server that greets first (SMTP, Redis, databases) returns its banner.
+func remoteAccepted(connection net.Conn) (bool, string) {
+	if err := connection.SetReadDeadline(time.Now().Add(remoteSettleTimeout)); err != nil {
+		return true, "TCP接続成立（読み取り期限を設定できないため、接続確立のみで判定しました）"
+	}
+	buffer := make([]byte, 1)
+	read, err := connection.Read(buffer)
+	switch {
+	case read > 0:
+		return true, "TCP接続成立（接続直後に応答データを受信）"
+	case err == nil:
+		return true, "TCP接続成立"
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		// Still open after the wait: the far side accepted and is waiting for a
+		// request, which is what a healthy TCP service looks like.
+		return true, "TCP接続成立（接続を維持したまま要求待ち）"
+	case errors.Is(err, io.EOF):
+		return false, "port-forwardのトンネルは確立しましたが、転送先のコンテナがポートで待ち受けていないため接続が切断されました"
+	default:
+		return false, "port-forwardのトンネルは確立しましたが、転送先への接続が確立できませんでした: " + err.Error()
+	}
+}
+
+// withForwardReason appends whatever the forwarder itself reported. kubelet's
+// refusal is written to that log rather than returned, and it names the port and
+// the reason far more precisely than a local read error ever can.
+func withForwardReason(detail string, opened *tunnel) string {
+	reason := opened.log.String()
+	if reason == "" {
+		return detail
+	}
+	return detail + "。port-forwardの報告: " + redact.SanitizeText(reason)
+}
+
+// forwardLog captures what the port-forwarder reports about a tunnel. kubelet
+// refusing the container port is written here rather than returned as an error,
+// so discarding this output is what makes a refused port look like a healthy
+// one. It is written from the forwarder's goroutine while the check reads it,
+// hence the mutex.
+type forwardLog struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (l *forwardLog) Write(value []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buffer.Write(value)
+}
+
+func (l *forwardLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.TrimSpace(l.buffer.String())
+}
+
+// tunnel is one open port-forward and everything needed to judge and close it.
+type tunnel struct {
+	cancel func()
+	ready  chan struct{}
+	done   chan struct{}
+	errors chan error
+	log    *forwardLog
+}
+
+func (checker *Checker) forward(ctx context.Context, namespace, pod string, local, remote int) (*tunnel, error) {
 	transport, upgrader, err := transportspdy.RoundTripperFor(checker.Clients.RESTConfig)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, err
 	}
 	hostURL, err := checker.portForwardURL(namespace, pod)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, err
 	}
-	dialer := transportspdy.NewDialer(upgrader, &http.Client{Transport: transport}, http.MethodPost, hostURL)
+	dialer := transportspdy.NewDialer(upgrader, &http.Client{Transport: transport, Timeout: portForwardTimeout}, http.MethodPost, hostURL)
 	stop, ready, done, errorsFound := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan error, 1)
-	forwarder, err := portforward.NewOnAddresses(dialer, []string{"127.0.0.1"}, []string{fmt.Sprintf("%d:%d", local, remote)}, stop, ready, io.Discard, &bytes.Buffer{})
+	var once sync.Once
+	opened := &tunnel{
+		cancel: func() { once.Do(func() { close(stop) }) },
+		ready:  ready, done: done, errors: errorsFound, log: &forwardLog{},
+	}
+	forwarder, err := portforward.NewOnAddresses(dialer, []string{"127.0.0.1"}, []string{fmt.Sprintf("%d:%d", local, remote)}, stop, ready, io.Discard, opened.log)
 	if err != nil {
-		return nil, nil, nil, nil, err
+		return nil, err
 	}
 	go func() {
 		defer close(done)
@@ -674,7 +1078,14 @@ func (checker *Checker) forward(_ context.Context, namespace, pod string, local,
 			errorsFound <- err
 		}
 	}()
-	return stop, ready, done, errorsFound, nil
+	go func() {
+		select {
+		case <-ctx.Done():
+			opened.cancel()
+		case <-done:
+		}
+	}()
+	return opened, nil
 }
 
 func (checker *Checker) portForwardURL(namespace, pod string) (*url.URL, error) {

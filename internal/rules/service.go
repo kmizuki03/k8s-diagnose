@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,13 +30,14 @@ func (ServiceRule) Metadata() Metadata {
 
 func (ServiceRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Config) []model.Finding {
 	result := []model.Finding{}
+	podIndex := indexPodsByNamespace(snapshot.Pods)
 	for i := range snapshot.Services {
 		service := &snapshot.Services[i]
 		if service.Spec.Type == corev1.ServiceTypeExternalName || len(service.Spec.Selector) == 0 {
 			continue
 		}
 		resource := ref("Service", service.Namespace, service.Name)
-		pods := selectedPods(service, snapshot.Pods)
+		pods := podIndex.selected(service)
 		if snapshot.AvailableOrUntracked("pods") && len(pods) == 0 {
 			result = append(result, model.NewFinding(
 				model.Warning, "K8S.SERVICE.SELECTOR_NO_MATCH", "Service", resource, "SelectorNoMatch", "selector-no-match",
@@ -65,7 +67,12 @@ func (ServiceRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config
 			}
 			target := serviceTargetPort(port)
 			if target.Type != intstrutil.String || target.StrVal == "" {
-				continue // numeric targetPort need not be declared as containerPort
+				// A numeric targetPort need not be declared as a containerPort,
+				// so it is judged separately and only ever as a Candidate.
+				if finding, ok := numericTargetPortUndeclared(service, port, target, pods, resource, snapshot); ok {
+					result = append(result, finding)
+				}
+				continue
 			}
 			protocol := string(port.Protocol)
 			if protocol == "" {
@@ -114,6 +121,104 @@ func (ServiceRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config
 		}
 	}
 	return result
+}
+
+// declaredPodPorts collects the ports a Pod's manifest positively states it
+// uses: containerPorts of the given protocol, plus the numeric ports its probes
+// connect to. A probe port counts on its own because kubelet is already
+// reaching it, which proves a listener exists even when ports[] omits it.
+func declaredPodPorts(pod *corev1.Pod, protocol string) map[int32]struct{} {
+	ports := map[int32]struct{}{}
+	numeric, _ := containerPorts(pod)
+	for port := range numeric[protocol] {
+		ports[port] = struct{}{}
+	}
+	if protocol != string(corev1.ProtocolTCP) {
+		return ports
+	}
+	forEachPodProbe(pod, func(_ corev1.Container, _ string, probe *corev1.Probe) {
+		var value intstrutil.IntOrString
+		switch {
+		case probe.HTTPGet != nil:
+			value = probe.HTTPGet.Port
+		case probe.TCPSocket != nil:
+			value = probe.TCPSocket.Port
+		default:
+			return
+		}
+		if value.Type == intstrutil.Int && value.IntVal > 0 {
+			ports[value.IntVal] = struct{}{}
+		}
+	})
+	return ports
+}
+
+// numericTargetPortUndeclared reports a numeric targetPort that matches neither
+// a declared containerPort nor a probe port on any selected Pod.
+//
+// Kubernetes does not require a numeric targetPort to appear in ports[], so a
+// mismatch is not proof of a defect and this stays a Candidate. It is still
+// worth raising, because this is the one Service misconfiguration where every
+// other signal looks healthy: the selector matches, the Pod passes its probes
+// and is Ready, and the EndpointSlice is populated — with the wrong port, since
+// Kubernetes copies targetPort into the endpoint without checking that anything
+// listens there. Nothing else in the diagnosis mentions the port at all, which
+// is why "Pod is Running and Ready, endpoints exist, the Service still does not
+// answer" is so hard to see.
+//
+// Requiring the selected Pods to declare at least one port of the same protocol
+// keeps manifests that document nothing out of the finding: with no declared
+// port anywhere there is no evidence either way, and guessing would be noise.
+func numericTargetPortUndeclared(service *corev1.Service, port corev1.ServicePort, target intstrutil.IntOrString, pods []*corev1.Pod, resource string, snapshot *kube.Snapshot) (model.Finding, bool) {
+	if target.Type != intstrutil.Int || target.IntVal <= 0 || len(pods) == 0 {
+		return model.Finding{}, false
+	}
+	protocol := string(port.Protocol)
+	if protocol == "" {
+		protocol = string(corev1.ProtocolTCP)
+	}
+	declared := map[int32]struct{}{}
+	for _, pod := range pods {
+		podPorts := declaredPodPorts(pod, protocol)
+		if _, matched := podPorts[target.IntVal]; matched {
+			return model.Finding{}, false
+		}
+		for value := range podPorts {
+			declared[value] = struct{}{}
+		}
+	}
+	if len(declared) == 0 {
+		return model.Finding{}, false
+	}
+	evidence := []model.Evidence{
+		{Kind: "service", Key: "spec.ports", Value: fmt.Sprintf("Serviceポート %s → targetPort %d", servicePortText(port), target.IntVal)},
+		{Kind: "service", Key: "spec.selector", Value: "Serviceのselector: " + serviceSelectorText(service.Spec.Selector)},
+		{Kind: "pod", Key: "selectorMatches", Value: selectedPodSummary(pods)},
+		{Kind: "pod", Key: "declaredPorts", Value: fmt.Sprintf("selectorに一致したPodが宣言している %s ポート（containerPortとProbeの合計）: %s", protocol, summarizeStrings(sortedInt32Set(declared), 10))},
+		{Kind: "decision", Key: "undeclared", Value: fmt.Sprintf("targetPort %d は、いずれのPodの containerPort にもProbeのポートにも含まれていませんでした（0件）", target.IntVal)},
+	}
+	if snapshot.AvailableOrUntracked("endpoint_slices") {
+		evidence = append(evidence, model.Evidence{Kind: "endpointSlice", Key: "resolvedPort", Value: "EndpointSliceにはtargetPortがそのまま記録されるため、待ち受けの有無はEndpointSliceからは確認できません"})
+	}
+	return model.NewFinding(
+		model.Candidate, "K8S.SERVICE.TARGET_PORT_UNDECLARED", "Service", resource, "TargetPortUndeclared",
+		port.Name+"/"+strconv.Itoa(int(target.IntVal)),
+		fmt.Sprintf("Service %s のポート %s では、targetPort に %d が指定されています。しかし、selectorに一致したPodには、%d を使う containerPort もProbeも見つかりません。転送先で待ち受けているコンテナがない可能性があります。数値のtargetPortは宣言が不要なため、ports[] に書かずに待ち受けている場合は設定どおりです", shortRef(service.Namespace, service.Name), servicePortText(port), target.IntVal, target.IntVal), 55,
+		evidence...,
+	), true
+}
+
+func sortedInt32Set(values map[int32]struct{}) []string {
+	result := make([]int, 0, len(values))
+	for value := range values {
+		result = append(result, int(value))
+	}
+	sort.Ints(result)
+	text := make([]string, 0, len(result))
+	for _, value := range result {
+		text = append(text, strconv.Itoa(value))
+	}
+	return text
 }
 
 func servicePortText(port corev1.ServicePort) string {

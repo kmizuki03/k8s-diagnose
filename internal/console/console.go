@@ -162,10 +162,11 @@ type TableRow struct {
 // layer resolves findings and equivalent kubectl commands so the console does
 // not need to know about rule metadata or Kubernetes collection keys.
 type DiagnosticItem struct {
-	Check        model.Check
-	Findings     []model.Finding
-	Commands     []string
-	Supplemental bool
+	Check          model.Check
+	Findings       []model.Finding
+	Commands       []string
+	InputSummaries []string
+	Supplemental   bool
 }
 
 func (c *Console) Table(headers []string, rows []TableRow, colorize bool) {
@@ -292,15 +293,46 @@ func (c *Console) DiagnosticContents(items []DiagnosticItem) {
 	} else {
 		c.Write(fmt.Sprintf("  実施状況: ✔ 実施済み %d件 / ? 確認不能 %d件", available, unavailable))
 	}
-	c.printWrapped(c.C.Dim, "  ※ ", "各項目の確認コマンドを結果の前に表示します。実施済みは正常という意味ではなく、判定を実行できたことを表します")
+	c.printWrapped(c.C.Dim, "  ※ ", "実施済みは正常という意味ではなく、判定を実行できたことを表します。所見の詳細は下の重大度別の一覧に、確認コマンドは所見のあった項目に表示します")
 
+	// This section answers "what did the tool actually look at". The findings
+	// themselves are printed in full under 確定異常 / 警告 / 要確認 just below,
+	// and every unavailable check is listed again under 確認できなかった項目, so
+	// repeating either here made this one section more than half of the whole
+	// report. Only the counts stay, and the checks that never ran are grouped by
+	// the reason they share instead of repeating it once per rule.
 	currentSection := ""
 	availableIndex := 0
+	blocked := map[string][]string{}
+	blockedOrder := []string{}
 	for _, item := range values {
 		check := item.Check
 		section := strings.TrimSpace(check.Section)
 		if section == "" {
 			section = "その他"
+		}
+		description := strings.TrimSpace(check.Description)
+		if description == "" {
+			description = strings.TrimSpace(check.ID)
+		}
+		if description == "" {
+			description = "検査内容が設定されていません"
+		}
+		if !check.Available {
+			reason := strings.TrimSpace(check.Reason)
+			if reason == "" {
+				reason = "判定に必要な情報を取得できませんでした"
+			}
+			if _, seen := blocked[reason]; !seen {
+				blockedOrder = append(blockedOrder, reason)
+			}
+			// The section is enough to see what is missing at a glance; the
+			// individual checks and their messages are listed in full under
+			// 確認できなかった項目.
+			if names := blocked[reason]; len(names) == 0 || names[len(names)-1] != section {
+				blocked[reason] = append(names, section)
+			}
+			continue
 		}
 		if section != currentSection {
 			if currentSection == "" {
@@ -309,40 +341,34 @@ func (c *Console) DiagnosticContents(items []DiagnosticItem) {
 			c.printColor(c.C.Cyan+c.C.Bold, "  "+MaskSecrets(section, c.Config.Mask))
 			currentSection = section
 		}
-
-		description := strings.TrimSpace(check.Description)
-		if description == "" {
-			description = strings.TrimSpace(check.ID)
+		descriptionColor := c.C.Green
+		if availableIndex%2 == 1 {
+			descriptionColor = c.C.Lime
 		}
-		if description == "" {
-			description = "検査内容が設定されていません"
-		}
-		descriptionColor := c.C.Yellow
-		if check.Available {
-			descriptionColor = c.C.Green
-			if availableIndex%2 == 1 {
-				descriptionColor = c.C.Lime
-			}
-			availableIndex++
-		}
+		availableIndex++
 		c.printWrapped(descriptionColor, "    検査: ", description)
-		if c.Config.ShowCmd {
+		for _, summary := range item.InputSummaries {
+			c.printWrapped(c.C.Cyan, "    対象: ", summary)
+		}
+		result, resultColor := c.diagnosticResult(item)
+		c.printWrapped(resultColor+c.C.Bold, "    結果: ", result)
+		// The command is what an operator runs to look closer, so it follows the
+		// checks that give them a reason to. Printing it under every clean check
+		// doubled the length of this section for lines nobody acts on.
+		if c.Config.ShowCmd && len(item.Findings) > 0 {
 			for _, command := range item.Commands {
 				c.printWrapped(c.C.Dim, "      $ ", command)
 			}
 		}
-
-		result, resultColor := c.diagnosticResult(item)
-		c.printWrapped(resultColor+c.C.Bold, "    結果: ", result)
-		if !check.Available {
-			reason := strings.TrimSpace(check.Reason)
-			if reason == "" {
-				reason = "判定に必要な情報を取得できませんでした"
-			}
-			c.printWrapped(c.C.Yellow, "      └─ 理由: ", reason)
-			continue
-		}
-		c.renderDiagnosticFindings(item.Findings)
+	}
+	if len(blockedOrder) == 0 {
+		return
+	}
+	c.Write()
+	c.printColor(c.C.Yellow+c.C.Bold, fmt.Sprintf("  ? 確認不能 %d件（詳細は「確認できなかった項目」）", unavailable))
+	for _, reason := range blockedOrder {
+		c.printWrapped(c.C.Yellow, "    理由: ", MaskSecrets(reason, c.Config.Mask))
+		c.printWrapped(c.C.Dim, "      ", MaskSecrets(strings.Join(blocked[reason], " / "), c.Config.Mask))
 	}
 }
 
@@ -388,53 +414,6 @@ func (c *Console) diagnosticResult(item DiagnosticItem) (string, string) {
 		result += fmt.Sprintf("（承認済み %d件）", acknowledged)
 	}
 	return result, color
-}
-
-func (c *Console) renderDiagnosticFindings(findings []model.Finding) {
-	if len(findings) == 0 {
-		return
-	}
-	values := append([]model.Finding{}, findings...)
-	sort.SliceStable(values, func(i, j int) bool {
-		left, right := diagnosticSeverityRank(values[i].Severity), diagnosticSeverityRank(values[j].Severity)
-		if left != right {
-			return left < right
-		}
-		return values[i].Message < values[j].Message
-	})
-	for index, finding := range values {
-		branch := "├─"
-		if index == len(values)-1 {
-			branch = "└─"
-		}
-		icon, label, color := "◇", "要確認", c.C.Magenta
-		switch finding.Severity {
-		case model.Issue:
-			icon, label, color = "✘", "確定異常", c.C.Red
-		case model.Warning:
-			icon, label, color = "▲", "警告", c.C.Yellow
-		case model.Unavailable:
-			icon, label, color = "?", "確認不能", c.C.Yellow
-		}
-		acknowledged := ""
-		if finding.Acknowledged {
-			acknowledged = " [承認済み]"
-		}
-		c.printWrapped(color, "      "+branch+" "+icon+" ", "["+label+"] "+finding.Message+acknowledged)
-	}
-}
-
-func diagnosticSeverityRank(severity model.Severity) int {
-	switch severity {
-	case model.Issue:
-		return 0
-	case model.Warning:
-		return 1
-	case model.Unavailable:
-		return 2
-	default:
-		return 3
-	}
 }
 
 func (c *Console) printWrapped(color, prefix, value string) {
@@ -858,6 +837,7 @@ func (c *Console) Summary(state *model.State, beforeFinding ...func(model.Findin
 	}
 	c.Section(scoreTitle)
 	health, coverage := state.Health(), state.Coverage()
+	ok, unavailable, total := state.CoverageCounts()
 	grade, gradeLabel, healthColor := "A", "良好", c.C.Green
 	if health < 90 {
 		grade, gradeLabel, healthColor = "B", "注意", c.C.Yellow
@@ -867,6 +847,19 @@ func (c *Console) Summary(state *model.State, beforeFinding ...func(model.Findin
 	}
 	if health < 60 {
 		grade, gradeLabel, healthColor = "D", "重大", c.C.Red
+	}
+	// The score can only speak for the checks that actually ran. A blocked run
+	// (RBAC, an unreachable API) produces few confirmed issues and therefore a
+	// high score, so an unqualified green "良好" would report an all-clear for a
+	// diagnosis that mostly did not happen — the same mistake as calling a
+	// connection verified when it was never attempted. The verdict therefore
+	// carries its scope whenever anything was skipped, and stops being painted
+	// as good news once the run is materially incomplete.
+	if unavailable > 0 {
+		gradeLabel += "（確認できた範囲）"
+		if coverage < partialCoverageThreshold && healthColor == c.C.Green {
+			healthColor = c.C.Yellow
+		}
 	}
 	barWidth := max(12, min(24, c.width-38))
 	healthLabel := "Health:"
@@ -902,7 +895,6 @@ func (c *Console) Summary(state *model.State, beforeFinding ...func(model.Findin
 			c.printColor(color, line)
 		}
 	}
-	ok, unavailable, total := state.CoverageCounts()
 	coverageLabel := "Coverage:"
 	coverageLabel += strings.Repeat(" ", max(0, 9-DisplayWidth(coverageLabel)))
 	c.printColor(c.C.Cyan+c.C.Bold, fmt.Sprintf("  %s [%s] %3d%%", coverageLabel, scoreBar(coverage, barWidth), coverage))
@@ -911,6 +903,9 @@ func (c *Console) Summary(state *model.State, beforeFinding ...func(model.Findin
 		coverageDetail = "確認対象なし"
 	}
 	c.printColor(c.C.Dim, "            "+coverageDetail)
+	if total > 0 && coverage < partialCoverageThreshold {
+		c.printWrapped(c.C.Yellow, "  ※ ", fmt.Sprintf("確認できた項目は %d/%d です。このスコアは診断できた範囲のもので、クラスタ全体が正常であることを示すものではありません", ok, total))
+	}
 	issues := len(state.BySeverity(model.Issue, false))
 	warnings := len(state.BySeverity(model.Warning, false))
 	unavailableFindings := len(state.BySeverity(model.Unavailable, false))
@@ -926,6 +921,10 @@ func (c *Console) Summary(state *model.State, beforeFinding ...func(model.Findin
 	}
 	c.printColor(c.C.Dim, "  "+healthDescription)
 }
+
+// partialCoverageThreshold is the Coverage percentage below which a run has
+// missed enough of the diagnosis that its score must not read as an all-clear.
+const partialCoverageThreshold = 75
 
 func scoreBar(value, width int) string {
 	value = max(0, min(100, value))

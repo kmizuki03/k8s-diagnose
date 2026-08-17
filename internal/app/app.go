@@ -43,11 +43,16 @@ type Runner struct {
 	LogAnalyzer *rules.LogAnalyzer
 	WebhookURL  string
 	History     *history.Analysis
-	watchRuns   []report.Document
-	reader      *bufio.Reader
-	logBlocks   []logBlock
-	trace       *bytes.Buffer
-	kubectlCmds [][]string
+	// ReplaySnapshot is the already-validated input loaded from
+	// --load-cluster-snapshot. Keeping it here prevents interactive select mode
+	// from falling through to a live Collector whose clients are intentionally
+	// nil in offline mode.
+	ReplaySnapshot *kube.Snapshot
+	watchRuns      []report.Document
+	reader         *bufio.Reader
+	logBlocks      []logBlock
+	trace          *bytes.Buffer
+	kubectlCmds    [][]string
 }
 
 type logBlock struct {
@@ -121,19 +126,43 @@ func Run(ctx context.Context, cfg config.Config, streams Streams) int {
 		printError(streams.Err, err)
 		return 1
 	}
-	clients, err := kube.NewClients(cfg)
-	if err != nil {
-		printError(streams.Err, err)
-		return 1
-	}
 	var trace *bytes.Buffer
-	if cfg.ShowAPIRequests && cfg.Output == "text" {
-		trace = &bytes.Buffer{}
-		clients.SetTraceWriter(trace)
-	}
-	if err := clients.Preflight(ctx); err != nil {
-		printError(streams.Err, err)
-		return 1
+	var clients *kube.Clients
+	var replaySnapshot *kube.Snapshot
+	if cfg.LoadClusterSnapshot != "" {
+		// Replaying a saved snapshot must work without any cluster access at
+		// all: whoever received the file is helping precisely because they
+		// cannot reach the reporter's cluster. Skip client construction and
+		// preflight, and label the run so reports never imply a live context.
+		file, err := kube.LoadClusterSnapshotFile(cfg.LoadClusterSnapshot)
+		if err != nil {
+			printError(streams.Err, err)
+			return 1
+		}
+		if err := file.ValidateReplayScope(cfg.Namespace, cfg.Mode, cfg.ShowUnused); err != nil {
+			printError(streams.Err, err)
+			return 1
+		}
+		clients = kube.OfflineClients(cfg)
+		if contextName := strings.TrimSpace(file.Scope.Context); contextName != "" {
+			clients.Context = contextName + "（保存済みクラスタ状態）"
+		}
+		replaySnapshot = file.Snapshot
+	} else {
+		live, err := kube.NewClients(cfg)
+		if err != nil {
+			printError(streams.Err, err)
+			return 1
+		}
+		clients = live
+		if cfg.ShowAPIRequests && cfg.Output == "text" {
+			trace = &bytes.Buffer{}
+			clients.SetTraceWriter(trace)
+		}
+		if err := clients.Preflight(ctx); err != nil {
+			printError(streams.Err, err)
+			return 1
+		}
 	}
 	consoleOut := streams.Out
 	if cfg.Output != "text" {
@@ -143,9 +172,9 @@ func Run(ctx context.Context, cfg config.Config, streams Streams) int {
 		Config: cfg, Streams: streams, Clients: clients,
 		Console: console.New(cfg, consoleOut, streams.Err), Registry: rules.Builtins(),
 		Baseline: loadedBaseline, Previous: previous, LogAnalyzer: logAnalyzer,
-		WebhookURL: webhookURL,
-		reader:     bufio.NewReader(streams.In),
-		trace:      trace,
+		WebhookURL: webhookURL, ReplaySnapshot: replaySnapshot,
+		reader: bufio.NewReader(streams.In),
+		trace:  trace,
 	}
 	if cfg.Watch > 0 {
 		return runner.watch(ctx)
@@ -228,8 +257,19 @@ func (runner *Runner) diagnose(ctx context.Context, selected *corev1.Pod) (*mode
 			keys[key] = true
 		}
 	}
-	collector := &kube.Collector{Clients: runner.Clients, Config: runner.Config, Only: keys}
-	snapshot := collector.Collect(ctx)
+	snapshot, err := runner.snapshotForKeys(ctx, keys)
+	if err != nil {
+		return nil, nil, err
+	}
+	if path := runner.Config.SaveClusterSnapshot; path != "" {
+		scope := kube.ClusterSnapshotScope{
+			Context: runner.Clients.Context, Namespace: runner.Config.Namespace, Mode: runner.Config.Mode,
+			Unused: runner.Config.ShowUnused,
+		}
+		if err := kube.SaveClusterSnapshot(path, config.Version, scope, snapshot); err != nil {
+			return nil, snapshot, err
+		}
+	}
 	if selected != nil {
 		if status := snapshot.Status("pods"); !status.Available {
 			return nil, snapshot, fmt.Errorf("選択したPodを診断直前に再取得できません。原因: %s", status.Reason)
@@ -246,13 +286,40 @@ func (runner *Runner) diagnose(ctx context.Context, selected *corev1.Pod) (*mode
 		addUnusedDiagnostics(snapshot, state, runner.Config.Namespace == "")
 	}
 	if selected != nil || runner.Config.ShowLogs {
-		runner.collectLogs(ctx, snapshot, state, selected != nil)
+		if runner.ReplaySnapshot != nil || runner.Config.LoadClusterSnapshot != "" {
+			runner.addReplayLogUnavailable(snapshot, state, selected != nil)
+		} else {
+			runner.collectLogs(ctx, snapshot, state, selected != nil)
+		}
 	}
 	runner.correlateAndApplyBaseline(snapshot, state)
 	if selected != nil && len(snapshot.Pods) == 1 {
 		state.SetScopedScore(calculatePodScore(&snapshot.Pods[0], state, snapshot))
 	}
 	return state, snapshot, nil
+}
+
+// snapshotForKeys selects exactly one input source. A replay never falls back
+// to Kubernetes API access; this is especially important in select mode,
+// where the first Pod-list screen previously created a Collector with nil
+// offline clients and could panic before showing the saved Pods.
+func (runner *Runner) snapshotForKeys(ctx context.Context, keys map[string]bool) (*kube.Snapshot, error) {
+	if runner.ReplaySnapshot != nil {
+		return runner.ReplaySnapshot, nil
+	}
+	if path := runner.Config.LoadClusterSnapshot; path != "" {
+		file, err := kube.LoadClusterSnapshotFile(path)
+		if err != nil {
+			return nil, err
+		}
+		if err := file.ValidateReplayScope(runner.Config.Namespace, runner.Config.Mode, runner.Config.ShowUnused); err != nil {
+			return nil, err
+		}
+		runner.ReplaySnapshot = file.Snapshot
+		return runner.ReplaySnapshot, nil
+	}
+	collector := &kube.Collector{Clients: runner.Clients, Config: runner.Config, Only: keys}
+	return collector.Collect(ctx), nil
 }
 
 func (runner *Runner) correlateAndApplyBaseline(snapshot *kube.Snapshot, state *model.State) {
@@ -360,8 +427,11 @@ func podPhaseCounts(pods []corev1.Pod) map[string]int {
 }
 
 func (runner *Runner) selectPod(ctx context.Context) int {
-	collector := &kube.Collector{Clients: runner.Clients, Config: runner.Config, Only: map[string]bool{"pods": true}}
-	snapshot := collector.Collect(ctx)
+	snapshot, err := runner.snapshotForKeys(ctx, map[string]bool{"pods": true})
+	if err != nil {
+		printError(runner.Streams.Err, err)
+		return 1
+	}
 	status := snapshot.Status("pods")
 	if !status.Available {
 		printErrorMessage(runner.Streams.Err, fmt.Sprintf("Pod一覧を取得できませんでした。原因: %s", status.Reason))
@@ -405,6 +475,7 @@ func (runner *Runner) selectPod(ctx context.Context) int {
 				runner.correlateAndApplyBaseline(selectedSnapshot, state)
 				state.SetScopedScore(calculatePodScore(selected, state, selectedSnapshot))
 				runner.renderConnectResults(results)
+				runner.probeManually(ctx, selected, results)
 			}
 		}
 		runner.Console.RootCauseReport(state.RootCauses)

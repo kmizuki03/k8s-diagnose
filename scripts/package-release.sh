@@ -4,6 +4,12 @@ set -euo pipefail
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 release_root=${1:-"$project_dir/dist/releases"}
+# Supply-chain artifacts (SBOM, third-party notices, license texts) are produced
+# separately by generate-supply-chain.sh. A release archive must carry them:
+# re-distributing binaries that link Apache-2.0 (k8s.io) and BSD (golang.org/x)
+# code requires shipping their NOTICE and license texts. Default to the standard
+# output location; allow an override for CI that stages it elsewhere.
+supply_chain_dir=${2:-${K8S_DIAGNOSE_SUPPLY_CHAIN_DIR:-"$project_dir/dist/supply-chain"}}
 
 version=$("$script_dir/version.sh")
 safe_version=${version//\//-}
@@ -35,6 +41,16 @@ for path in "$bundle_dir" "$archive" "$checksum"; do
     exit 1
   fi
 done
+
+third_party_notices="$supply_chain_dir/THIRD_PARTY_NOTICES.csv"
+licenses_dir="$supply_chain_dir/licenses"
+sbom_file="$supply_chain_dir/bom.cdx.json"
+if [[ ! -f $third_party_notices || ! -d $licenses_dir || ! -f $sbom_file ]]; then
+	printf '%s\n' "supply-chain生成物が見つかりません: $supply_chain_dir" >&2
+	printf '%s\n' '先に scripts/generate-supply-chain.sh（make supply-chain）を実行してください。' >&2
+	printf '%s\n' 'SBOMと第三者ライセンス表記を同梱しない配布物は作成できません。' >&2
+  exit 1
+fi
 
 mkdir -p "$release_root"
 staging_dir=$(mktemp -d "$release_root/.${bundle_name}.tmp.XXXXXX")
@@ -70,10 +86,17 @@ for legal_file in LICENSE LICENSE.txt LICENSE.md NOTICE NOTICE.txt; do
   fi
 done
 
+# Bundle the third-party notices and license texts so the archive is legally
+# self-contained. Validated to exist above.
+cp "$third_party_notices" "$payload/"
+cp -R "$licenses_dir" "$payload/licenses"
+cp "$sbom_file" "$payload/"
+
 printf '%s\n' "$version" > "$payload/VERSION"
 printf '%s\n' \
-  'このディレクトリは実運用向けの配布物です。' \
-  'Goソース、テスト、CI、レビュー資料、開発スクリプトは含みません。' \
+	'このディレクトリは実運用向けの配布物です。' \
+	'Goソース、テスト、CI、レビュー資料、開発スクリプトは含みません。' \
+	'bom.cdx.json（SBOM）と、LICENSE / NOTICE / THIRD_PARTY_NOTICES.csv / licenses/ の権利表記を同梱しています。' \
   > "$payload/CONTENTS.txt"
 
 COPYFILE_DISABLE=1 tar -C "$staging_dir" -czf "$staging_dir/$bundle_name.tar.gz" "$bundle_name"

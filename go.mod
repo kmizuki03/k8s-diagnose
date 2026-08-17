@@ -1,6 +1,6 @@
 module github.com/kmizuki03/k8s-diagnose
 
-go 1.25.12
+go 1.25.13
 
 require (
 	golang.org/x/sync v0.21.0

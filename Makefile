@@ -1,6 +1,10 @@
 .PHONY: build test vet lint verify security supply-chain package fmt clean fclean re
 
 NAME := k8s-diagnose
+MODULE_GO_VERSION := $(shell awk '$$1 == "go" { print $$2; exit }' go.mod)
+GOTOOLCHAIN ?= go$(MODULE_GO_VERSION)
+export GOTOOLCHAIN
+
 GO_SOURCES := $(shell find . -type f -name '*.go' ! -name '*_test.go' ! -path './vendor/*' | sort)
 BUILD_DEPS := $(GO_SOURCES) go.mod go.sum scripts/version.sh Makefile
 VERSION ?= $(shell ./scripts/version.sh)
@@ -41,7 +45,9 @@ supply-chain:
 	@command -v go-licenses >/dev/null || { echo 'go-licensesをインストールしてください'; exit 1; }
 	./scripts/generate-supply-chain.sh
 
-package:
+# package depends on supply-chain so every release archive carries the SBOM and
+# third-party notices; package-release.sh refuses to build without them.
+package: supply-chain
 	./scripts/package-release.sh
 
 fmt:

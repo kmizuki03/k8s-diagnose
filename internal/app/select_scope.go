@@ -136,6 +136,14 @@ func scopeSnapshotToSelectedPod(snapshot *kube.Snapshot, pod *corev1.Pod) *kube.
 			scoped.Events = append(scoped.Events, event)
 		}
 	}
+
+	// The shallow copy above inherited the source snapshot's cached name index,
+	// which still describes the unfiltered collections. Drop it now that every
+	// replacement is done, so the next lookup rebuilds it from the narrowed
+	// collections. This must stay the last statement: resetting earlier would
+	// leave a window in which any lookup added to this function would cache a
+	// half-filtered index, and no existing test would fail.
+	scoped.ResetIndex()
 	return &scoped
 }
 

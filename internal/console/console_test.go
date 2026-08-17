@@ -2,6 +2,8 @@ package console
 
 import (
 	"bytes"
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -74,31 +76,32 @@ func TestDiagnosticContentsShowsEveryCheckAndUnavailableReason(t *testing.T) {
 		{Check: model.Check{ID: "tls", Section: "TLS", Description: "TLS Secret内のX.509証明書", Available: false, Reason: "アクセス権限がありません authorization=Basic dXNlcjpwYXNz"}},
 		{Check: model.Check{ID: "service", Section: "Service", Description: "ServiceのPod選択条件・Endpoint・targetPort", Available: true}, Findings: []model.Finding{serviceFinding}, Commands: []string{"kubectl get services -A -o json"}},
 		{Check: model.Check{ID: "service/optional/endpoint_slices", Section: "Service", Description: "追加情報としてEndpointSlice一覧を取得", Available: true}, Commands: []string{"kubectl get endpointslices.discovery.k8s.io -A -o json"}, Supplemental: true},
-		{Check: model.Check{ID: "pod", Section: "Pod", Description: "Podとコンテナの稼働状態", Available: true}},
+		{Check: model.Check{ID: "pod", Section: "Pod", Description: "Podとコンテナの稼働状態", Available: true}, InputSummaries: []string{"Pod一覧: 0件（この診断範囲には存在しません）"}},
 	}
 
 	c.DiagnosticContents(items)
 	got := buffer.String()
+	// This section says what was looked at. The findings themselves are printed
+	// in full under the severity lists and every blocked check is listed again
+	// under 確認できなかった項目, so only counts and names belong here.
 	for _, want := range []string{
 		"診断内容（実施状況）",
 		"✔ 実施済み 3件",
 		"? 確認不能 1件",
-		"各項目の確認コマンドを結果の前に表示します",
 		"は正常という意味ではなく",
 		"検査: Podとコンテナの稼働状態",
+		"対象: Pod一覧: 0件",
+		"（この診断範囲には存在しません）",
 		"結果: ✔ 所見なし",
-		"Podとコンテナの稼働状態",
 		"ServiceのPod選択条件・Endpoint",
 		"・targetPort",
 		"$ kubectl get services",
 		"結果: ✘ 確定異常 1件",
-		"Service ns/api のtargetPortを解決",
-		"できません",
 		"追加情報としてEndpointSlice一覧を取得",
 		"結果: ✔ 追加情報を取得済み",
-		"TLS Secret内のX.509証明書",
-		"結果: ? 確認不能",
+		"? 確認不能 1件（詳細は「確認できなかった項目」）",
 		"理由: アクセス権限がありません",
+		"TLS",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("診断内容に%qがない: %q", want, got)
@@ -107,7 +110,12 @@ func TestDiagnosticContentsShowsEveryCheckAndUnavailableReason(t *testing.T) {
 	if strings.Contains(got, "dXNlcjpwYXNz") {
 		t.Fatalf("確認不能理由から資格情報が漏れた: %q", got)
 	}
-	if !(strings.Index(got, "  Pod\n") < strings.Index(got, "  Service\n") && strings.Index(got, "  Service\n") < strings.Index(got, "  TLS\n")) {
+	// The severity lists below carry the finding bodies; repeating them here made
+	// this one section more than half of the whole report.
+	if strings.Contains(got, "targetPortを解決") {
+		t.Fatalf("所見本文が重大度別一覧と重複している: %q", got)
+	}
+	if strings.Index(got, "  Pod\n") >= strings.Index(got, "  Service\n") {
 		t.Fatalf("診断分類が安定した順序で表示されていない: %q", got)
 	}
 	if items[0].Check.ID != "tls" || items[1].Check.ID != "service" || items[2].Check.ID != "service/optional/endpoint_slices" || items[3].Check.ID != "pod" {
@@ -142,10 +150,8 @@ func TestDiagnosticContentsHonoursNoCmdAndStillShowsResult(t *testing.T) {
 	if strings.Contains(got, "kubectl get pods") {
 		t.Fatalf("コマンド非表示設定でも診断内容にkubectlが表示された: %q", got)
 	}
-	for _, want := range []string{"結果: ▲ 警告 1件", "[警告] PodがReadyではありません"} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("コマンド非表示時に結果%qまで消えた: %q", want, got)
-		}
+	if !strings.Contains(got, "結果: ▲ 警告 1件") {
+		t.Fatalf("コマンド非表示時に結果まで消えた: %q", got)
 	}
 }
 
@@ -300,5 +306,79 @@ func TestRootCauseEvidenceLabelsAreReadable(t *testing.T) {
 		if got := rootCauseEvidenceLabel(test.evidence); got != test.want {
 			t.Fatalf("根拠ラベル=%q, want %q", got, test.want)
 		}
+	}
+}
+
+func summaryWithCoverage(t *testing.T, available, blocked int) string {
+	t.Helper()
+	state := model.NewState()
+	for i := 0; i < available; i++ {
+		state.AddCheck(model.Check{ID: "ok-" + strconv.Itoa(i), Available: true})
+	}
+	for i := 0; i < blocked; i++ {
+		state.AddCheck(model.Check{ID: "ng-" + strconv.Itoa(i), Available: false, Reason: "forbidden"})
+	}
+	buffer := &bytes.Buffer{}
+	cfg := config.Defaults()
+	cfg.Mode = "all"
+	New(cfg, buffer, buffer).Summary(state)
+	return buffer.String()
+}
+
+// A blocked run confirms few issues and therefore scores high. The headline is
+// the most prominent thing on screen, so it must not read as an all-clear for a
+// diagnosis that never ran.
+func TestScoreHeadlineDoesNotClaimAnAllClearWhenMostChecksWereBlocked(t *testing.T) {
+	out := summaryWithCoverage(t, 2, 14)
+	if !strings.Contains(out, "100/100") {
+		t.Fatalf("前提が変わっている（確定Issueなしでは満点のはず）: %s", out)
+	}
+	if !strings.Contains(out, "良好（確認できた範囲）") {
+		t.Errorf("評価が確認できた範囲のものだと示されていない: %s", out)
+	}
+	if !strings.Contains(out, "クラスタ全体が正常であることを示すものではありません") {
+		t.Errorf("カバレッジ不足の注記がない: %s", out)
+	}
+}
+
+func TestScoreHeadlineStaysPlainWhenEverythingWasChecked(t *testing.T) {
+	out := summaryWithCoverage(t, 16, 0)
+	if strings.Contains(out, "確認できた範囲") || strings.Contains(out, "示すものではありません") {
+		t.Errorf("全項目を確認できた実行に不要な注記が出ている: %s", out)
+	}
+}
+
+// This section grew to more than half of the whole report because it repeated
+// what the severity lists and 確認できなかった項目 already say. It must stay a
+// summary of what was looked at.
+func TestDiagnosticContentsStaysASummaryInsteadOfRepeatingEverything(t *testing.T) {
+	items := []DiagnosticItem{}
+	for i := 0; i < 20; i++ {
+		items = append(items, DiagnosticItem{
+			Check: model.Check{ID: fmt.Sprintf("blocked-%d", i), Section: fmt.Sprintf("分類%02d", i),
+				Description: "取得できなかった検査", Available: false, Reason: "アクセス権限がありません"},
+		})
+	}
+	items = append(items, DiagnosticItem{
+		Check:    model.Check{ID: "clean", Section: "Pod", Description: "所見のない検査", Available: true},
+		Commands: []string{"kubectl get pods -A -o json"},
+	})
+	buffer := &bytes.Buffer{}
+	New(config.Defaults(), buffer, buffer).DiagnosticContents(items)
+	got := buffer.String()
+
+	// One shared reason is printed once, not once per blocked rule.
+	if count := strings.Count(got, "アクセス権限がありません"); count != 1 {
+		t.Errorf("同じ理由を%d回繰り返している: %q", count, got)
+	}
+	// A check with nothing to act on does not need a command to act with.
+	if strings.Contains(got, "kubectl get pods") {
+		t.Errorf("所見のない検査にまで確認コマンドを出している: %q", got)
+	}
+	if !strings.Contains(got, "結果: ✔ 所見なし") {
+		t.Errorf("実施した検査が一覧から消えた: %q", got)
+	}
+	if lines := strings.Count(got, "\n"); lines > 20 {
+		t.Errorf("21件の検査で%d行を使っている（要約になっていない）: %q", lines, got)
 	}
 }

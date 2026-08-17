@@ -82,9 +82,13 @@ func loadINI(reader io.Reader, cfg *Config) error {
 	return nil
 }
 
+// inheritLegacyAPIRequestSetting keeps display.show_commands = false meaning
+// "print nothing extra" for files written before show_api_requests existed. The
+// enabling direction is deliberately not inherited: the trace is off by default
+// now, and show_commands = true must not switch it back on behind the operator.
 func inheritLegacyAPIRequestSetting(cfg *Config) {
-	if cfg.SettingExplicit("display.show_commands") && !cfg.SettingExplicit("display.show_api_requests") {
-		cfg.ShowAPIRequests = cfg.ShowCmd
+	if cfg.SettingExplicit("display.show_commands") && !cfg.ShowCmd && !cfg.SettingExplicit("display.show_api_requests") {
+		cfg.ShowAPIRequests = false
 	}
 }
 

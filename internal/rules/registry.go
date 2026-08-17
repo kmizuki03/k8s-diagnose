@@ -233,7 +233,7 @@ func Builtins() *Registry {
 		DependencyRule{}, PriorityClassDependencyRule{}, RuntimeClassDependencyRule{},
 		ServiceRule{}, IngressRule{}, StorageRule{}, PersistentVolumeRule{}, NetworkPolicyRule{},
 		WebhookRule{}, TLSRule{}, QuotaRule{}, PDBRule{}, APIServiceRule{},
-		ConfigRiskRule{}, ProbeConfigRule{}, LimitRangeRule{}, NamespaceRule{}, CRDRule{}, ControlPlaneRule{}, APIDeprecationRule{},
+		ConfigRiskRule{}, ConfigMapRule{}, ProbeConfigRule{}, LimitRangeRule{}, NamespaceRule{}, CRDRule{}, ControlPlaneRule{}, APIDeprecationRule{},
 	)
 }
 
