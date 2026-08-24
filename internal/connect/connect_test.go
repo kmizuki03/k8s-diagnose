@@ -1,3 +1,5 @@
+//lint:file-ignore SA1019 Legacy Endpoints fallback behavior is intentionally covered.
+
 package connect
 
 import (
