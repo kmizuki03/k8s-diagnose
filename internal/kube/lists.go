@@ -20,12 +20,24 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	schedulingv1 "k8s.io/api/scheduling/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
 func (c *Collector) limit() int64 { return c.Config.PageSize }
+
+// listOptionalDynamic treats an uninstalled extension API as an empty result.
+// Gateway API is optional in Kubernetes; its absence must not reduce ordinary
+// cluster coverage, while authorization and transport errors remain visible.
+func (c *Collector) listOptionalDynamic(ctx context.Context, gvr schema.GroupVersionResource, ns string) ([]unstructured.Unstructured, error) {
+	values, err := c.listDynamic(ctx, gvr, ns)
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+	return values, err
+}
 
 func (c *Collector) listPods(ctx context.Context, ns string) ([]corev1.Pod, error) {
 	var out []corev1.Pod

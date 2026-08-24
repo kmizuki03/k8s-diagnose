@@ -168,6 +168,12 @@ func diagnosticInputCount(snapshot *kube.Snapshot, key string) (int, bool) {
 		return len(snapshot.APIServices), true
 	case "crds":
 		return len(snapshot.CustomResourceDefs), true
+	case "gatewayclasses":
+		return len(snapshot.GatewayClasses), true
+	case "gateways":
+		return len(snapshot.Gateways), true
+	case "httproutes":
+		return len(snapshot.HTTPRoutes), true
 	default:
 		return 0, false
 	}

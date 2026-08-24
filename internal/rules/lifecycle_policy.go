@@ -3,6 +3,8 @@ package rules
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/kmizuki03/k8s-diagnose/internal/config"
@@ -44,6 +46,8 @@ func (PersistentVolumeRule) Evaluate(_ context.Context, snapshot *kube.Snapshot,
 
 type CronJobRule struct{}
 
+var shellOutputRedirect = regexp.MustCompile(`(?:^|[;&|]\s*)[^;&|]*?>+\s*([^\s;&|]+)`)
+
 func (CronJobRule) Metadata() Metadata {
 	return Metadata{ID: "cronjobs", Section: "Job", Description: "CronJobの一時停止状態とスケジュール", Required: []string{"cronjobs"}, Permissions: namespaced("batch", "cronjobs"), Modes: []string{"all", "triage"}}
 }
@@ -54,6 +58,32 @@ func (CronJobRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config
 		cronJob := &snapshot.CronJobs[i]
 		if cronJob.Spec.Suspend != nil && *cronJob.Spec.Suspend {
 			result = append(result, model.NewFinding(model.Candidate, "K8S.CRONJOB.SUSPENDED", "Job", ref("CronJob", cronJob.Namespace, cronJob.Name), "Suspended", "suspend", fmt.Sprintf("CronJob %s は一時停止されています（spec.suspend: true）", shortRef(cronJob.Namespace, cronJob.Name)), 45))
+		}
+		for _, container := range cronJob.Spec.JobTemplate.Spec.Template.Spec.Containers {
+			commandText := strings.Join(append(append([]string{}, container.Command...), container.Args...), " ")
+			redirects := shellOutputRedirect.FindAllStringSubmatch(commandText, -1)
+			if len(redirects) == 0 {
+				// A process may use the mounted volume through its defaults or
+				// environment. Only an explicit shell redirect outside the mount
+				// is strong enough evidence for this diagnostic.
+				continue
+			}
+			for _, mount := range container.VolumeMounts {
+				if mount.ReadOnly || mount.MountPath == "" {
+					continue
+				}
+				writesToMount := false
+				for _, match := range redirects {
+					if len(match) > 1 && strings.HasPrefix(match[1], strings.TrimSuffix(mount.MountPath, "/")+"/") {
+						writesToMount = true
+					}
+				}
+				if writesToMount {
+					continue
+				}
+				result = append(result, model.NewFinding(model.Candidate, "K8S.CRONJOB.MOUNT_PATH_UNUSED", "Job", ref("CronJob", cronJob.Namespace, cronJob.Name), "MountedPathNotReferenced", container.Name+"/"+mount.Name,
+					fmt.Sprintf("CronJob %s のコンテナ %q はボリュームを %q にマウントしていますが、command/argsの明示的な出力redirectはこの配下を使っていません。処理結果を一時ファイルシステムへ書き込んでいる可能性があります", shortRef(cronJob.Namespace, cronJob.Name), container.Name, mount.MountPath), 78))
+			}
 		}
 	}
 	return result
@@ -131,6 +161,34 @@ func (NetworkPolicyRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ 
 		}
 		if matched == 0 && elapsedSince(snapshot, policy.CreationTimestamp.Time) >= 5*time.Minute {
 			result = append(result, model.NewFinding(model.Candidate, "K8S.NETWORK_POLICY.SELECTOR_NO_MATCH", "NetworkPolicy", ref("NetworkPolicy", policy.Namespace, policy.Name), "SelectorNoMatch", "selector", fmt.Sprintf("NetworkPolicy %s のPod選択条件（podSelector）に一致するPodが見つかりません", shortRef(policy.Namespace, policy.Name)), 40))
+		}
+		if matched == 0 {
+			// Until the policy selects a destination Pod, an ingress peer has no
+			// effective traffic path to diagnose and reporting both selectors is
+			// misleading.
+			continue
+		}
+		for ruleIndex, ingress := range policy.Spec.Ingress {
+			for peerIndex, peer := range ingress.From {
+				if peer.PodSelector == nil || peer.NamespaceSelector != nil {
+					continue
+				}
+				peerSelector, err := metav1.LabelSelectorAsSelector(peer.PodSelector)
+				if err != nil {
+					continue
+				}
+				peerMatches := 0
+				for _, pod := range podIndex[policy.Namespace] {
+					if peerSelector.Matches(labels.Set(pod.Labels)) {
+						peerMatches++
+					}
+				}
+				if peerMatches == 0 {
+					stable := fmt.Sprintf("ingress/%d/from/%d", ruleIndex, peerIndex)
+					result = append(result, model.NewFinding(model.Candidate, "K8S.NETWORK_POLICY.PEER_SELECTOR_NO_MATCH", "NetworkPolicy", ref("NetworkPolicy", policy.Namespace, policy.Name), "PeerSelectorNoMatch", stable,
+						fmt.Sprintf("NetworkPolicy %s の ingress.from[%d] にあるPod選択条件に一致する送信元Podが、同じnamespaceに見つかりません。この許可ルールは通信を一件も許可しない可能性があります", shortRef(policy.Namespace, policy.Name), peerIndex), 70))
+				}
+			}
 		}
 	}
 	return result

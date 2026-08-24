@@ -230,8 +230,8 @@ func Builtins() *Registry {
 	return NewRegistry(
 		PodHealthRule{}, WorkloadRule{}, NodeRule{}, NodeHeartbeatRule{}, NodeMetricsRule{}, PodMetricsRule{}, JobRule{}, CronJobRule{}, HPARule{},
 		SchedulingRule{},
-		DependencyRule{}, PriorityClassDependencyRule{}, RuntimeClassDependencyRule{},
-		ServiceRule{}, IngressRule{}, StorageRule{}, PersistentVolumeRule{}, NetworkPolicyRule{},
+		DependencyRule{}, RuntimeDependencyRule{}, PriorityClassDependencyRule{}, RuntimeClassDependencyRule{},
+		ServiceRule{}, IngressRule{}, GatewayAPIRule{}, StorageRule{}, PersistentVolumeRule{}, NetworkPolicyRule{},
 		WebhookRule{}, TLSRule{}, QuotaRule{}, PDBRule{}, APIServiceRule{},
 		ConfigRiskRule{}, ConfigMapRule{}, ProbeConfigRule{}, LimitRangeRule{}, NamespaceRule{}, CRDRule{}, ControlPlaneRule{}, APIDeprecationRule{},
 	)

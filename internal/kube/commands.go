@@ -89,6 +89,9 @@ func kubectlCommands(cfg config.Config, statuses map[string]FetchStatus) [][]str
 		{key: "pod_metrics", rawPath: podMetricsPath},
 		{key: "apiservices", resource: "apiservices.apiregistration.k8s.io"},
 		{key: "crds", resource: "customresourcedefinitions.apiextensions.k8s.io"},
+		{key: "gatewayclasses", resource: "gatewayclasses.gateway.networking.k8s.io"},
+		{key: "gateways", resource: "gateways.gateway.networking.k8s.io", namespaced: true},
+		{key: "httproutes", resource: "httproutes.gateway.networking.k8s.io", namespaced: true},
 		{key: "readyz", rawPath: func(config.Config) string { return "/readyz?verbose" }},
 		{key: "livez", rawPath: func(config.Config) string { return "/livez?verbose" }},
 	}

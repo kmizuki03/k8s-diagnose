@@ -24,10 +24,43 @@ import (
 	"github.com/kmizuki03/k8s-diagnose/internal/model"
 	"github.com/kmizuki03/k8s-diagnose/internal/redact"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/portforward"
 	transportspdy "k8s.io/client-go/transport/spdy"
 )
+
+func init() {
+	// client-go reports a peer reset from its local-to-remote copy goroutine via
+	// the process-global runtime error handlers. A short-lived server that sends
+	// a greeting and closes normally (the I-06 DB is one example) can therefore
+	// print a red "Unhandled Error" after this checker has already received the
+	// response and correctly marked the TCP target reachable.
+	//
+	// Keep every other Kubernetes runtime error visible. If a reset happens
+	// before the target answers, remoteAccepted still observes the closed socket
+	// and returns a failed Result; this filter only removes the duplicate global
+	// log emitted by the forwarding copy goroutine.
+	previous := append([]utilruntime.ErrorHandler(nil), utilruntime.ErrorHandlers...)
+	utilruntime.ErrorHandlers = []utilruntime.ErrorHandler{func(ctx context.Context, err error, message string, keysAndValues ...interface{}) {
+		if isBenignPortForwardCopyReset(err) {
+			return
+		}
+		for _, handler := range previous {
+			handler(ctx, err, message, keysAndValues...)
+		}
+	}}
+}
+
+func isBenignPortForwardCopyReset(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "error copying from local connection to remote stream") &&
+		strings.Contains(message, "connection reset by peer")
+}
 
 type Target struct {
 	Container  string
@@ -50,8 +83,12 @@ type Target struct {
 	Strict      bool
 	Active      bool
 	Unavailable bool
-	Invalid     bool
-	Inactive    string
+	// UnavailableCode identifies a manifest/API preflight that prevented this
+	// target from being tested. Probe host limitations keep their historical
+	// code; Service endpoint-chain failures use a Service-specific code.
+	UnavailableCode string
+	Invalid         bool
+	Inactive        string
 	// ServiceName and ServicePort identify the Service a "service" group target
 	// was derived from. The check itself always tunnels to the Pod under
 	// diagnosis, but kubectl also accepts service/NAME, and that form is worth
@@ -176,7 +213,9 @@ func targetsAt(pod *corev1.Pod, services []corev1.Service, pathOverride string, 
 			if port.Protocol != "" && port.Protocol != corev1.ProtocolTCP || probePorts[int(port.ContainerPort)] {
 				continue
 			}
-			result = append(result, Target{Container: container.Name, Group: "pod", Label: container.Name, Protocol: "tcp", RemotePort: int(port.ContainerPort), PortName: port.Name, Source: "containerPort", Active: true})
+			target := Target{Container: container.Name, Group: "pod", Label: container.Name, Protocol: "tcp", RemotePort: int(port.ContainerPort), PortName: port.Name, Source: "containerPort", Active: true}
+			applyExplicitHTTPPath(&target, pathOverride)
+			result = append(result, target)
 			probePorts[int(port.ContainerPort)] = true
 		}
 	}
@@ -199,7 +238,9 @@ func targetsAt(pod *corev1.Pod, services []corev1.Service, pathOverride string, 
 				if !ok || probePorts[remote] {
 					continue
 				}
-				result = append(result, Target{Container: "Service " + matchingServices[i].Name + "から推定", Group: "pod", Label: "Serviceから推定", Protocol: "tcp", RemotePort: remote, Source: "service-inference", Active: true})
+				target := Target{Container: "Service " + matchingServices[i].Name + "から推定", Group: "pod", Label: "Serviceから推定", Protocol: "tcp", RemotePort: remote, Source: "service-inference", Active: true}
+				applyExplicitHTTPPath(&target, pathOverride)
+				result = append(result, target)
 				probePorts[remote] = true
 			}
 		}
@@ -220,6 +261,7 @@ func targetsAt(pod *corev1.Pod, services []corev1.Service, pathOverride string, 
 				targetText = strconv.Itoa(remote)
 			}
 			target := Target{Group: "service", Label: fmt.Sprintf("svc/%s :%d→%s", service.Name, servicePort.Port, targetText), Protocol: "tcp", RemotePort: remote, PortName: targetName, Source: "service", Strict: false, Active: true, ServiceName: service.Name, ServicePort: servicePort.Port}
+			applyExplicitHTTPPath(&target, pathOverride)
 			for _, probeTarget := range podTargets {
 				if probeTarget.Source != "probe" || probeTarget.Protocol != "http" || !probeTarget.Active {
 					continue
@@ -235,6 +277,16 @@ func targetsAt(pod *corev1.Pod, services []corev1.Service, pathOverride string, 
 		}
 	}
 	return result
+}
+
+func applyExplicitHTTPPath(target *Target, pathOverride string) {
+	if target == nil || pathOverride == "" {
+		return
+	}
+	target.Protocol = "http"
+	target.Scheme = "http"
+	target.Path = pathOverride
+	target.Strict = true
 }
 
 func resolveServicePort(port corev1.ServicePort, pod *corev1.Pod) (int, string, bool) {
@@ -385,11 +437,45 @@ type Checker struct {
 }
 
 func (checker *Checker) Check(ctx context.Context, pod *corev1.Pod, services []corev1.Service) ([]Result, []model.Finding) {
-	now := checker.Clients.ServerTime()
+	return checker.checkTargets(ctx, pod, targetsAt(pod, services, checker.Config.ConnectPath, checker.referenceTime()))
+}
+
+// CheckSnapshot verifies the Service selector/Endpoint chain before opening a
+// Pod-pinned tunnel. This mirrors kubectl port-forward service/... used by the
+// exercise checkers: a direct Pod response must not be presented as proof of a
+// usable Service when that Pod is not a Ready endpoint.
+func (checker *Checker) CheckSnapshot(ctx context.Context, pod *corev1.Pod, snapshot *kube.Snapshot) ([]Result, []model.Finding) {
+	if snapshot == nil {
+		return checker.Check(ctx, pod, nil)
+	}
+	targets := targetsAt(pod, snapshot.Services, checker.Config.ConnectPath, checker.referenceTime())
+	if snapshot.Available("endpoint_slices") || snapshot.Available("endpoints") {
+		for index := range targets {
+			target := &targets[index]
+			if target.Group != "service" || target.ServiceName == "" || serviceHasReadyPodEndpoint(snapshot, target.ServiceName, pod) {
+				continue
+			}
+			target.Active = false
+			target.Unavailable = true
+			target.UnavailableCode = "K8S.CONNECT.SERVICE_ENDPOINT_UNAVAILABLE"
+			target.Inactive = fmt.Sprintf("Service %s/%s のReady Endpointに選択Pod %qが含まれないため、Service経路を代表する接続として実施できません", pod.Namespace, target.ServiceName, pod.Name)
+		}
+	}
+	return checker.checkTargets(ctx, pod, targets)
+}
+
+func (checker *Checker) referenceTime() time.Time {
+	var now time.Time
+	if checker.Clients != nil {
+		now = checker.Clients.ServerTime()
+	}
 	if now.IsZero() {
 		now = time.Now()
 	}
-	targets := targetsAt(pod, services, checker.Config.ConnectPath, now)
+	return now
+}
+
+func (checker *Checker) checkTargets(ctx context.Context, pod *corev1.Pod, targets []Target) ([]Result, []model.Finding) {
 	results, findings := []Result{}, []model.Finding{}
 	base := checker.Config.ConnectPort
 	if base == 0 {
@@ -414,9 +500,13 @@ func (checker *Checker) Check(ctx context.Context, pod *corev1.Pod, services []c
 					model.Evidence{Kind: "decision", Key: "unresolved", Value: fmt.Sprintf("ポート名 %q に対応する containerPort は見つかりませんでした（0件）", target.PortName)},
 				))
 			} else if target.Unavailable {
-				findings = append(findings, model.NewFinding(model.Unavailable, "K8S.CONNECT.PROBE_HOST_UNSUPPORTED", "Probe確認", targetResource(target, pod), "ProbeHostNotReproduced", target.Group+"/"+targetName(target)+"/host", fmt.Sprintf("%sを実施できません。理由: %s", connectionTargetDescription(target, pod), target.Inactive), 100,
-					model.Evidence{Kind: "probe", Key: "host", Value: probeHost(target)},
-				))
+				code, section, reason, stable := target.UnavailableCode, "接続確認", "ConnectionPreflightFailed", target.Group+"/"+targetName(target)+"/preflight"
+				evidence := []model.Evidence{{Kind: "connect", Key: "preflight", Value: target.Inactive}}
+				if code == "" {
+					code, section, reason, stable = "K8S.CONNECT.PROBE_HOST_UNSUPPORTED", "Probe確認", "ProbeHostNotReproduced", target.Group+"/"+targetName(target)+"/host"
+					evidence = []model.Evidence{{Kind: "probe", Key: "host", Value: probeHost(target)}}
+				}
+				findings = append(findings, model.NewFinding(model.Unavailable, code, section, targetResource(target, pod), reason, stable, fmt.Sprintf("%sを実施できません。理由: %s", connectionTargetDescription(target, pod), target.Inactive), 100, evidence...))
 			}
 			continue
 		}
@@ -474,6 +564,66 @@ func (checker *Checker) Check(ctx context.Context, pod *corev1.Pod, services []c
 		}
 	}
 	return results, findings
+}
+
+func serviceHasReadyPodEndpoint(snapshot *kube.Snapshot, serviceName string, pod *corev1.Pod) bool {
+	podIPs := map[string]struct{}{}
+	if pod.Status.PodIP != "" {
+		podIPs[pod.Status.PodIP] = struct{}{}
+	}
+	for _, value := range pod.Status.PodIPs {
+		if value.IP != "" {
+			podIPs[value.IP] = struct{}{}
+		}
+	}
+	if snapshot.Available("endpoint_slices") {
+		for index := range snapshot.EndpointSlices {
+			slice := &snapshot.EndpointSlices[index]
+			if slice.Namespace != pod.Namespace || slice.Labels[discoveryv1.LabelServiceName] != serviceName {
+				continue
+			}
+			for _, endpoint := range slice.Endpoints {
+				if endpoint.Conditions.Ready != nil && !*endpoint.Conditions.Ready {
+					continue
+				}
+				if endpointTargetsPod(endpoint.TargetRef, endpoint.Addresses, pod, podIPs) {
+					return true
+				}
+			}
+		}
+		// EndpointSlice is the authoritative source when its collection
+		// succeeded. Do not let a stale legacy Endpoints object turn a
+		// Ready=false (or absent) EndpointSlice result back into success.
+		return false
+	}
+	if snapshot.Available("endpoints") {
+		for index := range snapshot.Endpoints {
+			endpoint := &snapshot.Endpoints[index]
+			if endpoint.Namespace != pod.Namespace || endpoint.Name != serviceName {
+				continue
+			}
+			for _, subset := range endpoint.Subsets {
+				for _, address := range subset.Addresses {
+					if endpointTargetsPod(address.TargetRef, []string{address.IP}, pod, podIPs) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func endpointTargetsPod(reference *corev1.ObjectReference, addresses []string, pod *corev1.Pod, podIPs map[string]struct{}) bool {
+	if reference != nil && (reference.Kind == "" || strings.EqualFold(reference.Kind, "Pod")) && reference.Name == pod.Name && (reference.Namespace == "" || reference.Namespace == pod.Namespace) && (reference.UID == "" || pod.UID == "" || reference.UID == pod.UID) {
+		return true
+	}
+	for _, address := range addresses {
+		if _, ok := podIPs[address]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func connectEvidence(result Result) []model.Evidence {
@@ -721,10 +871,10 @@ func sharedResult(origin Result, target Target) Result {
 }
 
 // GroupLabel names a check group for humans. The service wording deliberately
-// says "the port the Service forwards to" rather than anything resembling
-// "the Service": every check in both groups is a port-forward straight to the
-// Pod, so none of them exercises the ClusterIP, kube-proxy or the EndpointSlice
-// path. What separates the groups is only where the port number came from.
+// says "the port the Service forwards to" rather than implying ClusterIP
+// traffic was reproduced. CheckSnapshot validates selector/Ready Endpoint and
+// targetPort first, but the actual request still uses a Pod-pinned tunnel and
+// therefore does not traverse kube-proxy.
 func GroupLabel(group string) string {
 	if group == "service" {
 		return "Serviceの転送先ポート"

@@ -36,6 +36,10 @@ type FetchStatus struct {
 }
 
 type Snapshot struct {
+	// ScopeNamespace is empty for a cluster-wide collection and contains the
+	// requested namespace otherwise. Rules use it to avoid declaring a
+	// cross-namespace reference missing when that namespace was never listed.
+	ScopeNamespace         string
 	Pods                   []corev1.Pod
 	AllPods                []corev1.Pod
 	Nodes                  []corev1.Node
@@ -72,6 +76,9 @@ type Snapshot struct {
 	PodMetrics             []unstructured.Unstructured
 	APIServices            []unstructured.Unstructured
 	CustomResourceDefs     []unstructured.Unstructured
+	GatewayClasses         []unstructured.Unstructured
+	Gateways               []unstructured.Unstructured
+	HTTPRoutes             []unstructured.Unstructured
 	Readyz                 string
 	Livez                  string
 	APIWarnings            []string

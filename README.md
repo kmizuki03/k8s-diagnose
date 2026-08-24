@@ -172,7 +172,7 @@ dist/releases/k8s-diagnose_VERSION_OS_ARCH/
 | `--node-heartbeat-timeout SEC` | Node Lease停滞判定秒数。既定180。`-a` / `--triage`のみ |
 | `--log-signatures FILE` | カスタムログシグネチャINI。`-s`または`-a --logs` |
 | `--log-signature-lines N` | 解析する末尾行数、1〜5000。既定200 |
-| `--connect` | `-s`でProbe/Pod直接/Serviceの転送先ポートを一時port-forwardにより単発確認。追加確認なし。port-forwardはPodへ直接つなぐため、ClusterIP経由の経路は検証しない |
+| `--connect` | `-s`でProbe/Pod直接/Serviceの転送先ポートを一時port-forwardにより単発確認。Service由来の確認は、選択PodがReady Endpointに登録されていることを先に検証する。追加確認なし。通信自体はPodへ直接つなぐため、ClusterIP/kube-proxy経由のパケット転送は再現しない |
 | `--connect-port PORT` | ローカル先頭ポート、1024〜65535。`--connect`必須 |
 | `--connect-path PATH` | `/`で始まるHTTP pathの上書き。`--connect`必須 |
 | `--debug` | 診断後に対話debugメニュ。`-a` / `-s`のtext出力のみ |
@@ -267,12 +267,13 @@ NO_COLOR=1 ./k8s-diagnose -a
 - Pod/container: CrashLoopBackOff、ImagePullBackOff、現在/直近終了のOOMKilled、Ready、Pending、native sidecar、DisruptionTarget、PodReadyToStartContainers、直近再起動（debug用ephemeral containerの終了はPod異常にしない）
 - Workload: Deployment / ReplicaSet / StatefulSet / DaemonSetのreplica、ProgressDeadlineExceeded、ReplicaFailure、CronJob suspend
 - Scheduling/Node: nodeSelector、required nodeAffinity、taint/toleration、cordon、Node状態taint、Node Lease heartbeat、CPU/Memory/HugePages/extended resource、Pod数上限、Pod overhead、in-place resize、PVC、schedulingGate、nominatedNodeName
-- Service: selector、EndpointSlice ready/terminating+serving、Endpoints fallback、named targetPort、数値targetPortの未宣言（候補扱い）、LoadBalancer pending
+- Service: selector、EndpointSlice ready/terminating+serving、Endpoints fallback、named targetPort、数値targetPortの未宣言（候補扱い）、LoadBalancer pending、ExternalName参照先、`internalTrafficPolicy: Local`のNode別転送先不足
+- Gateway API: GatewayClass・親Gateway・backend Serviceの参照、Gateway/HTTPRoute condition、listenerとRouteのhostname整合、静的に確認できるRoute pathとbackendの受付path
 - 依存: optionalを考慮したSecret/ConfigMapオブジェクトとキー、PVC、ServiceAccount、PriorityClass、RuntimeClass。参照先リソース自体が無い場合は、種別・namespace・名前・参照元を明示します。`optional: true`ならPod起動を妨げないため確定異常にはせず「要確認」とし、必須参照と同じ対象を併記している場合は必須側だけを表示します。オブジェクトは存在するのに参照キーだけ無い場合も、キー名の誤りが疑われる候補として報告します。Secret Volume、projected Volume、CSI `nodePublishSecretRef`、従来型VolumeプラグインのSecret参照も追跡。欠落imagePullSecretはNode資格情報等でpull可能なためwarning
 - ConfigMap: 参照は解決できてもコンテナへ反映されない状態を診断します。同じ変数名が複数の`envFrom`や`env`から設定されてConfigMapの値が使われないキー衝突（値が実際に異なる場合のみ・候補扱い）、`subPath`マウント（ConfigMapを更新してもファイルが差し替わらない・候補扱い）、1オブジェクト上限1MiBへの接近を確認します。Kubernetes 1.34では緩和済み環境変数名が既定で有効なため、数字で始まるConfigMapキーを異常扱いしません。また、kubeletの`envFrom`が展開するのは`data`だけであり、`binaryData`を環境変数や衝突元として扱いません
 - Storage/TLS: WaitForFirstConsumer、PVC Lost/resize condition、PV Failed/Released/Pending、Ingressが参照するOpaque Secretを含むPEM/DERバンドル全証明書、TLSキー欠落・空データ・秘密鍵不正・証明書との不一致、期限切れ/有効開始前
 - Ingress/Webhook/API: backend/TLS/IngressClass参照、Admission Webhook Service、APIService、CRD condition、API warning header、readyz/livez（各endpointを独立してCoverageへ計上）
-- Policy: ResourceQuota使用率、PodDisruptionBudget、NetworkPolicy selector適用状況
+- Policy: ResourceQuota使用率、PodDisruptionBudget、NetworkPolicy selector適用状況と同一namespaceのingress peer selector
 - メトリクス: `metrics.k8s.io/v1beta1`からNode使用量とCPU上位10 Podを取得（NodeとPodを別々にCoverageへ計上）
 - 構成リスク: `:latest`/タグなしimage、CPU/Memory requests未設定、livenessProbe未設定（Job Podを除外）。Pod-level requestsがあるresourceはcontainer未設定を候補にしない。同一コンテナで同じ環境変数名が異なる値で複数回定義されている場合は、後の定義だけが採用され先の値が捨てられるため候補として報告（値が同じ重複は報告しない）
 - ログ: OOM、Go panic、Python Traceback、x509期限切れ、address in use、通信失敗等のシグネチャ
@@ -319,7 +320,7 @@ Service → Admission Webhook
 - アプリの応答本文は改行を保ったままマスクして端末にだけ表示します。確認に失敗した対象は全文（上限あり）、成功した対象は1行のプレビューを出すため、「200だが中身はエラーページ」を見分けられます。画像などバイナリの本文はバイト列を出さず種別とサイズだけを示します。Finding・snapshot・履歴・Webhookには従来どおりstatus code / Content-Type / 読取byte数だけを保存
 - HTTP 2xx/3xxを成功、別host redirectと10回超は追従せず注意扱い
 - HTTP ProbeのないポートはHTTPを送らずTCP接続のみを確認します。port-forwardのローカル側は転送先へ到達する前に接続を受け付けるため、`net.Dial`の成功だけでは待ち受けの有無を判定できません。接続後の読み取りで判定し、即座に切断された場合は「トンネルは確立したが転送先が待ち受けていない」として失敗、要求待ちのまま維持された場合を成功とします。port-forward自身が報告した理由も併記します
-- 「Pod直接」と「Serviceの転送先ポート」を別々に表示。ポートの出所が違うだけで、どちらもPodへの直接接続
+- 「Pod直接」と「Serviceの転送先ポート」を別々に表示。Service側はselector・Endpoint・targetPortの整合を事前確認しますが、通信自体はどちらもPodへの直接接続
 - 両者が同じポートに解決した場合は比較対象がないため、port-forwardを1本共有して同じ結果を再掲（二重にトンネルを張らない）
 - 対話端末では、確認結果の後に**ポートとパスを指定した追加確認**ができます。マニフェストが宣言していないポート（管理用・メトリクス等）や、実際に配信しているパスを、同じport-forward経由でその場で確認できます。空欄でEnterすると終了します
 
@@ -451,6 +452,9 @@ namespace指定時は`-A`を`-n NAMESPACE`に置き換えてください。List�
 | HPA | autoscaling/v2 `horizontalpodautoscalers` | `kubectl get horizontalpodautoscalers.autoscaling -A -o json` |
 | Ingress | networking.k8s.io/v1 `ingresses` | `kubectl get ingresses.networking.k8s.io -A -o json` |
 | IngressClass | networking.k8s.io/v1 `ingressclasses` | `kubectl get ingressclasses.networking.k8s.io -o json` |
+| GatewayClass | gateway.networking.k8s.io/v1 `gatewayclasses` | `kubectl get gatewayclasses.gateway.networking.k8s.io -o json` |
+| Gateway | gateway.networking.k8s.io/v1 `gateways` | `kubectl get gateways.gateway.networking.k8s.io -A -o json` |
+| HTTPRoute | gateway.networking.k8s.io/v1 `httproutes` | `kubectl get httproutes.gateway.networking.k8s.io -A -o json` |
 | NetworkPolicy | networking.k8s.io/v1 `networkpolicies` | `kubectl get networkpolicies.networking.k8s.io -A -o json` |
 | StorageClass | storage.k8s.io/v1 `storageclasses` | `kubectl get storageclasses.storage.k8s.io -o json` |
 | PDB | policy/v1 `poddisruptionbudgets` | `kubectl get poddisruptionbudgets.policy -A -o json` |

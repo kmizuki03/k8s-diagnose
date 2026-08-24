@@ -73,3 +73,24 @@ func TestKubectlCommandsForKeysOnlyReturnsCommandsForThatDiagnosticItem(t *testi
 		}
 	}
 }
+
+func TestKubectlCommandsIncludeGatewayAPIResources(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Namespace = "app"
+	statuses := map[string]FetchStatus{"gatewayclasses": {}, "gateways": {}, "httproutes": {}}
+	commands := KubectlCommandsForKeys(cfg, statuses, "gatewayclasses", "gateways", "httproutes")
+	joined := make([]string, len(commands))
+	for index, command := range commands {
+		joined[index] = strings.Join(command, " ")
+	}
+	all := strings.Join(joined, "\n")
+	for _, expected := range []string{
+		"get gatewayclasses.gateway.networking.k8s.io --chunk-size=500 -o json",
+		"get gateways.gateway.networking.k8s.io -n app",
+		"get httproutes.gateway.networking.k8s.io -n app",
+	} {
+		if !strings.Contains(all, expected) {
+			t.Fatalf("Gateway API確認コマンドに%qがない:\n%s", expected, all)
+		}
+	}
+}

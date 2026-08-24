@@ -466,7 +466,7 @@ func (runner *Runner) selectPod(ctx context.Context) int {
 		runner.renderEvents(selectedSnapshot, selectedSnapshot.Events, selected.Name)
 		runner.renderLogs()
 		if runner.Config.Connect {
-			results, ran, err := runner.runConnect(ctx, selected, selectedSnapshot.Services, state)
+			results, ran, err := runner.runConnect(ctx, selected, selectedSnapshot, state)
 			if err != nil {
 				printError(runner.Streams.Err, err)
 				return 1

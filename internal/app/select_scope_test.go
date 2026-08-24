@@ -17,7 +17,7 @@ func TestScopeSnapshotToSelectedPodExcludesUnrelatedResources(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "api-1", UID: types.UID("pod-1"), Labels: map[string]string{"app": "api"}},
 		Spec: corev1.PodSpec{
 			ServiceAccountName: "api-sa",
-			Containers: []corev1.Container{{Name: "app", EnvFrom: []corev1.EnvFromSource{
+			Containers: []corev1.Container{{Name: "app", Env: []corev1.EnvVar{{Name: "DEPENDENCY_URL", Value: "http://dependency/ready"}}, EnvFrom: []corev1.EnvFromSource{
 				{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "api-config"}}},
 				{SecretRef: &corev1.SecretEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "api-secret"}}},
 			}}},
@@ -32,6 +32,7 @@ func TestScopeSnapshotToSelectedPodExcludesUnrelatedResources(t *testing.T) {
 	snapshot.Pods = []corev1.Pod{pod, {ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "worker", Labels: map[string]string{"app": "worker"}}}}
 	snapshot.Services = []corev1.Service{
 		{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "api"}, Spec: corev1.ServiceSpec{Selector: map[string]string{"app": "api"}}},
+		{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "dependency"}},
 		{ObjectMeta: metav1.ObjectMeta{Namespace: "ns", Name: "worker"}, Spec: corev1.ServiceSpec{Selector: map[string]string{"app": "worker"}}},
 	}
 	snapshot.EndpointSlices = []discoveryv1.EndpointSlice{
@@ -74,7 +75,7 @@ func TestScopeSnapshotToSelectedPodExcludesUnrelatedResources(t *testing.T) {
 	if len(scoped.Pods) != 1 || scoped.Pods[0].Name != "api-1" {
 		t.Fatalf("選択Pod以外が残った: %#v", scoped.Pods)
 	}
-	if len(scoped.Services) != 1 || scoped.Services[0].Name != "api" {
+	if len(scoped.Services) != 2 || scoped.Services[0].Name != "api" || scoped.Services[1].Name != "dependency" {
 		t.Fatalf("無関係なServiceが残った: %#v", scoped.Services)
 	}
 	if len(scoped.EndpointSlices) != 1 || scoped.EndpointSlices[0].Name != "api-a" {
@@ -103,6 +104,21 @@ func TestScopeSnapshotToSelectedPodExcludesUnrelatedResources(t *testing.T) {
 	}
 	if len(scoped.Events) != 1 || scoped.Events[0].Name != "api-event" {
 		t.Fatalf("無関係なEventが残った: %#v", scoped.Events)
+	}
+}
+
+func TestScopeSnapshotRetainsExternalNameTarget(t *testing.T) {
+	pod := corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "client", Namespace: "ns"}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "client", Env: []corev1.EnvVar{{Name: "TARGET_URL", Value: "http://alias/data"}}}}}}
+	snapshot := kube.NewSnapshot()
+	snapshot.Pods = []corev1.Pod{pod}
+	snapshot.Services = []corev1.Service{
+		{ObjectMeta: metav1.ObjectMeta{Name: "alias", Namespace: "ns"}, Spec: corev1.ServiceSpec{Type: corev1.ServiceTypeExternalName, ExternalName: "backend.ns.svc.cluster.local"}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "backend", Namespace: "ns"}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "unrelated", Namespace: "ns"}},
+	}
+	scoped := scopeSnapshotToSelectedPod(snapshot, &pod)
+	if len(scoped.Services) != 2 || scoped.Services[0].Name != "alias" || scoped.Services[1].Name != "backend" {
+		t.Fatalf("ExternalNameまたは参照先Serviceの絞り込みが不正: %#v", scoped.Services)
 	}
 }
 

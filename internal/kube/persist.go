@@ -172,6 +172,9 @@ func LoadClusterSnapshotFile(path string) (*ClusterSnapshotFile, error) {
 	if file.Snapshot.Statuses == nil {
 		file.Snapshot.Statuses = map[string]FetchStatus{}
 	}
+	// The envelope is the authoritative collection scope and also upgrades
+	// snapshots written before ScopeNamespace was embedded in Snapshot.
+	file.Snapshot.ScopeNamespace = file.Scope.Namespace
 	return &file, nil
 }
 

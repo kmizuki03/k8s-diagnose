@@ -33,11 +33,42 @@ func (ServiceRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config
 	podIndex := indexPodsByNamespace(snapshot.Pods)
 	for i := range snapshot.Services {
 		service := &snapshot.Services[i]
-		if service.Spec.Type == corev1.ServiceTypeExternalName || len(service.Spec.Selector) == 0 {
+		if service.Spec.Type == corev1.ServiceTypeExternalName {
+			if finding, ok := externalNameTargetFinding(service, snapshot); ok {
+				result = append(result, finding)
+			}
+			continue
+		}
+		if len(service.Spec.Selector) == 0 {
 			continue
 		}
 		resource := ref("Service", service.Namespace, service.Name)
 		pods := podIndex.selected(service)
+		if service.Spec.InternalTrafficPolicy != nil && *service.Spec.InternalTrafficPolicy == corev1.ServiceInternalTrafficPolicyLocal && snapshot.AvailableOrUntracked("pods") {
+			endpointNodes := map[string]struct{}{}
+			for _, pod := range pods {
+				if pod.Spec.NodeName != "" && podReady(pod) {
+					endpointNodes[pod.Spec.NodeName] = struct{}{}
+				}
+			}
+			blockedClients := []string{}
+			for podIndex := range snapshot.Pods {
+				client := &snapshot.Pods[podIndex]
+				if client.Namespace != service.Namespace || client.Spec.NodeName == "" || client.Status.Phase == corev1.PodSucceeded || client.Status.Phase == corev1.PodFailed {
+					continue
+				}
+				if _, localEndpoint := endpointNodes[client.Spec.NodeName]; localEndpoint || !podReferencesService(client, service) {
+					continue
+				}
+				blockedClients = append(blockedClients, client.Name+"@"+client.Spec.NodeName)
+			}
+			if len(endpointNodes) > 0 && len(blockedClients) > 0 {
+				result = append(result, model.NewFinding(model.Candidate, "K8S.SERVICE.INTERNAL_TRAFFIC_LOCAL_GAP", "Service", resource, "NoLocalEndpointOnSomeNodes", "internal-traffic-policy/local",
+					fmt.Sprintf("Service %s は internalTrafficPolicy: Local ですが、このServiceを参照するPod %s のNodeにはReadyなローカルEndpointがありません。check.shと同じPod内Service接続では到達できません", shortRef(service.Namespace, service.Name), strings.Join(blockedClients, ", ")), 92,
+					model.Evidence{Kind: "service", Key: "endpointNodes", Value: strings.Join(sortedStringSet(endpointNodes), ", ")},
+					model.Evidence{Kind: "pod", Key: "clientsWithoutLocalEndpoint", Value: strings.Join(blockedClients, ", ")}))
+			}
+		}
 		if snapshot.AvailableOrUntracked("pods") && len(pods) == 0 {
 			result = append(result, model.NewFinding(
 				model.Warning, "K8S.SERVICE.SELECTOR_NO_MATCH", "Service", resource, "SelectorNoMatch", "selector-no-match",
@@ -121,6 +152,64 @@ func (ServiceRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config
 		}
 	}
 	return result
+}
+
+func podReady(pod *corev1.Pod) bool {
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == corev1.PodReady {
+			return condition.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
+func externalNameTargetFinding(service *corev1.Service, snapshot *kube.Snapshot) (model.Finding, bool) {
+	target := strings.TrimSuffix(strings.ToLower(service.Spec.ExternalName), ".")
+	parts := strings.Split(target, ".")
+	if len(parts) != 5 || parts[2] != "svc" || parts[3] != "cluster" || parts[4] != "local" {
+		return model.Finding{}, false
+	}
+	name, namespace := parts[0], parts[1]
+	// A namespace-scoped snapshot cannot prove that a Service outside the
+	// collected namespace is absent. A cluster-wide snapshot can.
+	if snapshot.ScopeNamespace != "" && namespace != snapshot.ScopeNamespace {
+		return model.Finding{}, false
+	}
+	for i := range snapshot.Services {
+		if snapshot.Services[i].Name == name && snapshot.Services[i].Namespace == namespace {
+			return model.Finding{}, false
+		}
+	}
+	return model.NewFinding(model.Warning, "K8S.SERVICE.EXTERNAL_NAME_TARGET_NOT_FOUND", "Service", ref("Service", service.Namespace, service.Name), "ExternalNameTargetNotFound", target,
+		fmt.Sprintf("ExternalName Service %s の参照先 %q はクラスタ内Service名の形式ですが、Service %s/%s は存在しません。名前の誤りまたは削除済みの参照先が疑われます", shortRef(service.Namespace, service.Name), service.Spec.ExternalName, namespace, name), 90), true
+}
+
+func podReferencesService(pod *corev1.Pod, service *corev1.Service) bool {
+	hosts := []string{
+		service.Name,
+		service.Name + "." + service.Namespace,
+		service.Name + "." + service.Namespace + ".svc",
+		service.Name + "." + service.Namespace + ".svc.cluster.local",
+	}
+	for _, container := range append(append([]corev1.Container{}, pod.Spec.InitContainers...), pod.Spec.Containers...) {
+		for _, env := range container.Env {
+			host := strings.TrimSuffix(strings.ToLower(environmentHost(strings.TrimSpace(env.Value))), ".")
+			for _, candidate := range hosts {
+				if host == candidate {
+					return true
+				}
+			}
+		}
+		commandText := strings.ToLower(strings.Join(append(append([]string{}, container.Command...), container.Args...), " "))
+		for _, candidate := range hosts {
+			for _, prefix := range []string{"http://", "https://"} {
+				if strings.Contains(commandText, prefix+candidate+"/") || strings.Contains(commandText, prefix+candidate+":") || strings.Contains(commandText, prefix+candidate+" ") {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 // declaredPodPorts collects the ports a Pod's manifest positively states it

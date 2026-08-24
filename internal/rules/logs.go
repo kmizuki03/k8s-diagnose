@@ -36,6 +36,8 @@ var builtInLogSignatures = []logSignature{
 	{"address_in_use", "K8S.LOG.ADDRESS_IN_USE", "待受アドレスの競合", regexp.MustCompile(`(?i)(?:bind|listen).{0,80}address already in use`), model.Warning, 85, 1},
 	{"network_unreachable", "K8S.LOG.NETWORK_UNREACHABLE", "通信先への接続失敗", regexp.MustCompile(`(?i)connection refused|no route to host`), model.Candidate, 55, 2},
 	{"permission_denied", "K8S.LOG.PERMISSION_DENIED", "権限拒否（permission denied）", regexp.MustCompile(`(?i)permission denied`), model.Candidate, 50, 2},
+	{"kubernetes_forbidden", "K8S.LOG.KUBERNETES_FORBIDDEN", "Kubernetes APIのRBAC拒否", regexp.MustCompile(`(?i)\bforbidden:\s+User .+ cannot (?:get|list|watch|create|update|patch|delete) resource`), model.Warning, 90, 1},
+	{"name_resolution", "K8S.LOG.NAME_RESOLUTION", "名前解決失敗", regexp.MustCompile(`(?i)(?:name or service not known|temporary failure in name resolution|no such host|nodename nor servname provided)`), model.Candidate, 65, 1},
 	{"connection_reset", "K8S.LOG.CONNECTION_RESET", "接続切断（connection reset by peer）", regexp.MustCompile(`(?i)connection reset by peer`), model.Candidate, 50, 2},
 }
 

@@ -3,6 +3,8 @@
 package app
 
 import (
+	"net"
+	"net/url"
 	"strings"
 
 	"github.com/kmizuki03/k8s-diagnose/internal/kube"
@@ -24,6 +26,7 @@ func scopeSnapshotToSelectedPod(snapshot *kube.Snapshot, pod *corev1.Pod) *kube.
 		return snapshot
 	}
 	scoped := *snapshot
+	scoped.ScopeNamespace = pod.Namespace
 	scoped.Pods = []corev1.Pod{*pod.DeepCopy()}
 
 	podIPs := map[string]struct{}{}
@@ -39,8 +42,24 @@ func scopeSnapshotToSelectedPod(snapshot *kube.Snapshot, pod *corev1.Pod) *kube.
 	serviceNames := map[string]struct{}{}
 	for i := range snapshot.Services {
 		service := &snapshot.Services[i]
-		if serviceSelectsPod(service, pod) {
+		if serviceSelectsPod(service, pod) || selectedPodReferencesService(pod, service) {
 			serviceNames[namespacedName(service.Namespace, service.Name)] = struct{}{}
+		}
+	}
+	// If the selected Pod references an ExternalName Service, retain an
+	// in-cluster target too. Otherwise ServiceRule would see the alias in the
+	// narrowed snapshot but incorrectly conclude that its existing target was
+	// absent.
+	for i := range snapshot.Services {
+		service := &snapshot.Services[i]
+		if service.Spec.Type != corev1.ServiceTypeExternalName {
+			continue
+		}
+		if _, selected := serviceNames[namespacedName(service.Namespace, service.Name)]; !selected {
+			continue
+		}
+		if namespace, name, ok := inClusterServiceDNSName(service.Spec.ExternalName); ok {
+			serviceNames[namespacedName(namespace, name)] = struct{}{}
 		}
 	}
 	for i := range snapshot.EndpointSlices {
@@ -159,6 +178,50 @@ func serviceSelectsPod(service *corev1.Service, pod *corev1.Pod) bool {
 		}
 	}
 	return true
+}
+
+func selectedPodReferencesService(pod *corev1.Pod, service *corev1.Service) bool {
+	if service.Namespace != pod.Namespace {
+		return false
+	}
+	hosts := map[string]struct{}{
+		service.Name:                                                   {},
+		service.Name + "." + service.Namespace:                         {},
+		service.Name + "." + service.Namespace + ".svc":                {},
+		service.Name + "." + service.Namespace + ".svc.cluster.local":  {},
+		service.Name + "." + service.Namespace + ".svc.cluster.local.": {},
+	}
+	for _, container := range append(append([]corev1.Container{}, pod.Spec.InitContainers...), pod.Spec.Containers...) {
+		for _, env := range container.Env {
+			value := strings.TrimSpace(env.Value)
+			host := value
+			if parsed, err := url.Parse(value); err == nil && parsed.Hostname() != "" {
+				host = parsed.Hostname()
+			} else if parsedHost, _, err := net.SplitHostPort(value); err == nil {
+				host = strings.Trim(parsedHost, "[]")
+			}
+			if _, ok := hosts[strings.ToLower(host)]; ok {
+				return true
+			}
+		}
+		commandText := strings.ToLower(strings.Join(append(append([]string{}, container.Command...), container.Args...), " "))
+		for host := range hosts {
+			for _, scheme := range []string{"http://", "https://"} {
+				if strings.Contains(commandText, scheme+host+"/") || strings.Contains(commandText, scheme+host+":") || strings.Contains(commandText, scheme+host+" ") {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func inClusterServiceDNSName(value string) (string, string, bool) {
+	parts := strings.Split(strings.TrimSuffix(strings.ToLower(strings.TrimSpace(value)), "."), ".")
+	if len(parts) != 5 || parts[2] != "svc" || parts[3] != "cluster" || parts[4] != "local" {
+		return "", "", false
+	}
+	return parts[1], parts[0], true
 }
 
 func objectReferenceMatches(reference *corev1.ObjectReference, pod *corev1.Pod, defaultNamespace string) bool {

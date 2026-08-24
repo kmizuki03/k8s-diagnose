@@ -10,6 +10,7 @@ import (
 
 	"github.com/kmizuki03/k8s-diagnose/internal/kube"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/rest"
@@ -59,6 +60,21 @@ func TestFindingEvidenceNeverContainsHTTPBody(t *testing.T) {
 	}
 }
 
+func TestBenignPortForwardCopyResetFilterIsNarrow(t *testing.T) {
+	if !isBenignPortForwardCopyReset(fmt.Errorf("error copying from local connection to remote stream: read: connection reset by peer")) {
+		t.Fatal("正常な短命TCP応答の終了時に出るport-forwardノイズを認識できない")
+	}
+	for _, err := range []error{
+		fmt.Errorf("error copying from remote stream to local connection: connection reset by peer"),
+		fmt.Errorf("error copying from local connection to remote stream: connection refused"),
+		fmt.Errorf("connection reset by peer"),
+	} {
+		if isBenignPortForwardCopyReset(err) {
+			t.Fatalf("無関係なエラーまで抑止対象にした: %v", err)
+		}
+	}
+}
+
 func TestPortForwardURLPreservesAPIServerPathPrefix(t *testing.T) {
 	checker := Checker{Clients: &kube.Clients{RESTConfig: &rest.Config{Host: "https://cluster.example/k8s/clusters/c-123?tenant=prod&route=primary"}}}
 	value, err := checker.portForwardURL("prod", "api")
@@ -94,6 +110,42 @@ func TestServiceTargetsAreDistinguishedAndUseMatchedHTTPProbe(t *testing.T) {
 	}
 	if serviceTarget.Protocol != "http" || serviceTarget.RemotePort != 8080 || serviceTarget.Path != "/ready" {
 		t.Fatalf("Serviceからprobeを引き継げていない: %#v", *serviceTarget)
+	}
+}
+
+func TestServiceConnectionPreflightRequiresSelectedPodReadyEndpoint(t *testing.T) {
+	ready := true
+	pod := corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "api-1", Namespace: "ns", UID: "pod-uid"}, Status: corev1.PodStatus{PodIP: "10.0.0.8"}}
+	snapshot := &kube.Snapshot{
+		EndpointSlices: []discoveryv1.EndpointSlice{{
+			ObjectMeta: metav1.ObjectMeta{Name: "api-a", Namespace: "ns", Labels: map[string]string{discoveryv1.LabelServiceName: "api"}},
+			Endpoints:  []discoveryv1.Endpoint{{Addresses: []string{"10.0.0.8"}, Conditions: discoveryv1.EndpointConditions{Ready: &ready}, TargetRef: &corev1.ObjectReference{Kind: "Pod", Namespace: "ns", Name: "api-1", UID: "pod-uid"}}},
+		}},
+		Statuses: map[string]kube.FetchStatus{"endpoint_slices": {Available: true}},
+	}
+	if !serviceHasReadyPodEndpoint(snapshot, "api", &pod) {
+		t.Fatal("Ready Endpointとして登録された選択Podを認識できない")
+	}
+	ready = false
+	if serviceHasReadyPodEndpoint(snapshot, "api", &pod) {
+		t.Fatal("Ready=falseのEndpointをService接続可能と判定した")
+	}
+	// A legacy Endpoints object can briefly lag behind EndpointSlice. Once the
+	// EndpointSlice collection succeeded, stale legacy data must not override
+	// its Ready=false result.
+	snapshot.Endpoints = []corev1.Endpoints{{
+		ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "ns"},
+		Subsets:    []corev1.EndpointSubset{{Addresses: []corev1.EndpointAddress{{IP: "10.0.0.8", TargetRef: &corev1.ObjectReference{Kind: "Pod", Namespace: "ns", Name: "api-1", UID: "pod-uid"}}}}},
+	}}
+	snapshot.Statuses["endpoints"] = kube.FetchStatus{Available: true}
+	if serviceHasReadyPodEndpoint(snapshot, "api", &pod) {
+		t.Fatal("Ready=falseのEndpointSliceを古いEndpointsで成功へ上書きした")
+	}
+	// Endpoints remains the compatibility fallback only when EndpointSlice
+	// could not be collected.
+	snapshot.Statuses["endpoint_slices"] = kube.FetchStatus{Available: false}
+	if !serviceHasReadyPodEndpoint(snapshot, "api", &pod) {
+		t.Fatal("EndpointSlice取得不能時にEndpointsへフォールバックできない")
 	}
 }
 
@@ -137,6 +189,23 @@ func TestServiceInferenceDoesNotTreatUDPAsTCP(t *testing.T) {
 	}}
 	if targets := Targets(&pod, []corev1.Service{service}, ""); len(targets) != 0 {
 		t.Fatalf("UDP ServiceをTCP接続確認へ混入した: %#v", targets)
+	}
+}
+
+func TestConnectPathAppliesWithoutHTTPProbe(t *testing.T) {
+	pod := corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "ns", Labels: map[string]string{"app": "api"}}, Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "api", Ports: []corev1.ContainerPort{{Name: "http", ContainerPort: 8080}}}}}}
+	service := corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "ns"}, Spec: corev1.ServiceSpec{Selector: map[string]string{"app": "api"}, Ports: []corev1.ServicePort{{Port: 80, TargetPort: intstr.FromString("http")}}}}
+	targets := targetsAt(&pod, []corev1.Service{service}, "/api/health", time.Now())
+	for _, group := range []string{"pod", "service"} {
+		found := false
+		for _, target := range targets {
+			if target.Group == group && target.Protocol == "http" && target.Path == "/api/health" && target.Strict {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("%s由来の対象に明示HTTP pathが適用されない: %#v", group, targets)
+		}
 	}
 }
 

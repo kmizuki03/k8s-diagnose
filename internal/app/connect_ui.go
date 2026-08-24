@@ -18,9 +18,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
-func (runner *Runner) runConnect(ctx context.Context, pod *corev1.Pod, services []corev1.Service, state *model.State) ([]connect.Result, bool, error) {
+func (runner *Runner) runConnect(ctx context.Context, pod *corev1.Pod, snapshot *kube.Snapshot, state *model.State) ([]connect.Result, bool, error) {
 	checker := &connect.Checker{Clients: runner.Clients, Config: runner.Config}
-	results, findings := checker.Check(ctx, pod, services)
+	results, findings := checker.CheckSnapshot(ctx, pod, snapshot)
 	for _, result := range results {
 		if result.LocalPort < 1 || result.Target.RemotePort < 1 {
 			continue
@@ -338,8 +338,8 @@ func (runner *Runner) renderConnectResults(results []connect.Result) {
 	// or the EndpointSlice path; what is verified is only that a container
 	// answers on the port the Service forwards to.
 	if service.tested > 0 {
-		runner.Console.Write("    ※ 接続確認はport-forwardでPodへ直接つなぐため、ClusterIP経由の経路（kube-proxy・Endpoint）は検証していません")
-		runner.Console.Write(fmt.Sprintf("       %sで確認しているのは、Serviceが転送先に指定したポートでコンテナが応答するかどうかです", serviceLabel))
+		runner.Console.Write("    ※ Serviceのselector・Ready Endpoint・targetPortは事前確認済みですが、通信はport-forwardでPodへ直接つなぎます")
+		runner.Console.Write(fmt.Sprintf("       %sではClusterIP/kube-proxy経由のパケット転送までは再現していません", serviceLabel))
 	}
 	reproducible := 0
 	for _, result := range results {

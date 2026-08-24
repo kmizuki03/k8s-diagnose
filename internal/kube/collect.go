@@ -30,6 +30,7 @@ type collectResult struct {
 func (c *Collector) Collect(ctx context.Context) *Snapshot {
 	c.Clients.BeginCollection()
 	snapshot := NewSnapshot()
+	snapshot.ScopeNamespace = c.Config.Namespace
 	namespace := c.Config.Namespace
 	if namespace == "" {
 		namespace = metav1.NamespaceAll

@@ -157,6 +157,18 @@ func (c *Collector) collectTasks(namespace string) []collectTask {
 			values, err := c.listDynamic(ctx, schema.GroupVersionResource{Group: "apiextensions.k8s.io", Version: "v1", Resource: "customresourcedefinitions"}, "")
 			return func(snapshot *Snapshot) { snapshot.CustomResourceDefs = values }, err
 		}},
+		{"gatewayclasses", func(ctx context.Context) (snapshotUpdate, error) {
+			values, err := c.listOptionalDynamic(ctx, schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "gatewayclasses"}, "")
+			return func(snapshot *Snapshot) { snapshot.GatewayClasses = values }, err
+		}},
+		{"gateways", func(ctx context.Context) (snapshotUpdate, error) {
+			values, err := c.listOptionalDynamic(ctx, schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "gateways"}, namespace)
+			return func(snapshot *Snapshot) { snapshot.Gateways = values }, err
+		}},
+		{"httproutes", func(ctx context.Context) (snapshotUpdate, error) {
+			values, err := c.listOptionalDynamic(ctx, schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "httproutes"}, namespace)
+			return func(snapshot *Snapshot) { snapshot.HTTPRoutes = values }, err
+		}},
 		{"readyz", func(ctx context.Context) (snapshotUpdate, error) {
 			value, err := c.raw(ctx, "/readyz?verbose")
 			return func(snapshot *Snapshot) { snapshot.Readyz = value }, err
