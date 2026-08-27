@@ -9,8 +9,11 @@ import (
 	"github.com/kmizuki03/k8s-diagnose/internal/kube"
 	"github.com/kmizuki03/k8s-diagnose/internal/model"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 )
 
 type QuotaRule struct{}
@@ -53,17 +56,24 @@ func quantityRatio(used, hard resource.Quantity) int {
 type PDBRule struct{}
 
 func (PDBRule) Metadata() Metadata {
-	return Metadata{ID: "pdb", Section: "ワークロード（Deploymentなど）", Description: "PodDisruptionBudgetの正常なPod数と退避余力", Required: []string{"pdbs"}, Permissions: namespaced("policy", "poddisruptionbudgets"), Modes: []string{"all", "triage"}}
+	permissions := namespaced("policy", "poddisruptionbudgets")
+	permissions = append(permissions, namespaced("", "pods")...)
+	return Metadata{ID: "pdb", Section: "ワークロード（Deploymentなど）", Description: "PodDisruptionBudgetの保護対象と退避余力", Required: []string{"pdbs"}, Optional: []string{"pods"}, Permissions: permissions, Modes: []string{"all", "triage"}}
 }
 
 func (PDBRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Config) []model.Finding {
 	result := []model.Finding{}
+	podIndex := indexPodsByNamespace(snapshot.Pods)
 	for i := range snapshot.PodDisruptionBudgets {
 		pdb := &snapshot.PodDisruptionBudgets[i]
 		if !statusGenerationCurrent(pdb.Generation, pdb.Status.ObservedGeneration) {
 			continue
 		}
 		resource := ref("PodDisruptionBudget", pdb.Namespace, pdb.Name)
+		if finding, ok := pdbProtectsNothing(pdb, podIndex, snapshot, resource); ok {
+			result = append(result, finding)
+			continue
+		}
 		if pdb.Status.CurrentHealthy < pdb.Status.DesiredHealthy {
 			result = append(result, model.NewFinding(model.Warning, "K8S.PDB.HEALTH_BELOW_DESIRED", "ワークロード（Deploymentなど）", resource, "HealthBelowDesired", "health", fmt.Sprintf("PDB %s では、正常なPodが %d個しかなく、必要な %d個を下回っています", shortRef(pdb.Namespace, pdb.Name), pdb.Status.CurrentHealthy, pdb.Status.DesiredHealthy), 85,
 				model.Evidence{Kind: "status", Key: "currentHealthy", Value: fmt.Sprint(pdb.Status.CurrentHealthy)},
@@ -74,6 +84,48 @@ func (PDBRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Con
 		}
 	}
 	return result
+}
+
+// pdbProtectsNothing reports a PodDisruptionBudget whose selector matches no
+// Pod. Nothing in the status says so — every counter simply reads zero — so a
+// budget that guards nothing looks exactly like one that has nothing to do. The
+// consequence only shows up during a drain, when the protection an operator
+// believed was in place turns out never to have applied to anything.
+func pdbProtectsNothing(pdb *policyv1.PodDisruptionBudget, podIndex podsByNamespace, snapshot *kube.Snapshot, resource string) (model.Finding, bool) {
+	if !snapshot.AvailableOrUntracked("pods") || pdb.Status.ExpectedPods > 0 {
+		return model.Finding{}, false
+	}
+	selector, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
+	if err != nil {
+		return model.NewFinding(
+			model.Unavailable, "K8S.PDB.SELECTOR_UNAVAILABLE", "ワークロード（Deploymentなど）", resource, "SelectorParseFailed", "selector",
+			fmt.Sprintf("PDB %s のPod選択条件（selector）を解析できません", shortRef(pdb.Namespace, pdb.Name)), 100,
+			model.Evidence{Kind: "decision", Key: "selector", Value: err.Error()},
+		), true
+	}
+	// An empty selector matches every Pod in the namespace, which is a different
+	// configuration entirely and not this rule's subject.
+	if pdb.Spec.Selector == nil || selector.Empty() {
+		return model.Finding{}, false
+	}
+	candidates := podIndex[pdb.Namespace]
+	for _, pod := range candidates {
+		if selector.Matches(labels.Set(pod.Labels)) {
+			return model.Finding{}, false
+		}
+	}
+	// With no Pods collected at all there is no evidence either way: the
+	// namespace may simply be empty at this moment.
+	if len(candidates) == 0 {
+		return model.Finding{}, false
+	}
+	return model.NewFinding(
+		model.Warning, "K8S.PDB.SELECTOR_NO_MATCH", "ワークロード（Deploymentなど）", resource, "SelectorNoMatch", "selector-no-match",
+		fmt.Sprintf("PDB %s のPod選択条件（selector）に一致するPodがありません。このPDBは何も保護していないため、Nodeのdrain時に想定した退避制限が働きません。ラベルの誤りか、対象ワークロードが0台に縮小されている可能性があります", shortRef(pdb.Namespace, pdb.Name)), 70,
+		model.Evidence{Kind: "pdb", Key: "spec.selector", Value: "PDBのselector: " + metav1.FormatLabelSelector(pdb.Spec.Selector)},
+		model.Evidence{Kind: "pod", Key: "namespacePods", Value: fmt.Sprintf("同じnamespaceのPod: %d件（うち一致 0件）", len(candidates))},
+		model.Evidence{Kind: "status", Key: "expectedPods", Value: "status.expectedPods: 0"},
+	), true
 }
 
 type APIServiceRule struct{}

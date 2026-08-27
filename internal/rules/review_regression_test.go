@@ -1378,3 +1378,257 @@ func TestWebhookMissingServiceIsStillReportedWhenItIsInScope(t *testing.T) {
 		t.Fatalf("実在するServiceを誤検知した: %#v", findings)
 	}
 }
+
+func pdbWithSelector(selector *metav1.LabelSelector, expected int32) policyv1.PodDisruptionBudget {
+	return policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "ns", Generation: 1},
+		Spec:       policyv1.PodDisruptionBudgetSpec{Selector: selector},
+		Status:     policyv1.PodDisruptionBudgetStatus{ObservedGeneration: 1, ExpectedPods: expected},
+	}
+}
+
+func labelledPod(name string, labelSet map[string]string) corev1.Pod {
+	return corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns", Labels: labelSet}}
+}
+
+// Every counter on a budget that guards nothing reads zero, exactly like one
+// with nothing to do. The difference only surfaces during a drain, when the
+// protection an operator believed was in place turns out never to have applied.
+func TestPodDisruptionBudgetProtectingNothingIsReported(t *testing.T) {
+	snapshot := &kube.Snapshot{
+		PodDisruptionBudgets: []policyv1.PodDisruptionBudget{pdbWithSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"app": "typo"}}, 0)},
+		Pods:                 []corev1.Pod{labelledPod("web-1", map[string]string{"app": "web"})},
+	}
+	findings := (PDBRule{}).Evaluate(context.Background(), snapshot, config.Defaults())
+	if !hasCodeAndResource(findings, "K8S.PDB.SELECTOR_NO_MATCH", "PodDisruptionBudget/ns/web") {
+		t.Fatalf("何も保護していないPDBを検出できない: %#v", findings)
+	}
+}
+
+func TestPodDisruptionBudgetWithMatchingPodsIsNotReported(t *testing.T) {
+	matching := &kube.Snapshot{
+		PodDisruptionBudgets: []policyv1.PodDisruptionBudget{pdbWithSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}}, 0)},
+		Pods:                 []corev1.Pod{labelledPod("web-1", map[string]string{"app": "web"})},
+	}
+	if hasCodeAndResource((PDBRule{}).Evaluate(context.Background(), matching, config.Defaults()), "K8S.PDB.SELECTOR_NO_MATCH", "PodDisruptionBudget/ns/web") {
+		t.Fatal("一致するPodがあるPDBを誤検知した")
+	}
+	// With no Pods collected there is no evidence either way, and a budget the
+	// controller already counts Pods for is doing its job.
+	noPods := &kube.Snapshot{PodDisruptionBudgets: []policyv1.PodDisruptionBudget{pdbWithSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}}, 0)}}
+	if len((PDBRule{}).Evaluate(context.Background(), noPods, config.Defaults())) != 0 {
+		t.Fatal("Podを取得していない状態で断定した")
+	}
+	counted := &kube.Snapshot{
+		PodDisruptionBudgets: []policyv1.PodDisruptionBudget{pdbWithSelector(&metav1.LabelSelector{MatchLabels: map[string]string{"app": "typo"}}, 3)},
+		Pods:                 []corev1.Pod{labelledPod("web-1", map[string]string{"app": "web"})},
+	}
+	if hasCodeAndResource((PDBRule{}).Evaluate(context.Background(), counted, config.Defaults()), "K8S.PDB.SELECTOR_NO_MATCH", "PodDisruptionBudget/ns/web") {
+		t.Fatal("status.expectedPodsが立っているPDBを誤検知した")
+	}
+}
+
+func deploymentWithSelector(name string, match map[string]string) appsv1.Deployment {
+	return appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns", Generation: 1},
+		Spec:       appsv1.DeploymentSpec{Selector: &metav1.LabelSelector{MatchLabels: match}},
+		Status:     appsv1.DeploymentStatus{ObservedGeneration: 1},
+	}
+}
+
+// Kubernetes does not stop two Deployments from selecting the same Pods, and
+// neither status records the collision: their ReplicaSets simply delete each
+// other's Pods to reach their own replica count.
+func TestOverlappingWorkloadSelectorsAreReported(t *testing.T) {
+	snapshot := &kube.Snapshot{
+		Deployments: []appsv1.Deployment{
+			deploymentWithSelector("web", map[string]string{"app": "web"}),
+			deploymentWithSelector("web-canary", map[string]string{"app": "web"}),
+		},
+		Pods: []corev1.Pod{labelledPod("web-1", map[string]string{"app": "web"})},
+	}
+	findings := (WorkloadRule{}).Evaluate(context.Background(), snapshot, config.Defaults())
+	if !hasCodeAndResource(findings, "K8S.WORKLOAD.SELECTOR_OVERLAP", "Pod/ns/web-1") {
+		t.Fatalf("selectorの重複を検出できない: %#v", findings)
+	}
+	for _, finding := range findings {
+		if finding.Code != "K8S.WORKLOAD.SELECTOR_OVERLAP" {
+			continue
+		}
+		for _, want := range []string{"Deployment web", "Deployment web-canary"} {
+			if !strings.Contains(finding.Message, want) {
+				t.Errorf("どのワークロード同士か本文から分からない: %q", finding.Message)
+			}
+		}
+	}
+}
+
+func TestDistinctWorkloadSelectorsAreNotReported(t *testing.T) {
+	// A Deployment always overlaps its own ReplicaSet, and distinct selectors
+	// never collide. Neither may be reported.
+	snapshot := &kube.Snapshot{
+		Deployments: []appsv1.Deployment{
+			deploymentWithSelector("web", map[string]string{"app": "web"}),
+			deploymentWithSelector("api", map[string]string{"app": "api"}),
+		},
+		ReplicaSets: []appsv1.ReplicaSet{{
+			ObjectMeta: metav1.ObjectMeta{Name: "web-abc", Namespace: "ns"},
+			Spec:       appsv1.ReplicaSetSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}}},
+		}},
+		Pods: []corev1.Pod{
+			labelledPod("web-1", map[string]string{"app": "web"}),
+			labelledPod("api-1", map[string]string{"app": "api"}),
+		},
+	}
+	for _, finding := range (WorkloadRule{}).Evaluate(context.Background(), snapshot, config.Defaults()) {
+		if finding.Code == "K8S.WORKLOAD.SELECTOR_OVERLAP" {
+			t.Fatalf("重複していないselectorを誤検知した: %#v", finding)
+		}
+	}
+}
+
+func selectorPod(name, replicaSet string, labelSet map[string]string) corev1.Pod {
+	controller := true
+	return corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+		Name: name, Namespace: "ns", Labels: labelSet,
+		OwnerReferences: []metav1.OwnerReference{{Kind: "ReplicaSet", Name: replicaSet, Controller: &controller}},
+	}}
+}
+
+func selectorReplicaSet(name, deployment string) appsv1.ReplicaSet {
+	controller := true
+	return appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{
+		Name: name, Namespace: "ns",
+		OwnerReferences: []metav1.OwnerReference{{Kind: "Deployment", Name: deployment, Controller: &controller}},
+	}}
+}
+
+func selectorSnapshot(selector map[string]string, replicaSets []appsv1.ReplicaSet, pods []corev1.Pod) *kube.Snapshot {
+	snapshot := kube.NewSnapshot()
+	snapshot.Services = []corev1.Service{{
+		ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "ns"},
+		Spec:       corev1.ServiceSpec{Selector: selector, Ports: []corev1.ServicePort{{Port: 80}}},
+	}}
+	snapshot.ReplicaSets, snapshot.Pods = replicaSets, pods
+	for _, key := range []string{"pods", "services", "replicasets"} {
+		snapshot.Statuses[key] = kube.FetchStatus{Available: true}
+	}
+	return snapshot
+}
+
+// "No Pod matches" is true but leaves the operator to diff the selector against
+// every Pod by hand. The label that differs is the whole answer.
+func TestSelectorNoMatchNamesTheLabelThatDiffers(t *testing.T) {
+	snapshot := selectorSnapshot(
+		map[string]string{"app": "web", "tier": "backend"},
+		[]appsv1.ReplicaSet{selectorReplicaSet("web-abc", "web")},
+		[]corev1.Pod{selectorPod("web-1", "web-abc", map[string]string{"app": "web", "tier": "back-end"})},
+	)
+	findings := (ServiceRule{}).Evaluate(context.Background(), snapshot, config.Defaults())
+	if !hasCodeAndResource(findings, "K8S.SERVICE.SELECTOR_NO_MATCH", "Service/ns/web") {
+		t.Fatalf("一致ゼロを検出できない: %#v", findings)
+	}
+	for _, finding := range findings {
+		if finding.Code != "K8S.SERVICE.SELECTOR_NO_MATCH" {
+			continue
+		}
+		for _, want := range []string{"web-1", "tier", "backend", "back-end"} {
+			if !strings.Contains(finding.Message, want) {
+				t.Errorf("不一致ラベル %q が本文にない: %q", want, finding.Message)
+			}
+		}
+		// The label that already lines up must not be blamed.
+		if strings.Contains(finding.Message, `app: Service=`) {
+			t.Errorf("一致しているラベルまで不一致として挙げている: %q", finding.Message)
+		}
+	}
+}
+
+// Nothing marks this state: the Service has Endpoints, every Pod is Ready, and
+// no counter says that some replicas receive no traffic.
+func TestServiceReachingOnlyPartOfAWorkloadIsReported(t *testing.T) {
+	snapshot := selectorSnapshot(
+		map[string]string{"app": "web", "version": "v1"},
+		[]appsv1.ReplicaSet{selectorReplicaSet("web-old", "web"), selectorReplicaSet("web-new", "web")},
+		[]corev1.Pod{
+			selectorPod("web-old-1", "web-old", map[string]string{"app": "web", "version": "v1"}),
+			selectorPod("web-new-1", "web-new", map[string]string{"app": "web", "version": "v2"}),
+		},
+	)
+	findings := (ServiceRule{}).Evaluate(context.Background(), snapshot, config.Defaults())
+	if !hasCodeAndResource(findings, "K8S.SERVICE.SELECTOR_PARTIAL_MATCH", "Service/ns/web") {
+		t.Fatalf("ワークロードの一部にしか届いていないServiceを検出できない: %#v", findings)
+	}
+	for _, finding := range findings {
+		if finding.Code == "K8S.SERVICE.SELECTOR_PARTIAL_MATCH" && !strings.Contains(finding.Message, "web-new-1") {
+			t.Errorf("対象外のPodが本文にない: %q", finding.Message)
+		}
+	}
+}
+
+func TestServiceCoveringAWholeWorkloadIsNotReported(t *testing.T) {
+	// A rollout is normal as long as the selector uses labels that survive it,
+	// and a different application in the same namespace is not this Service's
+	// business.
+	snapshot := selectorSnapshot(
+		map[string]string{"app": "web"},
+		[]appsv1.ReplicaSet{selectorReplicaSet("web-old", "web"), selectorReplicaSet("web-new", "web"), selectorReplicaSet("api-abc", "api")},
+		[]corev1.Pod{
+			selectorPod("web-old-1", "web-old", map[string]string{"app": "web", "version": "v1"}),
+			selectorPod("web-new-1", "web-new", map[string]string{"app": "web", "version": "v2"}),
+			selectorPod("api-1", "api-abc", map[string]string{"app": "api"}),
+		},
+	)
+	for _, finding := range (ServiceRule{}).Evaluate(context.Background(), snapshot, config.Defaults()) {
+		if finding.Code == "K8S.SERVICE.SELECTOR_PARTIAL_MATCH" {
+			t.Fatalf("全Podに届いているServiceを誤検知した: %#v", finding)
+		}
+	}
+}
+
+func barePod(name string, labelSet map[string]string) corev1.Pod {
+	return corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns", Labels: labelSet}}
+}
+
+// The grouping decides what counts as "the same workload", so it has to survive
+// the two ways the obvious answer is unavailable: ReplicaSets that were not
+// collected, and Pods created without any controller.
+func TestPartialSelectorMatchSurvivesMissingOwnershipInformation(t *testing.T) {
+	selector := map[string]string{"app": "web", "version": "v1"}
+	matching := map[string]string{"app": "web", "version": "v1"}
+	drifted := map[string]string{"app": "web", "version": "v2"}
+
+	// Without the ReplicaSets the two sides of a rollout must not be split into
+	// separate groups, or the mismatch between them disappears.
+	withoutReplicaSets := selectorSnapshot(selector, nil, []corev1.Pod{
+		selectorPod("web-old-1", "web-old", matching),
+		selectorPod("web-new-1", "web-new", drifted),
+	})
+	withoutReplicaSets.Deployments = []appsv1.Deployment{{
+		ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: "ns", Generation: 1},
+		Spec:       appsv1.DeploymentSpec{Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}}},
+		Status:     appsv1.DeploymentStatus{ObservedGeneration: 1},
+	}}
+	if !hasCodeAndResource((ServiceRule{}).Evaluate(context.Background(), withoutReplicaSets, config.Defaults()), "K8S.SERVICE.SELECTOR_PARTIAL_MATCH", "Service/ns/web") {
+		t.Error("ReplicaSet未取得で部分一致を見落とした")
+	}
+
+	bare := selectorSnapshot(selector, nil, []corev1.Pod{barePod("web-1", matching), barePod("web-2", drifted)})
+	if !hasCodeAndResource((ServiceRule{}).Evaluate(context.Background(), bare, config.Defaults()), "K8S.SERVICE.SELECTOR_PARTIAL_MATCH", "Service/ns/web") {
+		t.Error("コントローラを持たないPodで部分一致を見落とした")
+	}
+}
+
+// Grouping owner-less Pods by label keys alone pulled in unrelated
+// applications: app=web and app=api share the key and nothing else.
+func TestUnrelatedBarePodsAreNotTreatedAsTheSameWorkload(t *testing.T) {
+	snapshot := selectorSnapshot(map[string]string{"app": "web"}, nil, []corev1.Pod{
+		barePod("web-1", map[string]string{"app": "web"}),
+		barePod("api-1", map[string]string{"app": "api"}),
+	})
+	for _, finding := range (ServiceRule{}).Evaluate(context.Background(), snapshot, config.Defaults()) {
+		if finding.Code == "K8S.SERVICE.SELECTOR_PARTIAL_MATCH" {
+			t.Fatalf("無関係なPodを同じワークロード扱いした: %#v", finding)
+		}
+	}
+}

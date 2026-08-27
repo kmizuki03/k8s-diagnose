@@ -265,15 +265,15 @@ NO_COLOR=1 ./k8s-diagnose -a
 ## 6. 主な診断内容
 
 - Pod/container: CrashLoopBackOff、ImagePullBackOff、現在/直近終了のOOMKilled、Ready、Pending、native sidecar、DisruptionTarget、PodReadyToStartContainers、直近再起動（debug用ephemeral containerの終了はPod異常にしない）
-- Workload: Deployment / ReplicaSet / StatefulSet / DaemonSetのreplica、ProgressDeadlineExceeded、ReplicaFailure、CronJob suspend
+- Workload: Deployment / ReplicaSet / StatefulSet / DaemonSetのreplica、ProgressDeadlineExceeded、ReplicaFailure、CronJob suspend、複数ワークロードのselector重複（同じPodを取り合い、互いに削除し合う状態。statusには現れない）
 - Scheduling/Node: nodeSelector、required nodeAffinity、taint/toleration、cordon、Node状態taint、Node Lease heartbeat、CPU/Memory/HugePages/extended resource、Pod数上限、Pod overhead、in-place resize、PVC、schedulingGate、nominatedNodeName
-- Service: selector、EndpointSlice ready/terminating+serving、Endpoints fallback、named targetPort、数値targetPortの未宣言（候補扱い）、LoadBalancer pending、ExternalName参照先、`internalTrafficPolicy: Local`のNode別転送先不足
+- Service: selector（一致ゼロのときは一部だけ一致したPodと食い違っているラベルの実値を提示。同じワークロードのPodの一部にしか届いていない場合も検出）、EndpointSlice ready/terminating+serving、Endpoints fallback、named targetPort、数値targetPortの未宣言（候補扱い）、LoadBalancer pending、ExternalName参照先、`internalTrafficPolicy: Local`のNode別転送先不足
 - Gateway API: GatewayClass・親Gateway・backend Serviceの参照、Gateway/HTTPRoute condition、listenerとRouteのhostname整合、静的に確認できるRoute pathとbackendの受付path
 - 依存: optionalを考慮したSecret/ConfigMapオブジェクトとキー、PVC、ServiceAccount、PriorityClass、RuntimeClass。参照先リソース自体が無い場合は、種別・namespace・名前・参照元を明示します。`optional: true`ならPod起動を妨げないため確定異常にはせず「要確認」とし、必須参照と同じ対象を併記している場合は必須側だけを表示します。オブジェクトは存在するのに参照キーだけ無い場合も、キー名の誤りが疑われる候補として報告します。Secret Volume、projected Volume、CSI `nodePublishSecretRef`、従来型VolumeプラグインのSecret参照も追跡。欠落imagePullSecretはNode資格情報等でpull可能なためwarning
 - ConfigMap: 参照は解決できてもコンテナへ反映されない状態を診断します。同じ変数名が複数の`envFrom`や`env`から設定されてConfigMapの値が使われないキー衝突（値が実際に異なる場合のみ・候補扱い）、`subPath`マウント（ConfigMapを更新してもファイルが差し替わらない・候補扱い）、1オブジェクト上限1MiBへの接近を確認します。Kubernetes 1.34では緩和済み環境変数名が既定で有効なため、数字で始まるConfigMapキーを異常扱いしません。また、kubeletの`envFrom`が展開するのは`data`だけであり、`binaryData`を環境変数や衝突元として扱いません
 - Storage/TLS: WaitForFirstConsumer、PVC Lost/resize condition、PV Failed/Released/Pending、Ingressが参照するOpaque Secretを含むPEM/DERバンドル全証明書、TLSキー欠落・空データ・秘密鍵不正・証明書との不一致、期限切れ/有効開始前
 - Ingress/Webhook/API: backend/TLS/IngressClass参照、Admission Webhook Service、APIService、CRD condition、API warning header、readyz/livez（各endpointを独立してCoverageへ計上）
-- Policy: ResourceQuota使用率、PodDisruptionBudget、NetworkPolicy selector適用状況と同一namespaceのingress peer selector
+- Policy: ResourceQuota使用率、PodDisruptionBudget（保護対象が0件のもの＝selectorが誰にも一致せずdrain時に効かないものを含む）、NetworkPolicy selector適用状況と同一namespaceのingress peer selector
 - メトリクス: `metrics.k8s.io/v1beta1`からNode使用量とCPU上位10 Podを取得（NodeとPodを別々にCoverageへ計上）
 - 構成リスク: `:latest`/タグなしimage、CPU/Memory requests未設定、livenessProbe未設定（Job Podを除外）。Pod-level requestsがあるresourceはcontainer未設定を候補にしない。同一コンテナで同じ環境変数名が異なる値で複数回定義されている場合は、後の定義だけが採用され先の値が捨てられるため候補として報告（値が同じ重複は報告しない）
 - ログ: OOM、Go panic、Python Traceback、x509期限切れ、address in use、通信失敗等のシグネチャ

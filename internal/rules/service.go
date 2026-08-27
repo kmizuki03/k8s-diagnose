@@ -11,7 +11,10 @@ import (
 	"github.com/kmizuki03/k8s-diagnose/internal/config"
 	"github.com/kmizuki03/k8s-diagnose/internal/kube"
 	"github.com/kmizuki03/k8s-diagnose/internal/model"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	intstrutil "k8s.io/apimachinery/pkg/util/intstr"
 )
 
@@ -23,7 +26,7 @@ func (ServiceRule) Metadata() Metadata {
 	return Metadata{
 		ID: "services", Section: "Service", Description: "ServiceのPod選択条件・Endpoint・targetPort",
 		Required:    []string{"services"},
-		Optional:    []string{"pods", "endpoint_slices", "endpoints"},
+		Optional:    []string{"pods", "endpoint_slices", "endpoints", "replicasets", "deployments", "statefulsets", "daemonsets"},
 		Permissions: permissions, Modes: []string{"all", "triage", "select"},
 	}
 }
@@ -31,6 +34,7 @@ func (ServiceRule) Metadata() Metadata {
 func (ServiceRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Config) []model.Finding {
 	result := []model.Finding{}
 	podIndex := indexPodsByNamespace(snapshot.Pods)
+	owners := newWorkloadOwners(snapshot)
 	for i := range snapshot.Services {
 		service := &snapshot.Services[i]
 		if service.Spec.Type == corev1.ServiceTypeExternalName {
@@ -70,11 +74,24 @@ func (ServiceRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config
 			}
 		}
 		if snapshot.AvailableOrUntracked("pods") && len(pods) == 0 {
+			evidence := []model.Evidence{
+				{Kind: "service", Key: "spec.selector", Value: "Serviceのselector: " + serviceSelectorText(service.Spec.Selector)},
+			}
+			message := fmt.Sprintf("Service %s のPod選択条件（selector）に一致するPodが見つかりません", shortRef(service.Namespace, service.Name))
+			// "Nothing matches" leaves the operator to diff the selector against
+			// every Pod by hand. Naming the Pods that matched all but one label,
+			// and the label that differs, is the whole answer in one line.
+			if misses := nearestSelectorMisses(service, podIndex[service.Namespace], 3); len(misses) > 0 {
+				message += fmt.Sprintf("。一部だけ一致しているPodがあります: %s", summarizeStrings(misses, 3))
+				evidence = append(evidence, model.Evidence{Kind: "pod", Key: "nearestMatch", Value: "一部一致のPod: " + summarizeStrings(misses, 3)})
+			}
 			result = append(result, model.NewFinding(
 				model.Warning, "K8S.SERVICE.SELECTOR_NO_MATCH", "Service", resource, "SelectorNoMatch", "selector-no-match",
-				fmt.Sprintf("Service %s のPod選択条件（selector）に一致するPodが見つかりません", shortRef(service.Namespace, service.Name)), 75,
-				model.Evidence{Kind: "service", Key: "spec.selector", Value: "Serviceのselector: " + serviceSelectorText(service.Spec.Selector)},
+				message, 75, evidence...,
 			))
+		}
+		if snapshot.AvailableOrUntracked("pods") {
+			result = append(result, partialSelectorFindings(service, podIndex[service.Namespace], pods, owners, resource)...)
 		}
 		ready, fallback := serviceEndpointCounts(service, snapshot)
 		endpointDataAvailable := snapshot.AvailableOrUntracked("endpoint_slices") || snapshot.AvailableOrUntracked("endpoints")
@@ -441,4 +458,223 @@ func endpointSlicesAuthoritative(snapshot *kube.Snapshot) bool {
 		return status.Available
 	}
 	return len(snapshot.EndpointSlices) > 0
+}
+
+// selectorMismatch explains why one Pod is not selected, naming the labels that
+// do not line up. "No Pod matches" is true but useless on its own: the operator
+// still has to diff a selector against every Pod by hand to find the one key
+// that is spelled differently.
+func selectorMismatch(selector map[string]string, pod *corev1.Pod) (matched int, reasons []string) {
+	keys := make([]string, 0, len(selector))
+	for key := range selector {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		want := selector[key]
+		got, present := pod.Labels[key]
+		switch {
+		case present && got == want:
+			matched++
+		case present:
+			reasons = append(reasons, fmt.Sprintf("%s: Service=%q / Pod=%q", key, want, got))
+		default:
+			reasons = append(reasons, fmt.Sprintf("%s: Service=%q / Podにラベルなし", key, want))
+		}
+	}
+	return matched, reasons
+}
+
+// nearestSelectorMisses ranks the Pods that came closest to matching, so a
+// selector that matches nothing can still point at the label to fix.
+func nearestSelectorMisses(service *corev1.Service, candidates []*corev1.Pod, limit int) []string {
+	type miss struct {
+		matched int
+		text    string
+	}
+	misses := []miss{}
+	for _, pod := range candidates {
+		matched, reasons := selectorMismatch(service.Spec.Selector, pod)
+		if matched == 0 || len(reasons) == 0 {
+			continue
+		}
+		misses = append(misses, miss{matched, fmt.Sprintf("%s（%d項目一致、不一致: %s）", pod.Name, matched, strings.Join(reasons, "、"))})
+	}
+	sort.SliceStable(misses, func(i, j int) bool { return misses[i].matched > misses[j].matched })
+	result := []string{}
+	for _, value := range misses {
+		if len(result) >= limit {
+			break
+		}
+		result = append(result, value.text)
+	}
+	return result
+}
+
+// workloadOwners resolves which top-level controller each Pod belongs to. The
+// grouping decides what counts as "the same workload", so it has to survive the
+// two ways the obvious answer is unavailable: ReplicaSets that were not
+// collected, and Pods created without a controller at all.
+type workloadOwners struct {
+	replicaSets map[string]*appsv1.ReplicaSet
+	controllers []workloadSelector
+}
+
+func newWorkloadOwners(snapshot *kube.Snapshot) workloadOwners {
+	owners := workloadOwners{replicaSets: map[string]*appsv1.ReplicaSet{}}
+	for i := range snapshot.ReplicaSets {
+		owners.replicaSets[snapshot.ReplicaSets[i].Namespace+"/"+snapshot.ReplicaSets[i].Name] = &snapshot.ReplicaSets[i]
+	}
+	add := func(kind, namespace, name string, spec *metav1.LabelSelector) {
+		selector, err := metav1.LabelSelectorAsSelector(spec)
+		if err != nil || spec == nil || selector.Empty() {
+			return
+		}
+		owners.controllers = append(owners.controllers, workloadSelector{kind, namespace, name, selector})
+	}
+	for i := range snapshot.Deployments {
+		add("Deployment", snapshot.Deployments[i].Namespace, snapshot.Deployments[i].Name, snapshot.Deployments[i].Spec.Selector)
+	}
+	for i := range snapshot.StatefulSets {
+		add("StatefulSet", snapshot.StatefulSets[i].Namespace, snapshot.StatefulSets[i].Name, snapshot.StatefulSets[i].Spec.Selector)
+	}
+	for i := range snapshot.DaemonSets {
+		add("DaemonSet", snapshot.DaemonSets[i].Namespace, snapshot.DaemonSets[i].Name, snapshot.DaemonSets[i].Spec.Selector)
+	}
+	return owners
+}
+
+// of names the workload a Pod belongs to, in order of how much the answer can
+// be trusted.
+func (owners workloadOwners) of(pod *corev1.Pod) string {
+	for _, owner := range pod.OwnerReferences {
+		if owner.Controller == nil || !*owner.Controller {
+			continue
+		}
+		if owner.Kind != "ReplicaSet" {
+			return owner.Kind + "/" + owner.Name
+		}
+		if replicaSet, ok := owners.replicaSets[pod.Namespace+"/"+owner.Name]; ok {
+			for _, parent := range replicaSet.OwnerReferences {
+				if parent.Controller != nil && *parent.Controller {
+					return parent.Kind + "/" + parent.Name
+				}
+			}
+		}
+		// The ReplicaSet was not collected. Naming it directly would split one
+		// rollout into two groups and hide exactly the mismatch this looks for,
+		// so fall through to the controller whose selector claims this Pod.
+		break
+	}
+	for _, controller := range owners.controllers {
+		if controller.namespace == pod.Namespace && controller.selector.Matches(labels.Set(pod.Labels)) {
+			return controller.kind + "/" + controller.name
+		}
+	}
+	return ""
+}
+
+// matchedSelectorPairs lists the selector entries a Pod satisfies exactly. Two
+// Pods sharing one of these are related to this Service even when nothing in the
+// cluster records a controller for either of them; two Pods sharing none are
+// simply different applications that happen to use the same label key.
+func matchedSelectorPairs(selector map[string]string, pod *corev1.Pod) map[string]struct{} {
+	pairs := map[string]struct{}{}
+	for key, want := range selector {
+		if got, ok := pod.Labels[key]; ok && got == want {
+			pairs[key+"="+want] = struct{}{}
+		}
+	}
+	return pairs
+}
+
+// relatedToSelectedPod reports whether an unselected Pod belongs with the Pods
+// this Service does reach. Grouping owner-less Pods by label keys alone pulled
+// in unrelated applications: app=web and app=api share the key and nothing else.
+func relatedToSelectedPod(selector map[string]string, pod *corev1.Pod, selected []*corev1.Pod) bool {
+	pairs := matchedSelectorPairs(selector, pod)
+	if len(pairs) == 0 {
+		return false
+	}
+	for _, other := range selected {
+		for pair := range matchedSelectorPairs(selector, other) {
+			if _, shared := pairs[pair]; shared {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// partialSelectorFindings reports a Service that reaches only part of a
+// workload.
+//
+// Nothing marks this state: the Service has Endpoints, every Pod is Ready, and
+// no counter anywhere says that some replicas receive no traffic. It happens
+// when the selector uses a label that is not stable across revisions, so one
+// ReplicaSet's Pods match and the other's do not — capacity silently shrinks,
+// and the Service goes dark entirely once the matching side scales to zero.
+func partialSelectorFindings(service *corev1.Service, candidates []*corev1.Pod, selected []*corev1.Pod, owners workloadOwners, resource string) []model.Finding {
+	if len(selected) == 0 || len(candidates) == len(selected) {
+		return nil
+	}
+	isSelected := map[string]bool{}
+	for _, pod := range selected {
+		isSelected[pod.Name] = true
+	}
+	type group struct{ selected, missed []*corev1.Pod }
+	groups := map[string]*group{}
+	order := []string{}
+	const unowned = "コントローラを持たないPod"
+	for _, pod := range candidates {
+		owner := owners.of(pod)
+		if owner == "" {
+			// Nothing in the cluster says what this Pod belongs to, so relate it
+			// to the Pods the Service already reaches instead of guessing.
+			if isSelected[pod.Name] || !relatedToSelectedPod(service.Spec.Selector, pod, selected) {
+				continue
+			}
+			owner = unowned
+		}
+		if _, seen := groups[owner]; !seen {
+			groups[owner] = &group{}
+			order = append(order, owner)
+		}
+		if isSelected[pod.Name] {
+			groups[owner].selected = append(groups[owner].selected, pod)
+		} else {
+			groups[owner].missed = append(groups[owner].missed, pod)
+		}
+	}
+	result := []model.Finding{}
+	for _, owner := range order {
+		value := groups[owner]
+		// Only a workload that is split by this selector is evidence of a
+		// mismatch. One that is entirely outside the Service is simply a
+		// different application. The owner-less group is built from Pods already
+		// shown to be related to a selected one, so it needs no selected member
+		// of its own.
+		if len(value.missed) == 0 || (owner != unowned && len(value.selected) == 0) {
+			continue
+		}
+		details := []string{}
+		for _, pod := range value.missed {
+			_, reasons := selectorMismatch(service.Spec.Selector, pod)
+			details = append(details, fmt.Sprintf("%s（%s）", pod.Name, strings.Join(reasons, "、")))
+		}
+		total := len(value.selected) + len(value.missed)
+		if owner == unowned {
+			total = len(selected) + len(value.missed)
+			value.selected = selected
+		}
+		result = append(result, model.NewFinding(
+			model.Warning, "K8S.SERVICE.SELECTOR_PARTIAL_MATCH", "Service", resource, "SelectorPartialMatch", "partial/"+owner,
+			fmt.Sprintf("Service %s のPod選択条件（selector）は、%s のPod %d個のうち %d個にしか一致していません。残りのPodには通信が振り分けられず、一致している側が0台になるとこのServiceは応答しなくなります。対象外のPod: %s",
+				shortRef(service.Namespace, service.Name), owner, total, len(value.selected), summarizeStrings(details, 3)), 70,
+			model.Evidence{Kind: "service", Key: "spec.selector", Value: "Serviceのselector: " + serviceSelectorText(service.Spec.Selector)},
+			model.Evidence{Kind: "pod", Key: "selected", Value: fmt.Sprintf("%s のうち一致 %d個 / 不一致 %d個", owner, len(value.selected), len(value.missed))},
+			model.Evidence{Kind: "decision", Key: "mismatch", Value: "不一致の内訳: " + summarizeStrings(details, 5)},
+		))
+	}
+	return result
 }
