@@ -12,10 +12,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
@@ -32,15 +32,3 @@ jobs:
         env:
           K8S_DIAGNOSE_REQUIRE_SECURITY_TOOLS: "1"
         run: ./scripts/run-ci-tests.sh
-      - name: Install SBOM and license tools
-        run: |
-          go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.10.0
-          go install github.com/google/go-licenses/v2@v2.0.1
-      - name: Generate SBOM and third-party notices
-        run: ./scripts/generate-supply-chain.sh
-      - name: Upload supply-chain artifacts
-        uses: actions/upload-artifact@v7
-        with:
-          name: k8s-diagnose-supply-chain
-          path: dist/supply-chain
-          if-no-files-found: error

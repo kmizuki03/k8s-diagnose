@@ -33,7 +33,15 @@ func (ServiceRule) Metadata() Metadata {
 
 func (ServiceRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, _ config.Config) []model.Finding {
 	result := []model.Finding{}
-	podIndex := indexPodsByNamespace(snapshot.Pods)
+	// A selected-Pod snapshot intentionally narrows Pods to one item, but keeps
+	// AllPods for rules that need cluster context. Dependency Services retained
+	// in that snapshot may select other Pods, so evaluating their selectors
+	// against the narrowed slice would report a false "no matching Pods" warning.
+	selectorPods := snapshot.Pods
+	if len(snapshot.AllPods) > 0 && snapshot.AvailableOrUntracked("all_pods") {
+		selectorPods = snapshot.AllPods
+	}
+	podIndex := indexPodsByNamespace(selectorPods)
 	owners := newWorkloadOwners(snapshot)
 	for i := range snapshot.Services {
 		service := &snapshot.Services[i]

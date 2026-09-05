@@ -1,0 +1,29 @@
+name: 機能提案
+description: 新しい診断、出力、操作性の改善を提案します
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 解決したい課題
+      description: 現在どのような場面で困るのかを説明してください。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 提案する動作
+      description: 理想的な入力、出力、利用方法を記載してください。
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 検討した代替案
+  - type: textarea
+    id: context
+    attributes:
+      label: 補足
+      description: 参考資料や公開可能な例があれば記載してください。

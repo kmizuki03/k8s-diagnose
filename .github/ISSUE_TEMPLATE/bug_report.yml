@@ -1,0 +1,61 @@
+name: 不具合報告
+description: 再現可能な不具合や予期しない診断結果を報告します
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        報告ありがとうございます。機密情報や認証情報を含めないでください。
+  - type: input
+    id: version
+    attributes:
+      label: バージョン
+      description: "`k8s-diagnose --version`の出力を記載してください。"
+      placeholder: k8s-diagnose v1.2.3 (Go)
+    validations:
+      required: true
+  - type: input
+    id: kubernetes
+    attributes:
+      label: Kubernetes環境
+      description: Kubernetesのバージョンとディストリビューションを、公開可能な範囲で記載してください。
+      placeholder: Kubernetes 1.x / kind、EKS、GKEなど
+  - type: textarea
+    id: command
+    attributes:
+      label: 実行したコマンド
+      description: token、kubeconfigパス、Webhook URLなどの機密情報を削除してください。
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期待した結果
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 実際の結果
+      description: 出力を貼る場合は、クラスタ固有情報と機密情報が含まれていないことを確認してください。
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 再現手順
+      description: 可能であれば最小構成で記載してください。
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 確認事項
+      options:
+        - label: 既存Issueに同じ報告がないことを確認しました。
+          required: true
+        - label: 添付内容に認証情報や公開できないクラスタ情報がないことを確認しました。
+          required: true

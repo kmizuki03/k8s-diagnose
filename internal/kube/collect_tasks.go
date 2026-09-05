@@ -158,15 +158,15 @@ func (c *Collector) collectTasks(namespace string) []collectTask {
 			return func(snapshot *Snapshot) { snapshot.CustomResourceDefs = values }, err
 		}},
 		{"gatewayclasses", func(ctx context.Context) (snapshotUpdate, error) {
-			values, err := c.listOptionalDynamic(ctx, schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "gatewayclasses"}, "")
+			values, err := c.listOptionalDynamicVersions(ctx, "gateway.networking.k8s.io", "gatewayclasses", "", "v1", "v1beta1")
 			return func(snapshot *Snapshot) { snapshot.GatewayClasses = values }, err
 		}},
 		{"gateways", func(ctx context.Context) (snapshotUpdate, error) {
-			values, err := c.listOptionalDynamic(ctx, schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "gateways"}, namespace)
+			values, err := c.listOptionalDynamicVersions(ctx, "gateway.networking.k8s.io", "gateways", namespace, "v1", "v1beta1")
 			return func(snapshot *Snapshot) { snapshot.Gateways = values }, err
 		}},
 		{"httproutes", func(ctx context.Context) (snapshotUpdate, error) {
-			values, err := c.listOptionalDynamic(ctx, schema.GroupVersionResource{Group: "gateway.networking.k8s.io", Version: "v1", Resource: "httproutes"}, namespace)
+			values, err := c.listOptionalDynamicVersions(ctx, "gateway.networking.k8s.io", "httproutes", namespace, "v1", "v1beta1")
 			return func(snapshot *Snapshot) { snapshot.HTTPRoutes = values }, err
 		}},
 		{"readyz", func(ctx context.Context) (snapshotUpdate, error) {

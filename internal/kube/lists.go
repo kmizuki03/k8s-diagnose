@@ -28,15 +28,29 @@ import (
 
 func (c *Collector) limit() int64 { return c.Config.PageSize }
 
-// listOptionalDynamic treats an uninstalled extension API as an empty result.
-// Gateway API is optional in Kubernetes; its absence must not reduce ordinary
-// cluster coverage, while authorization and transport errors remain visible.
-func (c *Collector) listOptionalDynamic(ctx context.Context, gvr schema.GroupVersionResource, ns string) ([]unstructured.Unstructured, error) {
-	values, err := c.listDynamic(ctx, gvr, ns)
-	if apierrors.IsNotFound(err) {
-		return nil, nil
+// listOptionalDynamicVersions asks for the first served version of a resource.
+//
+// An extension API is usually available under several versions at once, and
+// which ones a cluster serves depends on how old its CRDs are. Asking for one
+// version only means a cluster that has the resources but not that version
+// answers NotFound. Trying candidate versions prevents those resources from
+// looking absent and silently disabling every rule built on them. If no version
+// is served, the extension API is treated as optional; authorization and
+// transport errors remain visible.
+func (c *Collector) listOptionalDynamicVersions(ctx context.Context, group, resource, ns string, versions ...string) ([]unstructured.Unstructured, error) {
+	for _, version := range versions {
+		values, err := c.listDynamic(ctx, schema.GroupVersionResource{Group: group, Version: version, Resource: resource}, ns)
+		if err == nil {
+			return values, nil
+		}
+		if !apierrors.IsNotFound(err) {
+			return values, err
+		}
 	}
-	return values, err
+	// Every candidate version answered NotFound, so the resource genuinely is
+	// not installed. That is not a diagnosis failure on a cluster that simply
+	// does not use this API.
+	return nil, nil
 }
 
 func (c *Collector) listPods(ctx context.Context, ns string) ([]corev1.Pod, error) {

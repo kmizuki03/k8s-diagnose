@@ -877,11 +877,32 @@ func TestCollectedLogsAreIncludedInCoverage(t *testing.T) {
 	state := model.NewState()
 	runner.collectLogs(context.Background(), &kube.Snapshot{Pods: []corev1.Pod{pod}}, state, true)
 	ok, unavailable, total := state.CoverageCounts()
-	if ok != 2 || unavailable != 0 || total != 2 {
-		t.Fatalf("current/previousログのCoverage=%d/%d unavailable=%d", ok, total, unavailable)
+	if ok != 1 || unavailable != 0 || total != 1 {
+		t.Fatalf("再起動履歴のないPodのログCoverage=%d/%d unavailable=%d", ok, total, unavailable)
 	}
-	if len(runner.kubectlCmds) != 2 {
-		t.Fatalf("current/previousの確認用kubectl logsが記録されない: %#v", runner.kubectlCmds)
+	if len(runner.kubectlCmds) != 1 || strings.Contains(strings.Join(runner.kubectlCmds[0], " "), "--previous") {
+		t.Fatalf("再起動履歴のないPodでpreviousログを要求した: %#v", runner.kubectlCmds)
+	}
+}
+
+func TestPreviousLogsAreRequestedOnlyForRestartedContainers(t *testing.T) {
+	cfg := config.Defaults()
+	runner := &Runner{Config: cfg, Clients: &kube.Clients{Kube: kubefake.NewSimpleClientset()}}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "ns"},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}, {Name: "sidecar"}}},
+		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{
+			{Name: "app", RestartCount: 1},
+			{Name: "sidecar", RestartCount: 0},
+		}},
+	}
+	_, _ = runner.podLogs(context.Background(), pod, true)
+	if len(runner.kubectlCmds) != 1 {
+		t.Fatalf("previousログの確認用コマンド数=%d, want 1: %#v", len(runner.kubectlCmds), runner.kubectlCmds)
+	}
+	command := strings.Join(runner.kubectlCmds[0], " ")
+	if !strings.Contains(command, "-c app") || !strings.Contains(command, "--previous") || strings.Contains(command, "-c sidecar") {
+		t.Fatalf("再起動したコンテナだけを選べていない: %q", command)
 	}
 }
 

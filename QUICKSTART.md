@@ -108,6 +108,6 @@ kubectl create clusterrolebinding k8s-diagnose-reader \
 - 実行したコマンドと、期待した結果 / 実際の結果
 - `./k8s-diagnose --version` の出力
 
-**連絡先: `<配布時にSlackチャンネル名 / 担当者を記入してください>`**
+不具合や改善提案は[GitHub Issues](https://github.com/kmizuki03/k8s-diagnose/issues)へ報告してください。
 
-<!-- TODO(配布担当): 上の連絡先を実際の窓口に置き換えてから配布してください。 -->
+スナップショットはSecret値などをマスクしますが、namespace名、リソース名、イメージ名などの運用メタデータは含まれます。公開Issueへ添付する前に、所属組織の情報公開ルールに照らして内容を確認してください。

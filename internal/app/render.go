@@ -174,6 +174,17 @@ func podStatus(pod *corev1.Pod) string {
 	if pod.Status.Reason != "" {
 		return pod.Status.Reason
 	}
+	if pod.Status.Phase == corev1.PodRunning {
+		ready, total := readyRatio(pod)
+		if ready < total {
+			return "NotReady"
+		}
+		for _, condition := range pod.Status.Conditions {
+			if condition.Type == corev1.PodReady && condition.Status != corev1.ConditionTrue {
+				return "NotReady"
+			}
+		}
+	}
 	if pod.Status.Phase != "" {
 		return string(pod.Status.Phase)
 	}
@@ -181,6 +192,9 @@ func podStatus(pod *corev1.Pod) string {
 }
 
 func ageText(created time.Time) string {
+	if created.IsZero() {
+		return "<unknown>"
+	}
 	duration := time.Since(created)
 	if duration < time.Minute {
 		return fmt.Sprintf("%ds", max(0, int(duration.Seconds())))

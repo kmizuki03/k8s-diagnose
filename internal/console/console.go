@@ -75,13 +75,14 @@ func (c *Console) Header(context string) {
 	c.printColor(c.C.Blue+c.C.Bold, "║"+title+"║")
 	c.printColor(c.C.Blue+c.C.Bold, "╠"+line+"╣")
 	labels := []string{"接続先", "namespace", "モード"}
-	values := []string{redact.SanitizeText(context), redact.SanitizeText(c.Config.ScopeLabel()), redact.SanitizeText(modeLabel(c.Config.Mode))}
+	values := []string{context, c.Config.ScopeLabel(), modeLabel(c.Config.Mode)}
 	labelWidth := 0
 	for _, label := range labels {
 		labelWidth = max(labelWidth, DisplayWidth(label))
 	}
 	for index := range labels {
 		prefix := "  " + labels[index] + strings.Repeat(" ", labelWidth-DisplayWidth(labels[index])) + " : "
+		values[index] = TruncateDisplay(tableCell(values[index], c.Config.Mask), inner-DisplayWidth(prefix))
 		content := prefix + values[index]
 		padding := max(0, inner-DisplayWidth(content))
 		if c.ColorEnabled() {
@@ -170,47 +171,103 @@ type DiagnosticItem struct {
 }
 
 func (c *Console) Table(headers []string, rows []TableRow, colorize bool) {
+	c.renderTable(headers, rows, c.C.Bold, colorize)
+}
+
+// tableCell masks before normalizing whitespace so multiline credentials are
+// handled as a whole, and embedded tabs/newlines cannot break column layout.
+func tableCell(value string, mask bool) string {
+	return strings.Join(strings.Fields(MaskSecrets(value, mask)), " ")
+}
+
+func (c *Console) renderTable(headers []string, rows []TableRow, headerColor string, colorize bool) {
 	if len(rows) == 0 {
 		return
 	}
 	headers = append([]string{}, headers...)
 	widths := make([]int, len(headers))
 	for i := range headers {
-		headers[i] = redact.SanitizeText(headers[i])
+		headers[i] = tableCell(headers[i], c.Config.Mask)
 		widths[i] = DisplayWidth(headers[i])
 	}
 	for _, row := range rows {
 		for i, value := range row.Cells {
 			if i < len(widths) {
-				value = MaskSecrets(value, c.Config.Mask)
+				value = tableCell(value, c.Config.Mask)
 				widths[i] = max(widths[i], DisplayWidth(value))
 			}
 		}
+	}
+	lineWidth := max(0, 2*(len(headers)-1))
+	for _, width := range widths {
+		lineWidth += width
+	}
+	available := c.Width()
+	if available <= 0 {
+		available = 68
+	}
+	if lineWidth > available {
+		// A vertical record retains full identifiers and messages when the
+		// table cannot fit. Selection tables are fitted by their caller first.
+		for index, row := range rows {
+			if index > 0 {
+				c.Write()
+			}
+			color := c.tableRowStyle(index, row, colorize)
+			for column, header := range headers {
+				value := ""
+				if column < len(row.Cells) {
+					value = tableCell(row.Cells[column], c.Config.Mask)
+				}
+				prefix := header + ": "
+				if header == "" {
+					prefix = ""
+				}
+				if DisplayWidth(prefix) > available/2 {
+					for _, line := range wrapDisplay(header+":", available) {
+						c.printColor(color, line)
+					}
+					prefix = "  "
+				}
+				lines := wrapDisplay(value, max(2, available-DisplayWidth(prefix)))
+				if len(lines) == 0 {
+					lines = []string{""}
+				}
+				for _, line := range lines {
+					c.printColor(color, prefix+line)
+					prefix = strings.Repeat(" ", DisplayWidth(prefix))
+				}
+			}
+		}
+		return
 	}
 	format := func(cells []string) string {
 		parts := make([]string, len(headers))
 		for index := range headers {
 			value := ""
 			if index < len(cells) {
-				value = MaskSecrets(cells[index], c.Config.Mask)
+				value = tableCell(cells[index], c.Config.Mask)
 			}
 			parts[index] = value + strings.Repeat(" ", max(0, widths[index]-DisplayWidth(value)))
 		}
 		return strings.TrimRight(strings.Join(parts, "  "), " ")
 	}
-	c.printColor(c.C.Bold, format(headers))
+	c.printColor(headerColor, format(headers))
 	for index, row := range rows {
-		color := ""
-		if colorize {
-			color = c.rowColor(index, row.Status+" "+strings.Join(row.Cells, " "))
-		}
-		if row.Selected {
-			// Some base colours intentionally include an ANSI reset. Apply the
-			// selection attributes last so either zebra colour remains selected.
-			color += c.C.Reverse + c.C.Bold
-		}
-		c.printColor(color, format(row.Cells))
+		c.printColor(c.tableRowStyle(index, row, colorize), format(row.Cells))
 	}
+}
+
+func (c *Console) tableRowStyle(index int, row TableRow, colorize bool) string {
+	color := ""
+	if colorize {
+		color = c.rowColor(index, row.Status)
+	}
+	if row.Selected {
+		// Apply selection after base colours, which may include an ANSI reset.
+		color += c.C.Reverse + c.C.Bold
+	}
+	return color
 }
 
 func (c *Console) PodTable(headers []string, rows []TableRow) {
@@ -221,39 +278,7 @@ func (c *Console) PodTable(headers []string, rows []TableRow) {
 		c.printColor(c.C.Green, "（Podなし）")
 		return
 	}
-	headers = append([]string{}, headers...)
-	widths := make([]int, len(headers))
-	for i := range headers {
-		headers[i] = redact.SanitizeText(headers[i])
-		widths[i] = DisplayWidth(headers[i])
-	}
-	for _, row := range rows {
-		for i, value := range row.Cells {
-			if i < len(widths) {
-				value = MaskSecrets(value, c.Config.Mask)
-				widths[i] = max(widths[i], DisplayWidth(value))
-			}
-		}
-	}
-	line := func(cells []string) string {
-		parts := make([]string, len(headers))
-		for i := range headers {
-			value := ""
-			if i < len(cells) {
-				value = MaskSecrets(cells[i], c.Config.Mask)
-			}
-			parts[i] = value + strings.Repeat(" ", max(0, widths[i]-DisplayWidth(value)))
-		}
-		return strings.TrimRight(strings.Join(parts, "  "), " ")
-	}
-	c.printColor(c.C.Cyan+c.C.Bold, line(headers))
-	for index, row := range rows {
-		style := c.rowColor(index, row.Status)
-		if row.Selected {
-			style += c.C.Reverse + c.C.Bold
-		}
-		c.printColor(style, line(row.Cells))
-	}
+	c.renderTable(headers, rows, c.C.Cyan+c.C.Bold, true)
 }
 
 // DiagnosticContents shows what each enabled rule inspected, the equivalent
@@ -523,7 +548,7 @@ func isWrapIdentifierRune(r rune) bool {
 }
 
 var errorRow = regexp.MustCompile(`(?i)CrashLoopBackOff|ImagePullBackOff|ErrImagePull|CreateContainerConfigError|RunContainerError|InvalidImageName|CreateContainerError|OOMKilled|Error|Failed|Evicted|Lost|NotReady|Unknown`)
-var warningRow = regexp.MustCompile(`(?i)Pending|ContainerCreating|PodInitializing|Terminating|Init:|Completed|Succeeded|Not-Ready`)
+var warningRow = regexp.MustCompile(`(?i)Warning|Pending|ContainerCreating|PodInitializing|Terminating|Init:|Completed|Succeeded|Not-Ready`)
 
 func (c *Console) rowColor(index int, text string) string {
 	if errorRow.MatchString(text) {
@@ -561,6 +586,10 @@ func (c *Console) RootCauseReport(values []model.RootCause) {
 	} else {
 		fmt.Fprintf(c.Out, "原因分析: 根本原因 %d件 / 原因候補 %d件 / 要確認 %d件\n", confirmed, probable, related)
 	}
+	if confirmed == 0 {
+		c.printWrapped(c.C.Yellow, "  ", "確定原因は見つかっていません。以下は追加確認が必要な候補です")
+	}
+	c.printWrapped(c.C.Dim, "  ", "確信度はルール上の評価であり、原因である確率を示すものではありません")
 	for index, root := range values {
 		icon, color := rootStyle(c, root)
 		c.Write()
@@ -594,7 +623,7 @@ func (c *Console) RootCauseReport(values []model.RootCause) {
 			}
 		}
 		c.printColor(color+c.C.Bold, fmt.Sprintf("%s %s [確信度: %d%%]", icon, root.Label, root.Confidence))
-		c.printColor(color+c.C.Bold, MaskSecrets(root.Cause.Message, c.Config.Mask))
+		c.printWrapped(color+c.C.Bold, "", root.Cause.Message)
 		reasons := []string{}
 		if root.Cause.Code != "" {
 			reasons = append(reasons, "判定ルール: "+root.Cause.Code)
@@ -618,28 +647,42 @@ func (c *Console) RootCauseReport(values []model.RootCause) {
 				if i == len(reasons)-1 {
 					branch = "└─"
 				}
-				c.Write(branch + " " + MaskSecrets(reason, c.Config.Mask))
+				c.printWrapped("", branch+" ", reason)
 			}
 		}
 		impacts := append(append([]model.Impact{}, root.DirectImpacts...), root.PropagatedImpacts...)
 		if len(impacts) > 0 {
 			c.Write()
-			c.printColor(c.C.Magenta+c.C.Bold, "影響経路（直接影響 → 波及影響）")
+			c.printColor(c.C.Magenta+c.C.Bold, "関連する異常と依存経路")
+			c.printWrapped(c.C.Dim, "  ", "依存関係と異常の併存を表示しています。同じ原因で発生したことまで確定するものではありません")
 			c.renderImpactTree(impacts, color)
 		}
 		if len(root.Remediations) > 0 {
 			c.Write()
-			c.printColor(c.C.Lime+c.C.Bold, "◆ 修正候補")
+			title := "◆ 次に確認すること"
+			if root.Confirmed {
+				title = "◆ 修正候補"
+			}
+			c.printColor(c.C.Lime+c.C.Bold, title)
 			for _, remediation := range root.Remediations {
-				c.printColor(c.C.Lime+c.C.Bold, "  ▶ "+MaskSecrets(remediation, c.Config.Mask))
+				c.printWrapped(c.C.Lime+c.C.Bold, "  ▶ ", remediation)
 			}
 		}
 	}
 }
 
 func rootCauseEvidenceLabel(evidence model.Evidence) string {
+	if evidence.Kind == "log-signature" {
+		return "参考ログ（因果関係は未確認）"
+	}
 	key := strings.Trim(strings.TrimSpace(evidence.Kind)+"."+strings.TrimSpace(evidence.Key), ".")
 	switch key {
+	case "assessment.classification":
+		return "分類理由"
+	case "log.source":
+		return "ログの取得元"
+	case "log.count":
+		return "ログの一致件数"
 	case "api.errors", "api.reason":
 		return "Kubernetes APIのエラー"
 	case "container.state":

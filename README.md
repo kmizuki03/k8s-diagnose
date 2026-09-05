@@ -1,6 +1,10 @@
-# k8s-diagnose Go版 説明書
+# k8s-diagnose
 
-Kubernetesの状態をread-onlyで取得し、異常、診断不能、原因候補を分離して報告する診断CLIです。Python版の出力スキーマ、CI方針、Root Cause相関、SQLite履歴と互換性を保ちつつ、Kubernetes API取得を`kubectl` subprocessから`client-go`の型付きクライアントへ移行しています。
+[![Go CI](https://github.com/kmizuki03/k8s-diagnose/actions/workflows/go-ci.yml/badge.svg)](https://github.com/kmizuki03/k8s-diagnose/actions/workflows/go-ci.yml)
+
+Kubernetesの状態をread-onlyで取得し、異常、診断不能、原因候補を分離して報告する診断CLIです。通常診断は`client-go`でKubernetes APIへ直接接続し、クラスタへリソースを作成・変更・削除しません。
+
+[クイックスタート](./QUICKSTART.md) · [RBAC](./rbac/)
 
 Go版の主な目的は次の4点です。
 
@@ -19,6 +23,8 @@ Go版の主な目的は次の4点です。
 Kubeconfigの`exec` credential pluginを使っている場合は、そのplugin本体（例: クラウドCLI）は実行環境に必要です。
 
 ## 2. ビルドと起動
+
+現時点ではソースからビルドしてください。`vX.Y.Z`タグのリリースでは、GitHub ReleasesへLinux/macOS/Windows向けアーカイブとSHA-256チェックサムを自動生成します。
 
 ```bash
 make build
@@ -59,6 +65,7 @@ GOOS=linux GOARCH=amd64 K8S_DIAGNOSE_VERSION=v3.0.0 make package
 dist/releases/k8s-diagnose_VERSION_OS_ARCH/
 ├── k8s-diagnose              # Windowsではk8s-diagnose.exe
 ├── README.md
+├── QUICKSTART.md
 ├── VERSION
 ├── CONTENTS.txt
 ├── k8s-diagnose.ini
@@ -69,7 +76,7 @@ dist/releases/k8s-diagnose_VERSION_OS_ARCH/
 
 同じ内容の`tar.gz`とSHA-256ファイルも生成します。配布ディレクトリにはGoソース、`*_test.go`、CI定義、レビュー資料、開発スクリプトを含めません。`*_test.go`は配布バイナリには元々組み込まれませんが、ソースリポジトリでは回帰検査に必要で、Goでは対象パッケージと同じ場所に置くため追跡を継続します。
 
-個人用の設計メモやレビュー原稿は`.local/notes/`へ置きます。`.local/`全体はGit管理外です。生成済み配布物を作り直す場合は、`make fclean`の後に`make package`を実行してください。
+ローカルだけで使う設計メモやレビュー原稿は`.local/notes/`へ置きます。`.local/`全体はGit管理外です。生成済み配布物を作り直す場合は、`make fclean`の後に`make package`を実行してください。
 
 ## 3. 説明書を読まずに始める
 
@@ -145,6 +152,8 @@ dist/releases/k8s-diagnose_VERSION_OS_ARCH/
 | トリアージ | `triage` | `--triage` | CIや初動向けのコンパクトな診断 |
 
 モードは同時に1つだけ指定できます。引数なしの対話端末ではガイドを表示し、非対話環境での未指定時は`all`です。`quick` / `ci` / `deep`は上表のモードへ安全な設定一式を重ねるプリセットです。
+
+text出力の表が端末幅に収まらない場合は、項目名と値を縦に並べる表示へ自動で切り替え、長いリソース名やメッセージを折り返します。ヘッダーの長い接続先・namespaceは末尾を`…`で省略します。Pod一覧の`STATUS`は、RunningでもコンテナのReady未達やPodのReady条件がFalse/Unknownの場合に`NotReady`を表示します。作成日時を取得できない場合の`AGE`は`<unknown>`です。
 
 ## 5. オプション一覧
 
@@ -268,7 +277,7 @@ NO_COLOR=1 ./k8s-diagnose -a
 - Workload: Deployment / ReplicaSet / StatefulSet / DaemonSetのreplica、ProgressDeadlineExceeded、ReplicaFailure、CronJob suspend、複数ワークロードのselector重複（同じPodを取り合い、互いに削除し合う状態。statusには現れない）
 - Scheduling/Node: nodeSelector、required nodeAffinity、taint/toleration、cordon、Node状態taint、Node Lease heartbeat、CPU/Memory/HugePages/extended resource、Pod数上限、Pod overhead、in-place resize、PVC、schedulingGate、nominatedNodeName
 - Service: selector（一致ゼロのときは一部だけ一致したPodと食い違っているラベルの実値を提示。同じワークロードのPodの一部にしか届いていない場合も検出）、EndpointSlice ready/terminating+serving、Endpoints fallback、named targetPort、数値targetPortの未宣言（候補扱い）、LoadBalancer pending、ExternalName参照先、`internalTrafficPolicy: Local`のNode別転送先不足
-- Gateway API: GatewayClass・親Gateway・backend Serviceの参照、Gateway/HTTPRoute condition、listenerとRouteのhostname整合、静的に確認できるRoute pathとbackendの受付path
+- Gateway API: GatewayClass・親Gateway・backend Serviceの参照、Gateway/HTTPRoute condition、listenerとRouteのhostname整合、静的に確認できるRoute pathとbackendの受付path。取得は`v1`→`v1beta1`の順に試し、クラスタが提供しているバージョンを使います（片方しか提供していないクラスタでリソースが存在しない扱いになるのを防ぐため）
 - 依存: optionalを考慮したSecret/ConfigMapオブジェクトとキー、PVC、ServiceAccount、PriorityClass、RuntimeClass。参照先リソース自体が無い場合は、種別・namespace・名前・参照元を明示します。`optional: true`ならPod起動を妨げないため確定異常にはせず「要確認」とし、必須参照と同じ対象を併記している場合は必須側だけを表示します。オブジェクトは存在するのに参照キーだけ無い場合も、キー名の誤りが疑われる候補として報告します。Secret Volume、projected Volume、CSI `nodePublishSecretRef`、従来型VolumeプラグインのSecret参照も追跡。欠落imagePullSecretはNode資格情報等でpull可能なためwarning
 - ConfigMap: 参照は解決できてもコンテナへ反映されない状態を診断します。同じ変数名が複数の`envFrom`や`env`から設定されてConfigMapの値が使われないキー衝突（値が実際に異なる場合のみ・候補扱い）、`subPath`マウント（ConfigMapを更新してもファイルが差し替わらない・候補扱い）、1オブジェクト上限1MiBへの接近を確認します。Kubernetes 1.34では緩和済み環境変数名が既定で有効なため、数字で始まるConfigMapキーを異常扱いしません。また、kubeletの`envFrom`が展開するのは`data`だけであり、`binaryData`を環境変数や衝突元として扱いません
 - Storage/TLS: WaitForFirstConsumer、PVC Lost/resize condition、PV Failed/Released/Pending、Ingressが参照するOpaque Secretを含むPEM/DERバンドル全証明書、TLSキー欠落・空データ・秘密鍵不正・証明書との不一致、期限切れ/有効開始前
@@ -303,7 +312,11 @@ Job → CronJob
 Service → Admission Webhook
 ```
 
-確信度90%以上を「根本原因」、60〜89%を「原因候補」、60%未満を「関連候補 / 要確認」と表示します。各Root Causeの詳細には、判定ルール、対象リソース、照合に使用した設定値や状態を「検出理由・根拠」として表示します。クラスタHealthは同一根本原因の波及症状を重複減点しません。Coverageはクラスタの健全性ではなく、実施できた診断ルールの割合です。text出力ではHealthとCoverageを別々の横棒ゲージとして表示し、HealthのA〜D評価、Coverageの確認済み件数、重大度別の所見件数を同じスコアカード内で確認できます。
+「根本原因」は、必須参照先の欠落やポート設定の不整合など、原因を直接確認する対象ルールが`issue`かつ確信度90%以上で検出した場合に限ります。Podの異常状態・ロールアウト期限超過・レプリカ作成失敗・接続失敗などの症状は原因分析の確信度を最大70にし、ログの記録や直接確認の対象外ルールは最大85にして、数値の高さだけで確定しないようにしています。確定条件を満たさない所見は60以上で「原因候補」、60未満で「関連候補 / 要確認」です。確信度はルール上の評価であり、統計的な確率ではありません。元のFindingの重大度・確信度は維持されます。
+
+各Root Causeの詳細には、分類理由、判定ルール、対象リソース、照合に使用した設定値や状態を「検出理由・根拠」として表示します。候補には「次に確認すること」を表示し、ログだけで検出した候補も原因分析に含めます。同じリソースの原因に添付したログは参考情報として表示します。依存経路は関連リソースで異常が見つかったことを示し、因果関係まで確定するものではありません。未確定の候補が依存先の症状を取り込んで非表示にすることはなく、独立した異常も別項目として保持します。
+
+クラスタHealthは同一根本原因の波及症状を重複減点しません。Coverageはクラスタの健全性ではなく、実施できた診断ルールの割合です。text出力ではHealthとCoverageを別々の横棒ゲージとして表示し、HealthのA〜D評価、Coverageの確認済み件数、重大度別の所見件数を同じスコアカード内で確認できます。
 
 `-s`はクラスタHealthの見出しだけを変えた値ではなく、選択Pod専用の「Pod総合スコア」を計算します。100点を`ライフサイクル 15`、`Ready・Condition 15`、`コンテナ稼働 20`、`再起動・ログ 10`、`Resources・構成 5`、`Scheduling・Node 8`、`依存リソース 7`、`Storage 4`、`Probe・接続 6`、`Service・Endpoint 4`、`NetworkPolicy 2`、`Ingress・TLS 4`の12項目へ分けます。phase/Ready、各コンテナの実状態、直近再起動・OOM・ログ所見、requests/limitsとメモリ使用率、Node/Scheduling、ConfigMap/Secret/PVC等の依存、Probe設定と単発接続結果、選択Podを実際に参照するService/Endpoint/NetworkPolicy/Ingress、関連TLS証明書の期限切れ・30日以内の期限を反映します。確認不能はクラスタ異常として減点せずCoverageへ分離します。選択時のService・Endpoint・Ingress・PVC・Secret・ConfigMap・NetworkPolicy・EventはPodとの参照関係で絞るため、同じnamespaceにある無関係なリソースはこのスコアへ入りません。
 
@@ -452,9 +465,9 @@ namespace指定時は`-A`を`-n NAMESPACE`に置き換えてください。List�
 | HPA | autoscaling/v2 `horizontalpodautoscalers` | `kubectl get horizontalpodautoscalers.autoscaling -A -o json` |
 | Ingress | networking.k8s.io/v1 `ingresses` | `kubectl get ingresses.networking.k8s.io -A -o json` |
 | IngressClass | networking.k8s.io/v1 `ingressclasses` | `kubectl get ingressclasses.networking.k8s.io -o json` |
-| GatewayClass | gateway.networking.k8s.io/v1 `gatewayclasses` | `kubectl get gatewayclasses.gateway.networking.k8s.io -o json` |
-| Gateway | gateway.networking.k8s.io/v1 `gateways` | `kubectl get gateways.gateway.networking.k8s.io -A -o json` |
-| HTTPRoute | gateway.networking.k8s.io/v1 `httproutes` | `kubectl get httproutes.gateway.networking.k8s.io -A -o json` |
+| GatewayClass | gateway.networking.k8s.io/v1 または v1beta1 `gatewayclasses` | `kubectl get gatewayclasses.gateway.networking.k8s.io -o json` |
+| Gateway | gateway.networking.k8s.io/v1 または v1beta1 `gateways` | `kubectl get gateways.gateway.networking.k8s.io -A -o json` |
+| HTTPRoute | gateway.networking.k8s.io/v1 または v1beta1 `httproutes` | `kubectl get httproutes.gateway.networking.k8s.io -A -o json` |
 | NetworkPolicy | networking.k8s.io/v1 `networkpolicies` | `kubectl get networkpolicies.networking.k8s.io -A -o json` |
 | StorageClass | storage.k8s.io/v1 `storageclasses` | `kubectl get storageclasses.storage.k8s.io -o json` |
 | PDB | policy/v1 `poddisruptionbudgets` | `kubectl get poddisruptionbudgets.policy -A -o json` |
@@ -546,16 +559,11 @@ make security
 go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
 actionlint -color=false
 
-# CycloneDX SBOM、依存ライセンス一覧、再配布用ライセンス文書をdistへ生成
-go install github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.10.0
-go install github.com/google/go-licenses/v2@v2.0.1
-make supply-chain
-
 # 一括
 ./scripts/run-ci-tests.sh
 ```
 
-リポジトリには[`.github/workflows/go-ci.yml`](./.github/workflows/go-ci.yml)も含まれます。GitHub Actionsではsecurity scannerを導入したうえで同じ一括スクリプトを実行し、scanner未導入による静かなskipを禁止します。さらに`dist/supply-chain/`へ配布バイナリ、CycloneDX JSON SBOM、`THIRD_PARTY_NOTICES.csv`、再配布用ライセンス文書を生成し、`k8s-diagnose-supply-chain` artifactとして保存します。SBOMはCycloneDXの`app`モードで、実際のビルド制約を評価し、main componentのバージョンをGit情報から決定します。そのため生成は`.git`を含むGit checkout内で実行する必要があり、ZIPへ展開しただけのディレクトリは対象外です。ローカル生成は`cyclonedx-gomod`と`go-licenses`を事前にインストールし、出力先が存在しない状態で`make supply-chain`を実行してください。ビルド・SBOM・ライセンス解析には既定で`go.mod`記載のパッチ版Goを共通利用するため、端末に入っている別バージョンのGoによって結果が変わりません。特殊な環境では`K8S_DIAGNOSE_SUPPLY_GOTOOLCHAIN`、ライセンス解析だけを変える場合は`K8S_DIAGNOSE_LICENSE_GOTOOLCHAIN`で明示上書きできます。NOTICE生成では自プロジェクトを除外し、依存ライブラリだけを対象にします。この処理は本プロジェクト自体のライセンスを設定するものではありません。
+リポジトリには[`.github/workflows/go-ci.yml`](./.github/workflows/go-ci.yml)も含まれます。GitHub Actionsではsecurity scannerを導入したうえで同じ一括スクリプトを実行し、scanner未導入による静かなskipを禁止します。
 
 Python版とGo版の実クラスタ結果を比較:
 

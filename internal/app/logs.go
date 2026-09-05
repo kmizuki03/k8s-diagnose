@@ -19,8 +19,9 @@ const maxLogBytesPerContainer = 512 * 1024
 // addReplayLogUnavailable makes the implicit per-Pod log diagnosis in select
 // mode explicit when the input is an offline snapshot. Cluster snapshots store
 // Kubernetes objects, not container logs; attempting the normal API request
-// would dereference the intentionally nil offline client. Mark both log views
-// unavailable so Coverage also reflects that this part was not reproduced.
+// would dereference the intentionally nil offline client. Mark the current log
+// view, plus the previous view when restart history exists, unavailable so
+// Coverage also reflects what was not reproduced.
 func (runner *Runner) addReplayLogUnavailable(snapshot *kube.Snapshot, state *model.State, selected bool) {
 	reason := "保存済みクラスタ状態にはコンテナログが含まれず、再生時はKubernetes APIへ接続しないため取得できません"
 	referenceTime := snapshot.ServerTime
@@ -32,7 +33,11 @@ func (runner *Runner) addReplayLogUnavailable(snapshot *kube.Snapshot, state *mo
 		if !selected && isHealthyPod(pod, runner.Config, referenceTime) {
 			continue
 		}
-		for _, source := range []struct{ key, label string }{{"current", "現在"}, {"previous", "前回終了時"}} {
+		sources := []struct{ key, label string }{{"current", "現在"}}
+		if podHasPreviousLogs(pod) {
+			sources = append(sources, struct{ key, label string }{"previous", "前回終了時"})
+		}
+		for _, source := range sources {
 			state.AddCheck(model.Check{
 				ID:      "logs/" + pod.Namespace + "/" + pod.Name + "/" + source.key,
 				Section: "ログ", Description: fmt.Sprintf("Pod %s/%s のログ（%s）", pod.Namespace, pod.Name, source.label),
@@ -61,6 +66,9 @@ func (runner *Runner) collectLogs(ctx context.Context, snapshot *kube.Snapshot, 
 			continue
 		}
 		for _, previous := range []bool{false, true} {
+			if previous && !podHasPreviousLogs(pod) {
+				continue
+			}
 			logs, failures := runner.podLogs(ctx, pod, previous)
 			source := "current"
 			sourceLabel := "現在"
@@ -123,15 +131,35 @@ func (runner *Runner) renderLogs() {
 
 func (runner *Runner) podLogs(ctx context.Context, pod *corev1.Pod, previous bool) ([]containerLog, []string) {
 	tail := int64(max(runner.Config.Tail, runner.Config.LogSignatureLines))
+	previousNames := map[string]struct{}{}
+	if previous {
+		for _, status := range append(append([]corev1.ContainerStatus{}, pod.Status.InitContainerStatuses...), pod.Status.ContainerStatuses...) {
+			if status.RestartCount > 0 {
+				previousNames[status.Name] = struct{}{}
+			}
+		}
+	}
 	names := []string{}
 	for _, container := range pod.Spec.InitContainers {
+		if previous {
+			if _, exists := previousNames[container.Name]; !exists {
+				continue
+			}
+		}
 		names = append(names, container.Name)
 	}
 	for _, container := range pod.Spec.Containers {
+		if previous {
+			if _, exists := previousNames[container.Name]; !exists {
+				continue
+			}
+		}
 		names = append(names, container.Name)
 	}
-	for _, container := range pod.Spec.EphemeralContainers {
-		names = append(names, container.Name)
+	if !previous {
+		for _, container := range pod.Spec.EphemeralContainers {
+			names = append(names, container.Name)
+		}
 	}
 	logs := []containerLog{}
 	failures := []string{}
@@ -157,6 +185,16 @@ func (runner *Runner) podLogs(ctx context.Context, pod *corev1.Pod, previous boo
 		}
 	}
 	return logs, failures
+}
+
+func podHasPreviousLogs(pod *corev1.Pod) bool {
+	statuses := append(append([]corev1.ContainerStatus{}, pod.Status.InitContainerStatuses...), pod.Status.ContainerStatuses...)
+	for _, status := range statuses {
+		if status.RestartCount > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func isHealthyPod(pod *corev1.Pod, cfg config.Config, now time.Time) bool {

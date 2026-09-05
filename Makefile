@@ -1,4 +1,4 @@
-.PHONY: build test vet lint verify security supply-chain package fmt clean fclean re
+.PHONY: build test vet lint verify security package fmt clean fclean re
 
 NAME := k8s-diagnose
 MODULE_GO_VERSION := $(shell awk '$$1 == "go" { print $$2; exit }' go.mod)
@@ -40,14 +40,7 @@ security:
 	govulncheck ./...
 	gosec ./...
 
-supply-chain:
-	@command -v cyclonedx-gomod >/dev/null || { echo 'cyclonedx-gomodをインストールしてください'; exit 1; }
-	@command -v go-licenses >/dev/null || { echo 'go-licensesをインストールしてください'; exit 1; }
-	./scripts/generate-supply-chain.sh
-
-# package depends on supply-chain so every release archive carries the SBOM and
-# third-party notices; package-release.sh refuses to build without them.
-package: supply-chain
+package:
 	./scripts/package-release.sh
 
 fmt:

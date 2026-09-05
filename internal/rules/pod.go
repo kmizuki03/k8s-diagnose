@@ -103,7 +103,9 @@ func (PodHealthRule) Evaluate(_ context.Context, snapshot *kube.Snapshot, cfg co
 					fmt.Sprintf("Pod %s は、EvictionまたはPreemptionなどによる終了対象になっています%s", short, reasonSuffix(podCondition.Reason)), 90,
 					model.Evidence{Kind: "condition", Key: string(podCondition.Type), Value: podCondition.Message},
 				))
-			case podCondition.Type == corev1.PodReadyToStartContainers && podCondition.Status == corev1.ConditionFalse:
+			case podCondition.Type == corev1.PodReadyToStartContainers &&
+				podCondition.Status == corev1.ConditionFalse &&
+				pod.Status.Phase != corev1.PodSucceeded && pod.Status.Phase != corev1.PodFailed:
 				findings = append(findings, model.NewFinding(
 					model.Warning, "K8S.POD.SANDBOX_NOT_READY", "Pod", resource, podCondition.Reason, "sandbox-not-ready",
 					fmt.Sprintf("Pod %s では、Podサンドボックスまたはネットワークの準備が完了していません%s", short, reasonSuffix(podCondition.Reason)), 85,

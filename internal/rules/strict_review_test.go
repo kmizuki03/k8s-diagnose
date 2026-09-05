@@ -82,6 +82,26 @@ func TestBareFailedPodIsIssueButFailedJobAttemptIsNot(t *testing.T) {
 	}
 }
 
+func TestTerminalPodTeardownDoesNotReportSandboxNotReady(t *testing.T) {
+	for _, phase := range []corev1.PodPhase{corev1.PodSucceeded, corev1.PodFailed} {
+		t.Run(string(phase), func(t *testing.T) {
+			pod := corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "job-attempt", Namespace: "ns"},
+				Status: corev1.PodStatus{
+					Phase: phase,
+					Conditions: []corev1.PodCondition{{
+						Type: corev1.PodReadyToStartContainers, Status: corev1.ConditionFalse,
+					}},
+				},
+			}
+			findings := (PodHealthRule{}).Evaluate(context.Background(), &kube.Snapshot{Pods: []corev1.Pod{pod}}, config.Defaults())
+			if hasFindingCode(findings, "K8S.POD.SANDBOX_NOT_READY") {
+				t.Fatalf("終了済みPodの通常のsandbox破棄を異常扱いした: %#v", findings)
+			}
+		})
+	}
+}
+
 func TestEphemeralContainerDependencyDoesNotBecomePodIssueOrImpact(t *testing.T) {
 	pod := corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "ns"},

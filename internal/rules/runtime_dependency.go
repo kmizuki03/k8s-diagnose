@@ -91,6 +91,16 @@ func (RuntimeDependencyRule) Evaluate(_ context.Context, snapshot *kube.Snapshot
 				if !strings.Contains(commandText, expectedPath+"/") {
 					continue
 				}
+				correctPathMounted := false
+				for _, mount := range container.VolumeMounts {
+					if mount.Name == volume.Name && strings.TrimSuffix(mount.MountPath, "/") == expectedPath {
+						correctPathMounted = true
+						break
+					}
+				}
+				if correctPathMounted {
+					continue
+				}
 				for _, mount := range container.VolumeMounts {
 					if mount.Name == volume.Name && strings.TrimSuffix(mount.MountPath, "/") != expectedPath {
 						result = append(result, model.NewFinding(model.Warning, "K8S.SECRET.MOUNT_PATH_MISMATCH", "関連リソース", ref("Pod", pod.Namespace, pod.Name), "SecretMountPathMismatch", container.Name+"/"+volume.Name,

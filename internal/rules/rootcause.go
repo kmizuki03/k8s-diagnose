@@ -173,10 +173,29 @@ func Correlate(snapshot *kube.Snapshot, state *model.State) {
 			byResource[finding.Resource] = append(byResource[finding.Resource], finding)
 		}
 	}
+	for resource := range byResource {
+		sort.Slice(byResource[resource], func(i, j int) bool {
+			return byResource[resource][i].ID < byResource[resource][j].ID
+		})
+	}
 	roots := []model.RootCause{}
 	candidates := []model.Finding{}
 	for _, finding := range state.Findings {
 		if rootEligible(finding) {
+			// Logs already appear as reference evidence on a non-log root for
+			// this resource. Otherwise retain them as standalone hypotheses.
+			if strings.HasPrefix(finding.Code, "K8S.LOG.") {
+				hasRoot := false
+				for _, other := range byResource[finding.Resource] {
+					if !strings.HasPrefix(other.Code, "K8S.LOG.") && rootEligible(other) {
+						hasRoot = true
+						break
+					}
+				}
+				if hasRoot {
+					continue
+				}
+			}
 			candidates = append(candidates, finding)
 		}
 	}
@@ -206,6 +225,8 @@ func Correlate(snapshot *kube.Snapshot, state *model.State) {
 		direct, propagated := []model.Impact{}, []model.Impact{}
 		related := []string{}
 		rootEvidence := append([]model.Evidence{}, cause.Evidence...)
+		confidence, assessment := rootAssessment(cause)
+		rootEvidence = append(rootEvidence, model.Evidence{Kind: "assessment", Key: "classification", Value: assessment})
 		for _, supporting := range byResource[cause.Resource] {
 			if supporting.ID == cause.ID || !strings.HasPrefix(supporting.Code, "K8S.LOG.") {
 				continue
@@ -253,10 +274,6 @@ func Correlate(snapshot *kube.Snapshot, state *model.State) {
 				propagated = append(propagated, impact)
 			}
 		}
-		confidence := cause.Confidence
-		if symptomCode(cause.Code) && confidence > 70 {
-			confidence = 70
-		}
 		root := model.NewRootCause(
 			cause, confidence, rootEvidence, direct, propagated,
 			remediations(cause), confirmationCommands(cause), related,
@@ -267,7 +284,9 @@ func Correlate(snapshot *kube.Snapshot, state *model.State) {
 			if !exists || finding.Severity != model.Issue {
 				continue
 			}
-			if id == cause.ID || !strongRootCode(finding.Code) {
+			// Dependency alone does not prove causation. Only a confirmed
+			// cause may absorb downstream symptoms; independent faults remain.
+			if id == cause.ID || root.Confirmed && symptomCode(finding.Code) {
 				claimed[id] = struct{}{}
 			}
 		}
@@ -279,9 +298,28 @@ func Correlate(snapshot *kube.Snapshot, state *model.State) {
 		if roots[i].Confidence != roots[j].Confidence {
 			return roots[i].Confidence > roots[j].Confidence
 		}
-		return roots[i].Cause.Resource < roots[j].Cause.Resource
+		if roots[i].Cause.Resource != roots[j].Cause.Resource {
+			return roots[i].Cause.Resource < roots[j].Cause.Resource
+		}
+		return roots[i].ID < roots[j].ID
 	})
 	state.SetRootCauses(roots)
+}
+
+func rootAssessment(cause model.Finding) (int, string) {
+	if symptomCode(cause.Code) {
+		return min(cause.Confidence, 70), "異常な状態は確認しましたが、その状態を引き起こした原因は未確定です。Event・ログ・依存先を照合してください"
+	}
+	if strings.HasPrefix(cause.Code, "K8S.LOG.") {
+		return min(cause.Confidence, 85), "ログの記録に基づく候補です。発生時刻・対象コンテナ・現在の状態を照合する必要があります"
+	}
+	if !strongRootCode(cause.Code) {
+		return min(cause.Confidence, 85), "所見は検出しましたが、原因を直接確認する判定ではないため候補として扱います"
+	}
+	if cause.Severity == model.Issue && cause.Confidence >= 90 {
+		return cause.Confidence, "対象リソースの設定・参照・状態を直接確認した判定です。依存先で見つかった異常との因果関係は別途確認してください"
+	}
+	return cause.Confidence, "原因を示す所見はありますが、確定条件を満たしていません。根拠と対象リソースの現在の状態を確認してください"
 }
 
 func appendLogEvidence(evidence []model.Evidence, finding model.Finding) []model.Evidence {
@@ -406,7 +444,6 @@ func strongRootCode(code string) bool {
 		"K8S.TLS.CERT_EXPIRED", "K8S.TLS.CERT_INVALID", "K8S.TLS.KEY_PAIR_INVALID", "K8S.CONTROL_PLANE.READYZ_FAILED",
 		"K8S.INGRESS.MISSING_REFERENCE", "K8S.WEBHOOK.MISSING_SERVICE",
 		"K8S.SERVICE.TARGET_PORT_UNRESOLVED", "K8S.PROBE.PORT_UNRESOLVED",
-		"K8S.WORKLOAD.PROGRESS_DEADLINE_EXCEEDED", "K8S.WORKLOAD.REPLICA_FAILURE",
 		"K8S.SCHEDULING.NO_AVAILABLE_NODE", "K8S.SCHEDULING.NODE_AFFINITY_MISMATCH",
 		"K8S.SCHEDULING.UNTOLERATED_TAINT", "K8S.SCHEDULING.INSUFFICIENT_RESOURCES":
 		return true
@@ -419,6 +456,7 @@ func symptomCode(code string) bool {
 	switch code {
 	case "K8S.POD.ABNORMAL_STATE", "K8S.POD.PENDING_STATE", "K8S.POD.NOT_READY",
 		"K8S.POD.FAILED_PHASE",
+		"K8S.WORKLOAD.PROGRESS_DEADLINE_EXCEEDED", "K8S.WORKLOAD.REPLICA_FAILURE",
 		"K8S.WORKLOAD.REPLICAS_UNAVAILABLE", "K8S.SERVICE.NO_READY_ENDPOINT", "K8S.SERVICE.TERMINATING_ENDPOINTS_ONLY":
 		return true
 	default:
@@ -427,6 +465,9 @@ func symptomCode(code string) bool {
 }
 
 func rootEligible(finding model.Finding) bool {
+	if strings.HasPrefix(finding.Code, "K8S.LOG.") && (finding.Severity == model.Warning || finding.Severity == model.Candidate) {
+		return true
+	}
 	if finding.Severity == model.Issue {
 		return true
 	}
@@ -557,6 +598,9 @@ func resourceKind(resource string) string {
 }
 
 func remediations(finding model.Finding) []string {
+	if strings.HasPrefix(finding.Code, "K8S.LOG.") {
+		return []string{"ログの発生時刻と対象コンテナを確認し、現在のログ・前回終了時のログ・Eventを比較する", "同じエラーが継続しているかを確認してから、ログに示された設定・依存先を調査する"}
+	}
 	if strings.HasPrefix(finding.Code, "K8S.PROBE.") {
 		switch finding.Reason {
 		case "readinessProbe":
@@ -598,12 +642,19 @@ func remediations(finding model.Finding) []string {
 	case "K8S.PV.FAILED":
 		return []string{"PVの status.message、CSIまたはボリュームプラグインのEvent、ストレージ基盤を確認する"}
 	default:
-		return nil
+		return []string{"対象リソースの現在の状態とEventを確認し、所見の発生時刻・参照先・関連ログを照合する"}
 	}
 }
 
 func confirmationCommands(finding model.Finding) []string {
 	parts := strings.Split(finding.Resource, "/")
+	if strings.HasPrefix(finding.Code, "K8S.LOG.") && len(parts) == 3 && parts[0] == "Pod" {
+		return []string{
+			fmt.Sprintf("kubectl describe pod %s -n %s", parts[2], parts[1]),
+			fmt.Sprintf("kubectl logs %s -n %s --all-containers=true --tail=100 --timestamps=true", parts[2], parts[1]),
+			fmt.Sprintf("kubectl logs %s -n %s --all-containers=true --previous --tail=100 --timestamps=true", parts[2], parts[1]),
+		}
+	}
 	if len(parts) == 2 && parts[0] == "ControlPlane" {
 		switch parts[1] {
 		case "readyz", "livez":

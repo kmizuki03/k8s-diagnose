@@ -122,6 +122,23 @@ func TestExerciseRuntimeDependencyGaps(t *testing.T) {
 	}
 }
 
+func TestSecretMountMismatchAcceptsAnAdditionalCorrectMount(t *testing.T) {
+	pod := corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "app", Namespace: "ns"}, Spec: corev1.PodSpec{
+		Volumes: []corev1.Volume{{Name: "app-secret", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: "secret"}}}},
+		Containers: []corev1.Container{{
+			Name: "app", Command: []string{"cat", "/etc/app-secret/token"},
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: "app-secret", MountPath: "/etc/app-secret"},
+				{Name: "app-secret", MountPath: "/etc/wrong-secret"},
+			},
+		}},
+	}}
+	findings := (RuntimeDependencyRule{}).Evaluate(context.Background(), &kube.Snapshot{Pods: []corev1.Pod{pod}}, config.Config{})
+	if hasFindingCode(findings, "K8S.SECRET.MOUNT_PATH_MISMATCH") {
+		t.Fatalf("正しいmountPathも存在するPodを不一致扱いした: %#v", findings)
+	}
+}
+
 func TestExerciseCronJobWritesOutsideMountedVolume(t *testing.T) {
 	cron := batchv1.CronJob{ObjectMeta: metav1.ObjectMeta{Name: "backup", Namespace: "ns"}, Spec: batchv1.CronJobSpec{JobTemplate: batchv1.JobTemplateSpec{Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "backup", Command: []string{"sh", "-c"}, Args: []string{"mkdir -p /backup && date > /tmp/backup.txt"}, VolumeMounts: []corev1.VolumeMount{{Name: "backup", MountPath: "/backup"}}}}}}}}}}
 	findings := (CronJobRule{}).Evaluate(context.Background(), &kube.Snapshot{CronJobs: []batchv1.CronJob{cron}}, config.Config{})
